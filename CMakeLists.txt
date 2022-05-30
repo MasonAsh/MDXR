@@ -13,6 +13,9 @@ add_subdirectory(DirectX-Headers)
 
 add_executable(mdxr
     src/main.cpp
+    src/util.h
+    src/mdxr.h
+    src/mdxr.cpp
 )
 
 target_compile_definitions(mdxr
@@ -23,4 +26,4 @@ target_compile_definitions(mdxr
         $<$<CONFIG:RelWithDebInfo>:D3DCOMPILE_DEBUG=1>
 )
 
-target_link_libraries(mdxr ${SDL2_LIBRARY} ${SDL2MAIN_LIBRARY} DirectX-Headers DirectX-Guids)
+target_link_libraries(mdxr ${SDL2_LIBRARY} ${SDL2MAIN_LIBRARY} DirectX-Headers DirectX-Guids D3d12 DXGI D3DCompiler)
