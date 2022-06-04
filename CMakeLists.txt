@@ -42,4 +42,4 @@ target_compile_definitions(mdxr
         $<$<CONFIG:RelWithDebInfo>:D3DCOMPILE_DEBUG=1>
 )
 
-target_link_libraries(mdxr ${SDL2_LIBRARY} ${SDL2MAIN_LIBRARY} DirectX-Headers DirectX-Guids D3d12 DXGI D3DCompiler)
+target_link_libraries(mdxr ${SDL2_LIBRARY} ${SDL2MAIN_LIBRARY} DirectX-Headers DirectX-Guids D3d12 DXGI D3DCompiler DXGuid)

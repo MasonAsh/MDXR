@@ -11,6 +11,5 @@ int main(int argc, char** argv)
         return -1;
     }
 
-    App app(argc, argv);
-    return app.Run();
+    RunMDXR(argc, argv);
 }
