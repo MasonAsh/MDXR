@@ -6,7 +6,9 @@
 #include <locale>
 #include <codecvt>
 #include <string>
-#include <DirectXMath.h>
+#include "tiny_gltf.h"
+#include "mesh.h"
+#include "glm/gtc/matrix_transform.hpp"
 
 using namespace DirectX;
 
@@ -33,6 +35,8 @@ App::App(int argc, char** argv) :
         std::cout << "The program will now exit" << std::endl;
         abort();
     }
+
+    wDataDir = convert_to_wstring(dataDir);
 }
 
 App::~App()
@@ -87,12 +91,18 @@ void App::InitWindow()
 
 void App::InitD3D()
 {
+#ifdef _DEBUG
     ComPtr<ID3D12Debug> debugController;
     if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debugController)))) {
         debugController->EnableDebugLayer();
     } else {
         std::cout << "Failed to enable D3D12 debug layer\n";
     }
+
+    ComPtr<ID3D12Debug1> debugController1;
+    ASSERT_HRESULT(debugController->QueryInterface(IID_PPV_ARGS(&debugController1)));
+    debugController1->SetEnableGPUBasedValidation(true);
+#endif
 
     ComPtr<IDXGIFactory4> dxgiFactory;
     ASSERT_HRESULT(CreateDXGIFactory2(DXGI_CREATE_FACTORY_DEBUG, IID_PPV_ARGS(&dxgiFactory)));
@@ -140,13 +150,24 @@ void App::InitD3D()
 
     frameIdx = swapChain->GetCurrentBackBufferIndex();
 
-    D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc = {};
-    rtvHeapDesc.NumDescriptors = FrameBufferCount;
-    rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    rtvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
-    ASSERT_HRESULT(
-        device->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&rtvHeap))
-    );
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc = {};
+        rtvHeapDesc.NumDescriptors = FrameBufferCount;
+        rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        rtvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+        ASSERT_HRESULT(
+            device->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&rtvHeap))
+        );
+
+        D3D12_DESCRIPTOR_HEAP_DESC cbvHeapDesc = {};
+        cbvHeapDesc.NumDescriptors = 1;
+        cbvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        cbvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        ASSERT_HRESULT(
+            device->CreateDescriptorHeap(&cbvHeapDesc, IID_PPV_ARGS(&cbvHeap))
+        );
+    }
+
 
     rtvDescriptorSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
@@ -168,24 +189,81 @@ void App::InitD3D()
     );
 }
 
+void App::CreateUnlitMeshPSO(Primitive& primitive)
+{
+    std::wstring wDataDir = convert_to_wstring(dataDir);
+
+    ComPtr<ID3DBlob> vertexShader;
+    ComPtr<ID3DBlob> pixelShader;
+    ASSERT_HRESULT(
+        D3DReadFileToBlob((wDataDir + L"/unlit_mesh.cvert").c_str(), &vertexShader)
+    );
+    ASSERT_HRESULT(
+        D3DReadFileToBlob((wDataDir + L"/unlit_mesh.cpixel").c_str(), &pixelShader)
+    );
+
+    // Describe and create the graphics pipeline state object (PSO).
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
+    psoDesc.InputLayout = { primitive.inputLayout.data(), (UINT)primitive.inputLayout.size() };
+    psoDesc.pRootSignature = rootSignature.Get();
+    psoDesc.VS = { reinterpret_cast<UINT8*>(vertexShader->GetBufferPointer()), vertexShader->GetBufferSize() };
+    psoDesc.PS = { reinterpret_cast<UINT8*>(pixelShader->GetBufferPointer()), pixelShader->GetBufferSize() };
+    psoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+    psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
+    psoDesc.DepthStencilState.DepthEnable = FALSE;
+    psoDesc.DepthStencilState.StencilEnable = FALSE;
+    psoDesc.SampleMask = UINT_MAX;
+    psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    psoDesc.NumRenderTargets = 1;
+    psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    psoDesc.SampleDesc.Count = 1;
+
+    ASSERT_HRESULT(
+        device->CreateGraphicsPipelineState(
+            &psoDesc,
+            IID_PPV_ARGS(&primitive.PSO)
+        )
+    );
+}
+
 void App::LoadScene()
 {
     {
-        CD3DX12_ROOT_SIGNATURE_DESC rootSignatureDesc;
-        rootSignatureDesc.Init(
+        D3D12_FEATURE_DATA_ROOT_SIGNATURE featureData = {};
+        featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_1;
+        if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &featureData, sizeof(featureData))))
+        {
+            featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_0;
+        }
+
+        CD3DX12_DESCRIPTOR_RANGE1 ranges[1];
+        CD3DX12_ROOT_PARAMETER1 rootParameters[1];
+
+        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC);
+        rootParameters[0].InitAsDescriptorTable(1, &ranges[0], D3D12_SHADER_VISIBILITY_VERTEX);
+
+        D3D12_ROOT_SIGNATURE_FLAGS rootSignatureFlags =
+            D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
+            D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS |
+            D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS |
+            D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS |
+            D3D12_ROOT_SIGNATURE_FLAG_DENY_PIXEL_SHADER_ROOT_ACCESS;
+
+        CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rootSignatureDesc;
+        rootSignatureDesc.Init_1_1(
+            _countof(rootParameters),
+            rootParameters,
             0,
             nullptr,
-            0,
-            nullptr,
-            D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
+            rootSignatureFlags
         );
 
         ComPtr<ID3DBlob> signature;
         ComPtr<ID3DBlob> error;
         ASSERT_HRESULT(
-            D3D12SerializeRootSignature(
+            D3DX12SerializeVersionedRootSignature(
                 &rootSignatureDesc,
-                D3D_ROOT_SIGNATURE_VERSION_1,
+                featureData.HighestVersion,
                 &signature,
                 &error
             )
@@ -203,43 +281,57 @@ void App::LoadScene()
     {
         std::wstring wDataDir = convert_to_wstring(dataDir);
 
-        ComPtr<ID3DBlob> vertexShader;
-        ComPtr<ID3DBlob> pixelShader;
-        ASSERT_HRESULT(
-            D3DReadFileToBlob((wDataDir + L"/basic.cvert").c_str(), &vertexShader)
-        );
-        ASSERT_HRESULT(
-            D3DReadFileToBlob((wDataDir + L"/basic.cpixel").c_str(), &pixelShader)
-        );
+        // ComPtr<ID3DBlob> vertexShader;
+        // ComPtr<ID3DBlob> pixelShader;
+        // ASSERT_HRESULT(
+        //     D3DReadFileToBlob((wDataDir + L"/basic.cvert").c_str(), &vertexShader)
+        // );
+        // ASSERT_HRESULT(
+        //     D3DReadFileToBlob((wDataDir + L"/basic.cpixel").c_str(), &pixelShader)
+        // );
 
-        D3D12_INPUT_ELEMENT_DESC inputElementDescs[] =
-        {
-            { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-            { "COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
-        };
+        // D3D12_INPUT_ELEMENT_DESC inputElementDescs[] =
+        // {
+        //     { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        //     { "COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
+        // };
 
-        // Describe and create the graphics pipeline state object (PSO).
-        D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
-        psoDesc.InputLayout = { inputElementDescs, _countof(inputElementDescs) };
-        psoDesc.pRootSignature = rootSignature.Get();
-        psoDesc.VS = { reinterpret_cast<UINT8*>(vertexShader->GetBufferPointer()), vertexShader->GetBufferSize() };
-        psoDesc.PS = { reinterpret_cast<UINT8*>(pixelShader->GetBufferPointer()), pixelShader->GetBufferSize() };
-        psoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
-        psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
-        psoDesc.DepthStencilState.DepthEnable = FALSE;
-        psoDesc.DepthStencilState.StencilEnable = FALSE;
-        psoDesc.SampleMask = UINT_MAX;
-        psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        psoDesc.NumRenderTargets = 1;
-        psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-        psoDesc.SampleDesc.Count = 1;
+        // // Describe and create the graphics pipeline state object (PSO).
+        // D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
+        // psoDesc.InputLayout = { inputElementDescs, _countof(inputElementDescs) };
+        // psoDesc.pRootSignature = rootSignature.Get();
+        // psoDesc.VS = { reinterpret_cast<UINT8*>(vertexShader->GetBufferPointer()), vertexShader->GetBufferSize() };
+        // psoDesc.PS = { reinterpret_cast<UINT8*>(pixelShader->GetBufferPointer()), pixelShader->GetBufferSize() };
+        // psoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+        // psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
+        // psoDesc.DepthStencilState.DepthEnable = FALSE;
+        // psoDesc.DepthStencilState.StencilEnable = FALSE;
+        // psoDesc.SampleMask = UINT_MAX;
+        // psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        // psoDesc.NumRenderTargets = 1;
+        // psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        // psoDesc.SampleDesc.Count = 1;
 
-        ASSERT_HRESULT(
-            device->CreateGraphicsPipelineState(
-                &psoDesc,
-                IID_PPV_ARGS(&pipelineState)
-            )
-        );
+        // ASSERT_HRESULT(
+        //     device->CreateGraphicsPipelineState(
+        //         &psoDesc,
+        //         IID_PPV_ARGS(&pipelineState)
+        //     )
+        // );
+    }
+
+    {
+        const UINT constantBufferSize = sizeof(ConstantBufferData);
+
+        D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
+        device->CreateConstantBufferView(&cbvDesc, cbvHeap->GetCPUDescriptorHandleForHeapStart());
+    }
+
+    model = LoadGLTF(device.Get(), dataDir + "/Suzanne.gltf");
+    for (auto& mesh : model.meshes) {
+        for (auto& primitive : mesh.primitives) {
+            CreateUnlitMeshPSO(primitive);
+        }
     }
 
     ASSERT_HRESULT(
@@ -301,6 +393,38 @@ void App::LoadScene()
         vertexBufferView.SizeInBytes = vertexBufferSize;
     }
 
+    UpdateConstantBufferData();
+
+    {
+        const UINT constantBufferSize = sizeof(ConstantBufferData);
+        CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_UPLOAD);
+        auto resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(constantBufferSize);
+        ASSERT_HRESULT(
+            device->CreateCommittedResource(
+                &heapProps,
+                D3D12_HEAP_FLAG_NONE,
+                &resourceDesc,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                nullptr,
+                IID_PPV_ARGS(&constantBuffer)
+            )
+        );
+
+        D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
+        cbvDesc.BufferLocation = constantBuffer->GetGPUVirtualAddress();
+        cbvDesc.SizeInBytes = constantBufferSize;
+        device->CreateConstantBufferView(
+            &cbvDesc,
+            cbvHeap->GetCPUDescriptorHandleForHeapStart()
+        );
+
+        CD3DX12_RANGE readRange(0, 0);
+        ASSERT_HRESULT(
+            constantBuffer->Map(0, &readRange, reinterpret_cast<void**>(&constantBufferDataPtr))
+        );
+        memcpy(constantBufferDataPtr, &constantBufferData, sizeof(constantBufferData));
+    }
+
     {
         ASSERT_HRESULT(
             device->CreateFence(
@@ -350,7 +474,31 @@ void App::WaitForPreviousFrame()
     frameIdx = swapChain->GetCurrentBackBufferIndex();
 }
 
-void App::DrawTriangle()
+void App::UpdateConstantBufferData()
+{
+    glm::mat4 projection = glm::perspective(glm::pi<float>() * 0.2f, (float)windowWidth / (float)windowHeight, 0.01f, 5000.0f);
+    glm::mat4 view = glm::lookAt(glm::vec3(0.0f, 100.0f, -1.0f), glm::vec3(0, 0.0f, 0), glm::vec3(0, 1, 0));
+    glm::mat4 model = glm::scale(glm::rotate(glm::mat4(1.0f), glm::radians(90.0f), glm::vec3(1, 0, 0)), glm::vec3(10.0f));
+    constantBufferData.MVP = projection * view * model;
+}
+
+void App::DrawModel(const Model& model, ID3D12GraphicsCommandList* commandList)
+{
+    ID3D12DescriptorHeap* ppHeaps[] = { cbvHeap.Get() };
+    commandList->SetDescriptorHeaps(1, ppHeaps);
+    commandList->SetGraphicsRootDescriptorTable(0, cbvHeap->GetGPUDescriptorHandleForHeapStart());
+    for (const auto& mesh : model.meshes) {
+        for (const auto& primitive : mesh.primitives) {
+            commandList->IASetPrimitiveTopology(primitive.primitiveTopology);
+            commandList->SetPipelineState(primitive.PSO.Get());
+            commandList->IASetVertexBuffers(0, primitive.vertexBufferViews.size(), primitive.vertexBufferViews.data());
+            commandList->IASetIndexBuffer(&primitive.indexBufferView);
+            commandList->DrawIndexedInstanced(primitive.indexCount, 1, 0, 0, 0);
+        }
+    }
+}
+
+void App::BuildCommandList()
 {
     ASSERT_HRESULT(
         commandAllocator->Reset()
@@ -361,10 +509,12 @@ void App::DrawTriangle()
     );
 
     commandList->SetGraphicsRootSignature(rootSignature.Get());
+
     commandList->RSSetViewports(1, &viewport);
     commandList->RSSetScissorRects(1, &scissorRect);
 
     auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(renderTargets[frameIdx].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    commandList->ResourceBarrier(1, &barrier);
 
     CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(rtvHeap->GetCPUDescriptorHandleForHeapStart(), frameIdx, rtvDescriptorSize);
     commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
@@ -372,9 +522,11 @@ void App::DrawTriangle()
     // Record commands.
     const float clearColor[] = { 0.0f, 0.2f, 0.4f, 1.0f };
     commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
-    commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    commandList->IASetVertexBuffers(0, 1, &vertexBufferView);
-    commandList->DrawInstanced(3, 1, 0, 0);
+    // commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    // commandList->IASetVertexBuffers(0, 1, &vertexBufferView);
+    // commandList->DrawInstanced(3, 1, 0, 0);
+
+    DrawModel(model, commandList.Get());
 
     // Indicate that the back buffer will now be used to present.
     barrier = CD3DX12_RESOURCE_BARRIER::Transition(renderTargets[frameIdx].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
@@ -388,7 +540,7 @@ void App::DrawTriangle()
 
 void App::Render()
 {
-    DrawTriangle();
+    BuildCommandList();
 
     ID3D12CommandList* ppCommandLists[] = { commandList.Get() };
     commandQueue->ExecuteCommandLists(_countof(ppCommandLists), ppCommandLists);

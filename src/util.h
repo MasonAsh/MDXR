@@ -17,7 +17,7 @@
         abort(); \
     }
 
-std::wstring convert_to_wstring(std::string input)
+inline std::wstring convert_to_wstring(std::string input)
 {
     std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> converter;
     std::wstring wide = converter.from_bytes(input);

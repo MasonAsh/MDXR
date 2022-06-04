@@ -4,6 +4,8 @@ project(mdxr)
 
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/modules/")
 
+set(CMAKE_CXX_STANDARD 20)
+
 set(CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION 19041)
 
 find_package(SDL2 REQUIRED)
@@ -16,10 +18,24 @@ add_executable(mdxr
     src/util.h
     src/mdxr.h
     src/mdxr.cpp
+    src/tiny_gltf_impl.cpp
+    src/mesh.h
+    src/mesh.cpp
+
+    # third party
+    src/stb_image.h
+    src/stb_image_write.h
+    src/json.hpp
+    src/tiny_gltf.h
 )
+
+include_directories(thirdparty/include)
 
 target_compile_definitions(mdxr
     PRIVATE
+        GLM_FORCE_RADIANS
+        GLM_FORCE_DEPTH_ZERO_TO_ONE
+        GLM_FORCE_LEFT_HANDED
         _CRT_SECURE_NO_WARNINGS
     PUBLIC
         $<$<CONFIG:Debug>:D3DCOMPILE_DEBUG=1>
