@@ -6,6 +6,7 @@
 #include <directx/d3dx12.h>
 #include <wrl.h>
 #include <DirectXMath.h>
+#include <glm/glm.hpp>
 
 using namespace DirectX;
 using namespace Microsoft::WRL;
@@ -29,6 +30,8 @@ struct Mesh {
 struct Model {
     std::vector<ComPtr<ID3D12Resource>> buffers;
     std::vector<Mesh> meshes;
+
+    glm::mat4 transform;
 };
 
 Model LoadGLTF(ID3D12Device* device, const std::string& path);

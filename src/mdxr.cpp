@@ -10,7 +10,10 @@
 #include "mesh.h"
 #include "glm/gtc/matrix_transform.hpp"
 #include "dxgidebug.h"
+#include <chrono>
 #include <algorithm>
+
+using namespace std::chrono;
 
 using namespace DirectX;
 
@@ -270,7 +273,7 @@ void InitWindow(App& app)
 void InitApp(App& app, int argc, char** argv)
 {
     app.viewport = CD3DX12_VIEWPORT(0.0f, 0.0f, static_cast<float>(app.windowWidth), static_cast<float>(app.windowHeight));
-    app.scissorRect = CD3DX12_RECT(0, 0, static_cast<LONG>(app.windowHeight), static_cast<LONG>(app.windowHeight));
+    app.scissorRect = CD3DX12_RECT(0, 0, static_cast<LONG>(app.windowWidth), static_cast<LONG>(app.windowHeight));
     app.rtvDescriptorSize = 0;
 
     for (int i = 0; i < argc; i++) {
@@ -336,12 +339,9 @@ ComPtr<ID3D12PipelineState> CreateUnlitMeshPSO(
     return PSO;
 }
 
-void UpdateConstantBufferData(ConstantBufferData& constantBufferData, int windowWidth, int windowHeight)
+void UpdateConstantBuffer(ConstantBufferData& constantBufferData, void* constantBufferPtr)
 {
-    glm::mat4 projection = glm::perspective(glm::pi<float>() * 0.2f, (float)windowWidth / (float)windowHeight, 0.01f, 5000.0f);
-    glm::mat4 view = glm::lookAt(glm::vec3(0.0f, 100.0f, -1.0f), glm::vec3(0, 0.0f, 0), glm::vec3(0, 1, 0));
-    glm::mat4 model = glm::scale(glm::rotate(glm::mat4(1.0f), glm::radians(90.0f), glm::vec3(1, 0, 0)), glm::vec3(10.0f));
-    constantBufferData.MVP = projection * view * model;
+    memcpy(constantBufferPtr, &constantBufferData, sizeof(ConstantBufferData));
 }
 
 void WaitForPreviousFrame(App& app)
@@ -642,6 +642,7 @@ void ProcessAssets(App& app, const AppAssets& assets)
     auto geometryBuffers = UploadModelGeometryBuffers(app, assets.gltfModel);
 
     app.model = FinalizeModel(assets.gltfModel, geometryBuffers);
+    app.model.transform = glm::scale(glm::rotate(glm::mat4(1.0f), glm::radians(90.0f), glm::vec3(1, 0, 0)), glm::vec3(10.0f));
 
     for (auto& mesh : app.model.meshes) {
         for (auto& primitive : mesh.primitives) {
@@ -653,9 +654,6 @@ void ProcessAssets(App& app, const AppAssets& assets)
 
     ID3D12CommandList* ppCommandLists[] = { app.commandList.Get() };
     app.commandQueue->ExecuteCommandLists(1, ppCommandLists);
-
-    // Wait for the copy command queue to finish before continuing with the rest of the program.
-    // app.copyFence.SignalAndWaitQueue(app.copyCommandQueue.Get());
 }
 
 void LoadScene(App& app, const AppAssets& assets)
@@ -745,12 +743,6 @@ void LoadScene(App& app, const AppAssets& assets)
 
     float aspectRatio = (float)app.windowWidth / (float)app.windowHeight;
 
-    UpdateConstantBufferData(
-        app.constantBufferData,
-        app.windowWidth,
-        app.windowHeight
-    );
-
     {
         const UINT constantBufferSize = sizeof(ConstantBufferData);
         CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_UPLOAD);
@@ -778,8 +770,9 @@ void LoadScene(App& app, const AppAssets& assets)
         ASSERT_HRESULT(
             app.constantBuffer->Map(0, &readRange, reinterpret_cast<void**>(&app.constantBufferDataPtr))
         );
-        memcpy(app.constantBufferDataPtr, &app.constantBufferData, sizeof(app.constantBufferData));
     }
+
+    UpdateConstantBuffer(app.constantBufferData, app.constantBufferDataPtr);
 
     {
         app.fence.Initialize(app.device.Get());
@@ -789,6 +782,23 @@ void LoadScene(App& app, const AppAssets& assets)
     ProcessAssets(app, assets);
 
     WaitForPreviousFrame(app);
+}
+
+void UpdateScene(App& app)
+{
+    float timeSeconds = (float)high_resolution_clock::now().time_since_epoch().count() / (float)1e9;
+
+    glm::mat4 translation = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, sin(timeSeconds) * 5.0f, 0.0f));
+    glm::mat4 scale = glm::scale(translation, glm::vec3(10.0f));
+    glm::mat4 rotation = glm::rotate(scale, glm::radians(0.0f), glm::vec3(1, 0, 0));
+    app.model.transform = rotation;
+
+    glm::mat4 projection = glm::perspective(glm::pi<float>() * 0.2f, (float)app.windowWidth / (float)app.windowHeight, 0.01f, 5000.0f);
+    glm::mat4 view = glm::lookAt(glm::vec3(0.0f, 0.0f, -100.0f), glm::vec3(0, 0.0f, 0), glm::vec3(0, 1, 0));
+    glm::mat4 model = app.model.transform;
+    app.constantBufferData.MVP = projection * view * model;
+
+    UpdateConstantBuffer(app.constantBufferData, app.constantBufferDataPtr);
 }
 
 void DrawModelCommandList(const Model& model, ID3D12GraphicsCommandList* commandList, ID3D12DescriptorHeap* cbvHeap)
@@ -882,6 +892,7 @@ int RunApp(int argc, char** argv)
             }
         }
 
+        UpdateScene(app);
         RenderFrame(app);
     }
 
