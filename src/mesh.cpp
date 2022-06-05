@@ -124,17 +124,6 @@ Model LoadGLTF(ID3D12Device* device, const std::string& path)
                     // track of what input slot is linked to a bufferview.
                     int bufferViewIdx = accessor.bufferView;
                     auto bufferView = model.bufferViews[bufferViewIdx];
-                    // if (!bufferViewToInputSlotMap.contains(bufferViewIdx)) {
-                    //     bufferViewToInputSlotMap[bufferViewIdx] = InputSlotCount++;
-
-                    //     D3D12_VERTEX_BUFFER_VIEW view;
-                    //     auto bufferView = model.bufferViews[bufferViewIdx];
-                    //     auto buffer = resourceBuffers[bufferView.buffer];
-                    //     view.BufferLocation = buffer->GetGPUVirtualAddress() + bufferView.byteOffset;
-                    //     view.SizeInBytes = bufferView.byteLength;
-                    //     view.StrideInBytes = bufferView.byteStride;
-                    //     vertexBufferViews.push_back(view);
-                    // }
 
                     byteStride = bufferView.byteStride > 0 ? bufferView.byteStride : byteStride;
 
