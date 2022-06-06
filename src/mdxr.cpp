@@ -10,8 +10,10 @@
 #include "mesh.h"
 #include "glm/gtc/matrix_transform.hpp"
 #include "dxgidebug.h"
+#include "stb_image.h"
 #include <chrono>
 #include <algorithm>
+#include <span>
 
 using namespace std::chrono;
 
@@ -109,18 +111,18 @@ struct App {
 
     tinygltf::TinyGLTF loader;
 
-    int uploadHeapSize;
-    ComPtr<ID3D12Resource> uploadHeap;
     ComPtr<ID3D12CommandQueue> copyCommandQueue;
     ComPtr<ID3D12GraphicsCommandList> copyCommandList;
     IncrementalFence copyFence;
 
     ComPtr<ID3D12PipelineState> unlitMeshPSO;
 
-    ComPtr<ID3D12DescriptorHeap> cbvHeap;
+    ComPtr<ID3D12DescriptorHeap> mainDescriptorHeap;
     ConstantBufferData constantBufferData;
     ComPtr<ID3D12Resource> constantBuffer;
     UINT8* constantBufferDataPtr = nullptr;
+
+    ComPtr<ID3D12DescriptorHeap> srvHeap;
 
     Model model;
 
@@ -216,11 +218,11 @@ void InitD3D(App& app)
         );
 
         D3D12_DESCRIPTOR_HEAP_DESC cbvHeapDesc = {};
-        cbvHeapDesc.NumDescriptors = 1;
+        cbvHeapDesc.NumDescriptors = 2;
         cbvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         cbvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         ASSERT_HRESULT(
-            device->CreateDescriptorHeap(&cbvHeapDesc, IID_PPV_ARGS(&app.cbvHeap))
+            device->CreateDescriptorHeap(&cbvHeapDesc, IID_PPV_ARGS(&app.mainDescriptorHeap))
         );
     }
 
@@ -293,22 +295,24 @@ void InitApp(App& app, int argc, char** argv)
     app.wDataDir = convert_to_wstring(app.dataDir);
 }
 
-ComPtr<ID3D12PipelineState> CreateUnlitMeshPSO(
+ComPtr<ID3D12PipelineState> CreatePSO(
     ID3D12Device* device,
     const std::string& dataDir,
+    const std::string& shaderName,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
 )
 {
     std::wstring wDataDir = convert_to_wstring(dataDir);
+    std::wstring wShaderName = convert_to_wstring(shaderName);
 
     ComPtr<ID3DBlob> vertexShader;
     ComPtr<ID3DBlob> pixelShader;
     ASSERT_HRESULT(
-        D3DReadFileToBlob((wDataDir + L"/unlit_mesh.cvert").c_str(), &vertexShader)
+        D3DReadFileToBlob((wDataDir + L"/" + wShaderName + L".cvert").c_str(), &vertexShader)
     );
     ASSERT_HRESULT(
-        D3DReadFileToBlob((wDataDir + L"/unlit_mesh.cpixel").c_str(), &pixelShader)
+        D3DReadFileToBlob((wDataDir + L"/" + wShaderName + L".cpixel").c_str(), &pixelShader)
     );
 
     // Describe and create the graphics pipeline state object (PSO).
@@ -337,6 +341,38 @@ ComPtr<ID3D12PipelineState> CreateUnlitMeshPSO(
     );
 
     return PSO;
+}
+
+ComPtr<ID3D12PipelineState> CreateUnlitMeshPSO(
+    ID3D12Device* device,
+    const std::string& dataDir,
+    ID3D12RootSignature* rootSignature,
+    const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
+)
+{
+    return CreatePSO(
+        device,
+        dataDir,
+        "unlit_mesh",
+        rootSignature,
+        inputLayout
+    );
+}
+
+ComPtr<ID3D12PipelineState> CreateDiffuseMeshPSO(
+    ID3D12Device* device,
+    const std::string& dataDir,
+    ID3D12RootSignature* rootSignature,
+    const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
+)
+{
+    return CreatePSO(
+        device,
+        dataDir,
+        "diffuse_mesh",
+        rootSignature,
+        inputLayout
+    );
 }
 
 void UpdateConstantBuffer(ConstantBufferData& constantBufferData, void* constantBufferPtr)
@@ -368,22 +404,30 @@ AppAssets LoadAssets(App& app)
             &assets.gltfModel,
             &err,
             &warn,
-            app.dataDir + "/Suzanne.gltf"
+            app.dataDir + "/BoxTextured.gltf"
         )
     );
 
     return assets;
 }
 
-void CreateUploadHeap(App& app, const AppAssets& assets)
+ComPtr<ID3D12Resource> CreateUploadHeap(App& app, const std::vector<D3D12_RESOURCE_DESC>& resourceDescs, std::vector<UINT64>& gltfBufferOffsets)
 {
     UINT64 uploadHeapSize = 0;
 
-    for (const auto& buffer : assets.gltfModel.buffers) {
-        uploadHeapSize += buffer.data.size();
+    for (const auto& desc : resourceDescs) {
+        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+            uploadHeapSize += D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - (uploadHeapSize % D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+        }
+        UINT64 requiredSize;
+        app.device->GetCopyableFootprints(&desc, 0, 1, 0, nullptr, nullptr, nullptr, &requiredSize);
+        gltfBufferOffsets.push_back(uploadHeapSize);
+        uploadHeapSize += requiredSize;
     }
 
     ID3D12Device* device = app.device.Get();
+
+    ComPtr<ID3D12Resource> uploadHeap;
 
     CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_UPLOAD);
     auto resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(uploadHeapSize);
@@ -394,40 +438,135 @@ void CreateUploadHeap(App& app, const AppAssets& assets)
             &resourceDesc,
             D3D12_RESOURCE_STATE_GENERIC_READ,
             nullptr,
-            IID_PPV_ARGS(&app.uploadHeap)
+            IID_PPV_ARGS(&uploadHeap)
         )
     );
 
-    app.uploadHeapSize = uploadHeapSize;
+    return uploadHeap;
 }
 
-std::vector<ComPtr<ID3D12Resource>> UploadModelGeometryBuffers(App& app, const tinygltf::Model& model)
+void CreateDescriptorHeap(
+    App& app,
+    const tinygltf::Model& model,
+    const std::span<ComPtr<ID3D12Resource>> textureResources,
+    ComPtr<ID3D12DescriptorHeap>& outHeap,
+    std::vector<D3D12_GPU_DESCRIPTOR_HANDLE>& outHandles
+)
 {
-    std::vector<ComPtr<ID3D12Resource>> geometryBuffers;
-    geometryBuffers.reserve(model.buffers.size());
+    const int NUM_CONSTANT_BUFFERS = 1;
+    ID3D12DescriptorHeap* heap;
+    int numDescriptors = NUM_CONSTANT_BUFFERS + model.textures.size();
+    outHandles.reserve(numDescriptors);
+
+    D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+    heapDesc.NumDescriptors = numDescriptors;
+    heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    ASSERT_HRESULT(
+        app.device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&outHeap))
+    );
+
+    UINT incrementSize = app.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    CD3DX12_CPU_DESCRIPTOR_HANDLE cpuHandle(outHeap->GetCPUDescriptorHandleForHeapStart(), 1, incrementSize);
+    CD3DX12_GPU_DESCRIPTOR_HANDLE gpuHandle(outHeap->GetGPUDescriptorHandleForHeapStart(), 1, incrementSize);
+    for (int i = 0; i < textureResources.size(); i++) {
+        auto& textureResource = textureResources[i];
+        auto textureDesc = textureResource->GetDesc();
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvDesc.Format = textureDesc.Format;
+        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Texture2D.MipLevels = 1;
+        app.device->CreateShaderResourceView(textureResource.Get(), &srvDesc, cpuHandle);
+        outHandles.push_back((D3D12_GPU_DESCRIPTOR_HANDLE)gpuHandle);
+        cpuHandle.Offset(1, incrementSize);
+        gpuHandle.Offset(1, incrementSize);
+    }
+}
+
+D3D12_RESOURCE_DESC GetImageResourceDesc(const tinygltf::Image& image)
+{
+    D3D12_RESOURCE_DESC desc = {};
+    desc.MipLevels = 1;
+    desc.Width = image.width;
+    desc.Height = image.height;
+    desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    desc.DepthOrArraySize = 1;
+    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Quality = 0;
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+
+    assert(image.component == STBI_rgb_alpha);
+
+    switch (image.pixel_type) {
+    case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        break;
+    case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT:
+        desc.Format = DXGI_FORMAT_R16G16B16A16_UNORM;
+        break;
+    default:
+        abort();
+    };
+
+    return desc;
+}
+
+std::vector<D3D12_RESOURCE_DESC> CreateResourceDescriptions(const tinygltf::Model& model)
+{
+    std::vector<D3D12_RESOURCE_DESC> descs;
+    for (const auto& buffer : model.buffers) {
+        D3D12_RESOURCE_DESC desc = CD3DX12_RESOURCE_DESC::Buffer(buffer.data.size());
+        descs.push_back(desc);
+    }
+    for (const auto& image : model.images) {
+        auto desc = GetImageResourceDesc(image);
+        descs.push_back(desc);
+    }
+    return descs;
+}
+
+std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
+    App& app,
+    const tinygltf::Model& model,
+    ComPtr<ID3D12Resource> uploadHeap,
+    const std::vector<D3D12_RESOURCE_DESC>& resourceDescs,
+    const std::vector<UINT64>& uploadOffsets,
+    std::span<ComPtr<ID3D12Resource>>& outGeometryResources,
+    std::span<ComPtr<ID3D12Resource>>& outTextureResources
+)
+{
+    std::vector<ComPtr<ID3D12Resource>> resourceBuffers;
+    resourceBuffers.reserve(model.buffers.size() + model.images.size());
 
     // Copy all GLTF buffer data to the upload heap
     size_t uploadHeapPosition = 0;
     UINT8* uploadHeapPtr;
     CD3DX12_RANGE readRange(0, 0);
-    std::vector<int> gltfBufferOffsets;
-    app.uploadHeap->Map(0, &readRange, reinterpret_cast<void**>(&uploadHeapPtr));
-    for (auto&& buffer : model.buffers)
-    {
-        memcpy(uploadHeapPtr, buffer.data.data(), buffer.data.size());
-        gltfBufferOffsets.push_back(uploadHeapPosition);
-        uploadHeapPosition += buffer.data.size();
+    uploadHeap->Map(0, &readRange, reinterpret_cast<void**>(&uploadHeapPtr));
+    int bufferIdx = 0;
+    for (bufferIdx = 0; bufferIdx < model.buffers.size(); bufferIdx++) {
+        auto buffer = model.buffers[bufferIdx];
+        auto uploadHeapPosition = uploadOffsets[bufferIdx];
+        memcpy(uploadHeapPtr + uploadHeapPosition, buffer.data.data(), buffer.data.size());
     }
-    app.uploadHeap->Unmap(0, nullptr);
+    int imageIdx = 0;
+    for (; bufferIdx < uploadOffsets.size(); imageIdx++, bufferIdx++)
+    {
+        auto image = model.images[imageIdx];
+        auto uploadHeapPosition = uploadOffsets[bufferIdx];
+        memcpy(uploadHeapPtr + uploadHeapPosition, image.image.data(), image.image.size());
+    }
+    uploadHeap->Unmap(0, nullptr);
 
     std::vector<CD3DX12_RESOURCE_BARRIER> resourceBarriers;
 
     // Copy all the gltf buffer data to a dedicated geometry buffer
-    for (int i = 0; i < model.buffers.size(); i++) {
-        const auto& gltfBuffer = model.buffers[i];
+    for (bufferIdx = 0; bufferIdx < model.buffers.size(); bufferIdx++) {
+        const auto& gltfBuffer = model.buffers[bufferIdx];
         ComPtr<ID3D12Resource> geometryBuffer;
         CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
-        auto resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(app.uploadHeapSize);
+        auto resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(gltfBuffer.data.size());
         auto resourceState = D3D12_RESOURCE_STATE_COPY_DEST;
         ASSERT_HRESULT(
             app.device->CreateCommittedResource(
@@ -440,12 +579,10 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelGeometryBuffers(App& app, const t
             )
         );
 
-        D3D12_SUBRESOURCE_DATA data;
-
         app.commandList->CopyBufferRegion(
-            geometryBuffer.Get(), 0, app.uploadHeap.Get(), gltfBufferOffsets[i], app.uploadHeapSize);
+            geometryBuffer.Get(), 0, uploadHeap.Get(), uploadOffsets[bufferIdx], gltfBuffer.data.size());
 
-        geometryBuffers.push_back(geometryBuffer);
+        resourceBuffers.push_back(geometryBuffer);
 
         resourceBarriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(
             geometryBuffer.Get(),
@@ -454,12 +591,64 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelGeometryBuffers(App& app, const t
         ));
     }
 
+    // Upload images to buffers
+    for (; bufferIdx < model.buffers.size() + model.images.size(); bufferIdx++) {
+        const auto& gltfImage = model.images[bufferIdx - model.buffers.size()];
+        ComPtr<ID3D12Resource> buffer;
+        CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
+        auto resourceDesc = GetImageResourceDesc(gltfImage);
+        auto resourceState = D3D12_RESOURCE_STATE_COPY_DEST;
+        ASSERT_HRESULT(
+            app.device->CreateCommittedResource(
+                &heapProps,
+                D3D12_HEAP_FLAG_NONE,
+                &resourceDesc,
+                resourceState,
+                nullptr,
+                IID_PPV_ARGS(&buffer)
+            )
+        );
+
+        UINT64 requiredSize;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+        app.device->GetCopyableFootprints(
+            &resourceDesc,
+            0,
+            1,
+            uploadOffsets[bufferIdx],
+            &footprint,
+            nullptr,
+            nullptr,
+            &requiredSize
+        );
+        // app.commandList->CopyBufferRegion(buffer.Get(), 0, uploadHeap.Get(), gltfBufferOffsets[bufferIdx], gltfImage.image.size());
+        const CD3DX12_TEXTURE_COPY_LOCATION Dst(buffer.Get(), 0);
+        const CD3DX12_TEXTURE_COPY_LOCATION Src(uploadHeap.Get(), footprint);
+        app.commandList->CopyTextureRegion(&Dst, 0, 0, 0, &Src, nullptr);
+
+        resourceBuffers.push_back(buffer);
+
+        resourceBarriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(
+            buffer.Get(),
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+        ));
+    }
+
+    auto endGeometryBuffer = resourceBuffers.begin() + model.buffers.size();
+    outGeometryResources = std::span(resourceBuffers.begin(), endGeometryBuffer);
+    outTextureResources = std::span(endGeometryBuffer, resourceBuffers.end());
+
     app.commandList->ResourceBarrier(resourceBarriers.size(), resourceBarriers.data());
 
-    return geometryBuffers;
+    return resourceBuffers;
 }
 
-Model FinalizeModel(const tinygltf::Model& model, const std::vector<ComPtr<ID3D12Resource>>& resourceBuffers)
+Model FinalizeModel(
+    const tinygltf::Model& model,
+    const std::vector<ComPtr<ID3D12Resource>>& resourceBuffers,
+    const std::vector<D3D12_GPU_DESCRIPTOR_HANDLE>& srvHandles
+)
 {
     // Just storing these strings so that we don't have to keep the Model object around.
     static std::array SEMANTIC_NAMES{
@@ -488,6 +677,9 @@ Model FinalizeModel(const tinygltf::Model& model, const std::vector<ComPtr<ID3D1
     Model result;
 
     result.buffers = resourceBuffers;
+
+    // textures begin immediately after the geometry buffers
+    int baseTextureIdx = model.buffers.size();
 
     std::vector<Mesh> meshes;
     meshes.reserve(model.meshes.size());
@@ -602,6 +794,21 @@ Model FinalizeModel(const tinygltf::Model& model, const std::vector<ComPtr<ID3D1
                 }
             }
 
+            if (primitive.material != -1)
+            {
+                auto material = model.materials[primitive.material];
+                int texIdx = material.pbrMetallicRoughness.baseColorTexture.index;
+                // int texcoord = material.pbrMetallicRoughness.baseColorTexture.texCoord;
+                // int imageBufferIdx = baseTextureIdx + model.textures[texIdx].source;
+                // auto resourceBuffer = resourceBuffers[imageBufferIdx];
+                // D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc;
+                // srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                // srvDesc.Format = resourceBuffer->GetDesc().Format;
+                // srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                // srvDesc.Texture2D.MipLevels = 1;
+                drawCall.srvHandle = srvHandles[texIdx];
+            }
+
             {
                 D3D12_INDEX_BUFFER_VIEW& ibv = drawCall.indexBufferView;
                 int accessorIdx = primitive.indices;
@@ -635,18 +842,42 @@ Model FinalizeModel(const tinygltf::Model& model, const std::vector<ComPtr<ID3D1
 
 void ProcessAssets(App& app, const AppAssets& assets)
 {
-    CreateUploadHeap(app, assets);
+    auto resourceDescs = CreateResourceDescriptions(assets.gltfModel);
+
+    std::vector<UINT64> uploadOffsets;
+    auto uploadHeap = CreateUploadHeap(app, resourceDescs, uploadOffsets);
+
+    std::span<ComPtr<ID3D12Resource>> geometryBuffers;
+    std::span<ComPtr<ID3D12Resource>> textureBuffers;
 
     // Can only call this ONCE before command list executed
     // This will need to be adapted to handle N models.
-    auto geometryBuffers = UploadModelGeometryBuffers(app, assets.gltfModel);
+    auto resourceBuffers = UploadModelBuffers(
+        app,
+        assets.gltfModel,
+        uploadHeap,
+        resourceDescs,
+        uploadOffsets,
+        geometryBuffers,
+        textureBuffers
+    );
 
-    app.model = FinalizeModel(assets.gltfModel, geometryBuffers);
+    std::vector<D3D12_GPU_DESCRIPTOR_HANDLE> srvHandles;
+    ComPtr<ID3D12DescriptorHeap> mainDescriptorHeap;
+    CreateDescriptorHeap(app, assets.gltfModel, textureBuffers, mainDescriptorHeap, srvHandles);
+    app.mainDescriptorHeap = mainDescriptorHeap;
+
+    app.model = FinalizeModel(assets.gltfModel, resourceBuffers, srvHandles);
     app.model.transform = glm::scale(glm::rotate(glm::mat4(1.0f), glm::radians(90.0f), glm::vec3(1, 0, 0)), glm::vec3(10.0f));
 
     for (auto& mesh : app.model.meshes) {
         for (auto& primitive : mesh.primitives) {
-            primitive.PSO = CreateUnlitMeshPSO(app.device.Get(), app.dataDir, app.rootSignature.Get(), primitive.inputLayout);
+            primitive.PSO = CreateDiffuseMeshPSO(
+                app.device.Get(),
+                app.dataDir,
+                app.rootSignature.Get(),
+                primitive.inputLayout
+            );
         }
     }
 
@@ -654,6 +885,8 @@ void ProcessAssets(App& app, const AppAssets& assets)
 
     ID3D12CommandList* ppCommandLists[] = { app.commandList.Get() };
     app.commandQueue->ExecuteCommandLists(1, ppCommandLists);
+
+    WaitForPreviousFrame(app);
 }
 
 void LoadScene(App& app, const AppAssets& assets)
@@ -667,25 +900,42 @@ void LoadScene(App& app, const AppAssets& assets)
             featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_0;
         }
 
-        CD3DX12_DESCRIPTOR_RANGE1 ranges[1];
-        CD3DX12_ROOT_PARAMETER1 rootParameters[1];
+        CD3DX12_DESCRIPTOR_RANGE1 ranges[2];
+        CD3DX12_ROOT_PARAMETER1 rootParameters[2];
 
         ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC);
+        ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC);
         rootParameters[0].InitAsDescriptorTable(1, &ranges[0], D3D12_SHADER_VISIBILITY_VERTEX);
+        rootParameters[1].InitAsDescriptorTable(1, &ranges[1], D3D12_SHADER_VISIBILITY_PIXEL);
 
-        D3D12_ROOT_SIGNATURE_FLAGS rootSignatureFlags =
-            D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
-            D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS |
-            D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS |
-            D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS |
-            D3D12_ROOT_SIGNATURE_FLAG_DENY_PIXEL_SHADER_ROOT_ACCESS;
+        D3D12_ROOT_SIGNATURE_FLAGS rootSignatureFlags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+        // D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS |
+        // D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS |
+        // D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS |
+        // D3D12_ROOT_SIGNATURE_FLAG_DENY_PIXEL_SHADER_ROOT_ACCESS;
+
+        // FIXME: This is going to have to be dynamic...
+        D3D12_STATIC_SAMPLER_DESC sampler = {};
+        sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+        sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+        sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+        sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+        sampler.MipLODBias = 0;
+        sampler.MaxAnisotropy = 0;
+        sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+        sampler.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+        sampler.MinLOD = 0.0f;
+        sampler.MaxLOD = D3D12_FLOAT32_MAX;
+        sampler.ShaderRegister = 0;
+        sampler.RegisterSpace = 0;
+        sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
         CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rootSignatureDesc;
         rootSignatureDesc.Init_1_1(
             _countof(rootParameters),
             rootParameters,
-            0,
-            nullptr,
+            1,
+            &sampler,
             rootSignatureFlags
         );
 
@@ -707,13 +957,6 @@ void LoadScene(App& app, const AppAssets& assets)
                 IID_PPV_ARGS(&app.rootSignature)
             )
         );
-    }
-
-    {
-        const UINT constantBufferSize = sizeof(ConstantBufferData);
-
-        D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
-        device->CreateConstantBufferView(&cbvDesc, app.cbvHeap->GetCPUDescriptorHandleForHeapStart());
     }
 
     // Create command lists
@@ -744,6 +987,13 @@ void LoadScene(App& app, const AppAssets& assets)
     float aspectRatio = (float)app.windowWidth / (float)app.windowHeight;
 
     {
+        app.fence.Initialize(app.device.Get());
+        app.copyFence.Initialize(app.device.Get());
+    }
+
+    ProcessAssets(app, assets);
+
+    {
         const UINT constantBufferSize = sizeof(ConstantBufferData);
         CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_UPLOAD);
         auto resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(constantBufferSize);
@@ -763,7 +1013,7 @@ void LoadScene(App& app, const AppAssets& assets)
         cbvDesc.SizeInBytes = constantBufferSize;
         device->CreateConstantBufferView(
             &cbvDesc,
-            app.cbvHeap->GetCPUDescriptorHandleForHeapStart()
+            app.mainDescriptorHeap->GetCPUDescriptorHandleForHeapStart()
         );
 
         CD3DX12_RANGE readRange(0, 0);
@@ -773,13 +1023,6 @@ void LoadScene(App& app, const AppAssets& assets)
     }
 
     UpdateConstantBuffer(app.constantBufferData, app.constantBufferDataPtr);
-
-    {
-        app.fence.Initialize(app.device.Get());
-        app.copyFence.Initialize(app.device.Get());
-    }
-
-    ProcessAssets(app, assets);
 
     WaitForPreviousFrame(app);
 }
@@ -801,13 +1044,14 @@ void UpdateScene(App& app)
     UpdateConstantBuffer(app.constantBufferData, app.constantBufferDataPtr);
 }
 
-void DrawModelCommandList(const Model& model, ID3D12GraphicsCommandList* commandList, ID3D12DescriptorHeap* cbvHeap)
+void DrawModelCommandList(const Model& model, ID3D12GraphicsCommandList* commandList, ID3D12DescriptorHeap* mainDescriptorHeap)
 {
-    ID3D12DescriptorHeap* ppHeaps[] = { cbvHeap };
+    ID3D12DescriptorHeap* ppHeaps[] = { mainDescriptorHeap };
     commandList->SetDescriptorHeaps(1, ppHeaps);
-    commandList->SetGraphicsRootDescriptorTable(0, cbvHeap->GetGPUDescriptorHandleForHeapStart());
+    commandList->SetGraphicsRootDescriptorTable(0, mainDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
     for (const auto& mesh : model.meshes) {
         for (const auto& primitive : mesh.primitives) {
+            commandList->SetGraphicsRootDescriptorTable(1, primitive.srvHandle);
             commandList->IASetPrimitiveTopology(primitive.primitiveTopology);
             commandList->SetPipelineState(primitive.PSO.Get());
             commandList->IASetVertexBuffers(0, primitive.vertexBufferViews.size(), primitive.vertexBufferViews.data());
@@ -844,7 +1088,7 @@ void BuildCommandList(const App& app)
     const float clearColor[] = { 0.0f, 0.2f, 0.4f, 1.0f };
     commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
 
-    DrawModelCommandList(app.model, commandList, app.cbvHeap.Get());
+    DrawModelCommandList(app.model, commandList, app.mainDescriptorHeap.Get());
 
     // Indicate that the back buffer will now be used to present.
     barrier = CD3DX12_RESOURCE_BARRIER::Transition(app.renderTargets[app.frameIdx].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);

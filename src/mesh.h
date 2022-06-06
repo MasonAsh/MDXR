@@ -17,6 +17,7 @@ struct Primitive {
     D3D12_INDEX_BUFFER_VIEW indexBufferView;
     D3D12_PRIMITIVE_TOPOLOGY primitiveTopology;
     ComPtr<ID3D12PipelineState> PSO;
+    D3D12_GPU_DESCRIPTOR_HANDLE srvHandle;
     int indexCount;
 };
 
