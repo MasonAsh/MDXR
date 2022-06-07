@@ -108,6 +108,9 @@ struct App {
     CD3DX12_VIEWPORT viewport;
     CD3DX12_RECT scissorRect;
 
+    ComPtr<ID3D12Resource> depthStencilBuffer;
+    ComPtr<ID3D12DescriptorHeap> dsHeap;
+
     IncrementalFence fence;
 
     tinygltf::TinyGLTF loader;
@@ -132,6 +135,44 @@ struct App {
     unsigned int frameIdx;
     unsigned int rtvDescriptorSize = 0;
 };
+
+void SetupDepthStencil(App& app)
+{
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC dsHeapDesc = {};
+        dsHeapDesc.NumDescriptors = 1;
+        dsHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+        dsHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+        ASSERT_HRESULT(app.device->CreateDescriptorHeap(&dsHeapDesc, IID_PPV_ARGS(&app.dsHeap)));
+    }
+
+    D3D12_DEPTH_STENCIL_VIEW_DESC dsDesc = {};
+    dsDesc.Format = DXGI_FORMAT_D32_FLOAT;
+    dsDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    dsDesc.Flags = D3D12_DSV_FLAG_NONE;
+
+    D3D12_CLEAR_VALUE depthOptimizedClearValue = {};
+    depthOptimizedClearValue.Format = DXGI_FORMAT_D32_FLOAT;
+    depthOptimizedClearValue.DepthStencil.Depth = 1.0f;
+    depthOptimizedClearValue.DepthStencil.Stencil = 0;
+
+    CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
+    auto resourceDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_D32_FLOAT, app.windowWidth, app.windowHeight, 1, 0, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+    ASSERT_HRESULT(app.device->CreateCommittedResource(
+        &heapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &resourceDesc,
+        D3D12_RESOURCE_STATE_DEPTH_WRITE,
+        &depthOptimizedClearValue,
+        IID_PPV_ARGS(&app.depthStencilBuffer)
+    ));
+
+    app.device->CreateDepthStencilView(
+        app.depthStencilBuffer.Get(),
+        &dsDesc,
+        app.dsHeap->GetCPUDescriptorHandleForHeapStart()
+    );
+}
 
 void InitD3D(App& app)
 {
@@ -232,6 +273,8 @@ void InitD3D(App& app)
         rtvHandle.Offset(1, app.rtvDescriptorSize);
     }
 
+    SetupDepthStencil(app);
+
     ASSERT_HRESULT(
         device->CreateCommandAllocator(
             D3D12_COMMAND_LIST_TYPE_COPY,
@@ -324,6 +367,7 @@ ComPtr<ID3D12PipelineState> CreatePSO(
     psoDesc.NumRenderTargets = 1;
     psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     psoDesc.SampleDesc.Count = 1;
+    psoDesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
 
     ComPtr<ID3D12PipelineState> PSO;
 
@@ -398,7 +442,7 @@ AppAssets LoadAssets(App& app)
             &assets.gltfModel,
             &err,
             &warn,
-            app.dataDir + "/Suzanne.gltf"
+            app.dataDir + "/Duck.gltf"
         )
     );
 
@@ -1027,12 +1071,15 @@ void UpdateScene(App& app)
     float timeSeconds = (float)ticksSinceStart / (float)1e9;
 
     glm::mat4 translation = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, sin(timeSeconds) * 5.0f, 0.0f));
-    glm::mat4 scale = glm::scale(translation, glm::vec3(10.0f));
+    glm::mat4 scale = glm::scale(translation, glm::vec3(1.0f));
     glm::mat4 rotation = glm::rotate(scale, glm::radians(0.0f), glm::vec3(1, 0, 0));
     app.model.transform = rotation;
 
+    float camZ = sin(timeSeconds) * 500.0f;
+    float camX = cos(timeSeconds) * 500.0f;
+
     glm::mat4 projection = glm::perspective(glm::pi<float>() * 0.2f, (float)app.windowWidth / (float)app.windowHeight, 0.01f, 5000.0f);
-    glm::mat4 view = glm::lookAt(glm::vec3(0.0f, 0.0f, 100.0f), glm::vec3(0, 0.0f, 0), glm::vec3(0, 1, 0));
+    glm::mat4 view = glm::lookAt(glm::vec3(camX, 100.0f, camZ), glm::vec3(0, 100.0f, 0), glm::vec3(0, 1, 0));
     glm::mat4 model = app.model.transform;
     app.constantBufferData.MVP = projection * view * model;
 
@@ -1077,11 +1124,14 @@ void BuildCommandList(const App& app)
     commandList->ResourceBarrier(1, &barrier);
 
     CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(app.rtvHeap->GetCPUDescriptorHandleForHeapStart(), app.frameIdx, app.rtvDescriptorSize);
-    commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
+    CD3DX12_CPU_DESCRIPTOR_HANDLE dsvHandle(app.dsHeap->GetCPUDescriptorHandleForHeapStart());
+    commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, &dsvHandle);
 
     // Record commands.
     const float clearColor[] = { 0.0f, 0.2f, 0.4f, 1.0f };
     commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
+
+    commandList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 
     DrawModelCommandList(app.model, commandList, app.mainDescriptorHeap.Get());
 
