@@ -16,7 +16,6 @@
 #include <span>
 
 using namespace std::chrono;
-
 using namespace DirectX;
 
 const int FrameBufferCount = 2;
@@ -91,8 +90,10 @@ struct App {
     SDL_Window* window;
     HWND hwnd;
 
-    int windowWidth = 640;
-    int windowHeight = 480;
+    long long startTick;
+
+    int windowWidth = 1280;
+    int windowHeight = 720;
 
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12CommandQueue> commandQueue;
@@ -194,6 +195,7 @@ void InitD3D(App& app)
         swapChainDesc.OutputWindow = app.hwnd;
         swapChainDesc.SampleDesc.Count = 1;
         swapChainDesc.Windowed = TRUE;
+        swapChainDesc.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
 
         ComPtr<IDXGISwapChain> swapChain;
         ASSERT_HRESULT(
@@ -215,14 +217,6 @@ void InitD3D(App& app)
         rtvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
         ASSERT_HRESULT(
             device->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&app.rtvHeap))
-        );
-
-        D3D12_DESCRIPTOR_HEAP_DESC cbvHeapDesc = {};
-        cbvHeapDesc.NumDescriptors = 2;
-        cbvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-        cbvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        ASSERT_HRESULT(
-            device->CreateDescriptorHeap(&cbvHeapDesc, IID_PPV_ARGS(&app.mainDescriptorHeap))
         );
     }
 
@@ -404,7 +398,7 @@ AppAssets LoadAssets(App& app)
             &assets.gltfModel,
             &err,
             &warn,
-            app.dataDir + "/BoxTextured.gltf"
+            app.dataDir + "/Suzanne.gltf"
         )
     );
 
@@ -415,7 +409,9 @@ ComPtr<ID3D12Resource> CreateUploadHeap(App& app, const std::vector<D3D12_RESOUR
 {
     UINT64 uploadHeapSize = 0;
 
+    // Compute upload heap size
     for (const auto& desc : resourceDescs) {
+        // For textures we need to skip to the next multiple of D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.
         if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
             uploadHeapSize += D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - (uploadHeapSize % D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
         }
@@ -453,6 +449,7 @@ void CreateDescriptorHeap(
     std::vector<D3D12_GPU_DESCRIPTOR_HANDLE>& outHandles
 )
 {
+    // Allocate 1 descriptor for the constant buffer and the rest for the textures.
     const int NUM_CONSTANT_BUFFERS = 1;
     ID3D12DescriptorHeap* heap;
     int numDescriptors = NUM_CONSTANT_BUFFERS + model.textures.size();
@@ -903,16 +900,12 @@ void LoadScene(App& app, const AppAssets& assets)
         CD3DX12_DESCRIPTOR_RANGE1 ranges[2];
         CD3DX12_ROOT_PARAMETER1 rootParameters[2];
 
-        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC);
+        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE);
         ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC);
         rootParameters[0].InitAsDescriptorTable(1, &ranges[0], D3D12_SHADER_VISIBILITY_VERTEX);
         rootParameters[1].InitAsDescriptorTable(1, &ranges[1], D3D12_SHADER_VISIBILITY_PIXEL);
 
         D3D12_ROOT_SIGNATURE_FLAGS rootSignatureFlags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
-        // D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS |
-        // D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS |
-        // D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS |
-        // D3D12_ROOT_SIGNATURE_FLAG_DENY_PIXEL_SHADER_ROOT_ACCESS;
 
         // FIXME: This is going to have to be dynamic...
         D3D12_STATIC_SAMPLER_DESC sampler = {};
@@ -1029,7 +1022,9 @@ void LoadScene(App& app, const AppAssets& assets)
 
 void UpdateScene(App& app)
 {
-    float timeSeconds = (float)high_resolution_clock::now().time_since_epoch().count() / (float)1e9;
+    long long currentTick = high_resolution_clock::now().time_since_epoch().count();
+    long long ticksSinceStart = currentTick - app.startTick;
+    float timeSeconds = (float)ticksSinceStart / (float)1e9;
 
     glm::mat4 translation = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, sin(timeSeconds) * 5.0f, 0.0f));
     glm::mat4 scale = glm::scale(translation, glm::vec3(10.0f));
@@ -1037,7 +1032,7 @@ void UpdateScene(App& app)
     app.model.transform = rotation;
 
     glm::mat4 projection = glm::perspective(glm::pi<float>() * 0.2f, (float)app.windowWidth / (float)app.windowHeight, 0.01f, 5000.0f);
-    glm::mat4 view = glm::lookAt(glm::vec3(0.0f, 0.0f, -100.0f), glm::vec3(0, 0.0f, 0), glm::vec3(0, 1, 0));
+    glm::mat4 view = glm::lookAt(glm::vec3(0.0f, 0.0f, 100.0f), glm::vec3(0, 0.0f, 0), glm::vec3(0, 1, 0));
     glm::mat4 model = app.model.transform;
     app.constantBufferData.MVP = projection * view * model;
 
@@ -1107,7 +1102,7 @@ void RenderFrame(App& app)
     app.commandQueue->ExecuteCommandLists(_countof(ppCommandLists), ppCommandLists);
 
     ASSERT_HRESULT(
-        app.swapChain->Present(1, 0)
+        app.swapChain->Present(0, DXGI_PRESENT_ALLOW_TEARING)
     );
 
     WaitForPreviousFrame(app);
@@ -1127,6 +1122,8 @@ int RunApp(int argc, char** argv)
     }
 
     SDL_Event e;
+
+    app.startTick = high_resolution_clock().now().time_since_epoch().count();
 
     bool running = true;
     while (running) {
