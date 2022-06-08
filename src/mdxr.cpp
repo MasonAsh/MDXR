@@ -7,30 +7,50 @@
 #include <codecvt>
 #include <string>
 #include "tiny_gltf.h"
-#include "mesh.h"
 #include "glm/gtc/matrix_transform.hpp"
 #include "dxgidebug.h"
 #include "stb_image.h"
 #include <chrono>
 #include <algorithm>
 #include <span>
+#include <glm/gtc/type_ptr.hpp>
+#include <glm/gtx/quaternion.hpp>
 
 using namespace std::chrono;
-using namespace DirectX;
 
 const int FrameBufferCount = 2;
 
-struct Vertex {
-    XMFLOAT3 position;
-    XMFLOAT4 color;
-};
-
-struct ConstantBufferData {
+struct PerMeshConstantData {
     glm::mat4 MVP;
     float padding[48]; // 256 aligned
 };
+static_assert((sizeof(PerMeshConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
 
-static_assert((sizeof(ConstantBufferData) % 256) == 0, "Constant buffer must be 256-byte aligned");
+struct Primitive {
+    std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout;
+    std::vector<D3D12_VERTEX_BUFFER_VIEW> vertexBufferViews;
+    D3D12_INDEX_BUFFER_VIEW indexBufferView;
+    D3D12_PRIMITIVE_TOPOLOGY primitiveTopology;
+    ComPtr<ID3D12PipelineState> PSO;
+    D3D12_GPU_DESCRIPTOR_HANDLE srvHandle;
+    int indexCount;
+};
+
+struct Mesh {
+    std::vector<Primitive> primitives;
+
+    glm::mat4 modelMatrix;
+    PerMeshConstantData constantData;
+};
+
+struct Model {
+    std::vector<ComPtr<ID3D12Resource>> buffers;
+    std::vector<Mesh> meshes;
+
+    // All of the child mesh constant buffers stored in this constant buffer
+    ComPtr<ID3D12Resource> perMeshConstantBuffer;
+    UINT8* perMeshBufferPtr;
+};
 
 struct AppAssets {
     tinygltf::Model gltfModel;
@@ -122,18 +142,14 @@ struct App {
     ComPtr<ID3D12PipelineState> unlitMeshPSO;
 
     ComPtr<ID3D12DescriptorHeap> mainDescriptorHeap;
-    ConstantBufferData constantBufferData;
-    ComPtr<ID3D12Resource> constantBuffer;
-    UINT8* constantBufferDataPtr = nullptr;
 
     ComPtr<ID3D12DescriptorHeap> srvHeap;
 
     Model model;
 
-    std::vector<ComPtr<ID3D12Resource>> geometryBuffers;
-
     unsigned int frameIdx;
     unsigned int rtvDescriptorSize = 0;
+    unsigned int cbvSrvUavDescriptorSize = 0;
 };
 
 void SetupDepthStencil(App& app)
@@ -262,6 +278,7 @@ void InitD3D(App& app)
     }
 
     app.rtvDescriptorSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    app.cbvSrvUavDescriptorSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
     CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(app.rtvHeap->GetCPUDescriptorHandleForHeapStart());
     for (int i = 0; i < FrameBufferCount; i++) {
@@ -360,7 +377,7 @@ ComPtr<ID3D12PipelineState> CreatePSO(
     psoDesc.PS = { reinterpret_cast<UINT8*>(pixelShader->GetBufferPointer()), pixelShader->GetBufferSize() };
     psoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
     psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
-    psoDesc.DepthStencilState.DepthEnable = FALSE;
+    psoDesc.DepthStencilState.DepthEnable = TRUE;
     psoDesc.DepthStencilState.StencilEnable = FALSE;
     psoDesc.SampleMask = UINT_MAX;
     psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
@@ -368,6 +385,7 @@ ComPtr<ID3D12PipelineState> CreatePSO(
     psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     psoDesc.SampleDesc.Count = 1;
     psoDesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
+    psoDesc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
 
     ComPtr<ID3D12PipelineState> PSO;
 
@@ -413,11 +431,6 @@ ComPtr<ID3D12PipelineState> CreateDiffuseMeshPSO(
     );
 }
 
-void UpdateConstantBuffer(ConstantBufferData& constantBufferData, void* constantBufferPtr)
-{
-    memcpy(constantBufferPtr, &constantBufferData, sizeof(ConstantBufferData));
-}
-
 void WaitForPreviousFrame(App& app)
 {
     // WAITING FOR THE FRAME TO COMPLETE BEFORE CONTINUING IS NOT BEST PRACTICE.
@@ -442,7 +455,7 @@ AppAssets LoadAssets(App& app)
             &assets.gltfModel,
             &err,
             &warn,
-            app.dataDir + "/Duck.gltf"
+            app.dataDir + "/FlightHelmet/FlightHelmet.gltf"
         )
     );
 
@@ -485,18 +498,19 @@ ComPtr<ID3D12Resource> CreateUploadHeap(App& app, const std::vector<D3D12_RESOUR
     return uploadHeap;
 }
 
-void CreateDescriptorHeap(
+void CreateDescriptorsForModel(
     App& app,
     const tinygltf::Model& model,
     const std::span<ComPtr<ID3D12Resource>> textureResources,
     ComPtr<ID3D12DescriptorHeap>& outHeap,
-    std::vector<D3D12_GPU_DESCRIPTOR_HANDLE>& outHandles
+    std::vector<D3D12_GPU_DESCRIPTOR_HANDLE>& outHandles,
+    ComPtr<ID3D12Resource>& perMeshConstantBuffer
 )
 {
     // Allocate 1 descriptor for the constant buffer and the rest for the textures.
-    const int NUM_CONSTANT_BUFFERS = 1;
+    const int numConstantBuffers = model.meshes.size();
     ID3D12DescriptorHeap* heap;
-    int numDescriptors = NUM_CONSTANT_BUFFERS + model.textures.size();
+    int numDescriptors = numConstantBuffers + model.textures.size();
     outHandles.reserve(numDescriptors);
 
     D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
@@ -508,20 +522,50 @@ void CreateDescriptorHeap(
     );
 
     UINT incrementSize = app.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    CD3DX12_CPU_DESCRIPTOR_HANDLE cpuHandle(outHeap->GetCPUDescriptorHandleForHeapStart(), 1, incrementSize);
-    CD3DX12_GPU_DESCRIPTOR_HANDLE gpuHandle(outHeap->GetGPUDescriptorHandleForHeapStart(), 1, incrementSize);
-    for (int i = 0; i < textureResources.size(); i++) {
-        auto& textureResource = textureResources[i];
-        auto textureDesc = textureResource->GetDesc();
-        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        srvDesc.Format = textureDesc.Format;
-        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        srvDesc.Texture2D.MipLevels = 1;
-        app.device->CreateShaderResourceView(textureResource.Get(), &srvDesc, cpuHandle);
-        outHandles.push_back((D3D12_GPU_DESCRIPTOR_HANDLE)gpuHandle);
-        cpuHandle.Offset(1, incrementSize);
-        gpuHandle.Offset(1, incrementSize);
+
+    {
+        const UINT constantBufferSize = sizeof(PerMeshConstantData) * model.meshes.size();
+        CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_UPLOAD);
+        auto resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(constantBufferSize);
+        ASSERT_HRESULT(
+            app.device->CreateCommittedResource(
+                &heapProps,
+                D3D12_HEAP_FLAG_NONE,
+                &resourceDesc,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                nullptr,
+                IID_PPV_ARGS(&perMeshConstantBuffer)
+            )
+        );
+
+        CD3DX12_CPU_DESCRIPTOR_HANDLE cpuHandle(outHeap->GetCPUDescriptorHandleForHeapStart(), 0, incrementSize);
+        for (int i = 0; i < model.meshes.size(); i++) {
+            D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
+            cbvDesc.BufferLocation = perMeshConstantBuffer->GetGPUVirtualAddress() + (i * sizeof(PerMeshConstantData));
+            cbvDesc.SizeInBytes = sizeof(PerMeshConstantData);
+            app.device->CreateConstantBufferView(
+                &cbvDesc,
+                cpuHandle
+            );
+            cpuHandle.Offset(1, incrementSize);
+        }
+    }
+
+    {
+        CD3DX12_CPU_DESCRIPTOR_HANDLE cpuHandle(outHeap->GetCPUDescriptorHandleForHeapStart(), model.meshes.size(), incrementSize);
+        CD3DX12_GPU_DESCRIPTOR_HANDLE gpuHandle(outHeap->GetGPUDescriptorHandleForHeapStart(), model.meshes.size(), incrementSize);
+        for (const auto& textureResource : textureResources) {
+            auto textureDesc = textureResource->GetDesc();
+            D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+            srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srvDesc.Format = textureDesc.Format;
+            srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srvDesc.Texture2D.MipLevels = 1;
+            app.device->CreateShaderResourceView(textureResource.Get(), &srvDesc, cpuHandle);
+            outHandles.push_back((D3D12_GPU_DESCRIPTOR_HANDLE)gpuHandle);
+            cpuHandle.Offset(1, incrementSize);
+            gpuHandle.Offset(1, incrementSize);
+        }
     }
 }
 
@@ -685,10 +729,53 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
     return resourceBuffers;
 }
 
+glm::mat4 GetNodeTransfomMatrix(const tinygltf::Node& node) {
+    if (node.matrix.size() > 0) {
+        assert(node.matrix.size() == 16);
+        return glm::make_mat4(node.matrix.data());;
+    } else if (node.translation.size() > 0) {
+        auto translationData = node.translation.data();
+        auto rotationData = node.rotation.data();
+        auto scaleData = node.scale.data();
+
+        glm::vec3 translate = glm::make_vec3(translationData);
+        glm::quat rotation = glm::make_quat(rotationData);
+        glm::vec3 scale = glm::make_vec3(scaleData);
+
+        glm::mat4 T = glm::translate(glm::mat4(1.0f), translate);
+        glm::mat4 R = glm::toMat4(rotation);
+        glm::mat4 S = glm::scale(glm::mat4(), scale);
+        return S * R * T;
+    } else {
+        return glm::mat4(1.0f);
+    }
+}
+
+void TraverseNode(const tinygltf::Model& model, const tinygltf::Node& node, std::vector<Mesh>& meshes, const glm::mat4& accumulator) {
+    glm::mat4 transform = accumulator * GetNodeTransfomMatrix(node);
+    if (node.mesh != -1) {
+        meshes[node.mesh].modelMatrix = transform;
+    }
+    for (const auto& child : node.children) {
+        TraverseNode(model, model.nodes[child], meshes, accumulator);
+    }
+}
+
+void ResolveMeshTransforms(
+    const tinygltf::Model& model,
+    std::vector<Mesh>& meshes
+)
+{
+    for (const auto& node : model.scenes[model.defaultScene].nodes) {
+        TraverseNode(model, model.nodes[node], meshes, glm::mat4(1.0f));
+    }
+}
+
 Model FinalizeModel(
     const tinygltf::Model& model,
     const std::vector<ComPtr<ID3D12Resource>>& resourceBuffers,
-    const std::vector<D3D12_GPU_DESCRIPTOR_HANDLE>& srvHandles
+    const std::vector<D3D12_GPU_DESCRIPTOR_HANDLE>& srvHandles,
+    ComPtr<ID3D12Resource> perMeshConstantBuffer
 )
 {
     // Just storing these strings so that we don't have to keep the Model object around.
@@ -716,14 +803,15 @@ Model FinalizeModel(
     };
 
     Model result;
-
     result.buffers = resourceBuffers;
+
+    result.perMeshConstantBuffer = perMeshConstantBuffer;
+    CD3DX12_RANGE readRange(0, 0);
+    ASSERT_HRESULT(perMeshConstantBuffer->Map(0, &readRange, reinterpret_cast<void**>(&result.perMeshBufferPtr)));
 
     // textures begin immediately after the geometry buffers
     int baseTextureIdx = model.buffers.size();
 
-    std::vector<Mesh> meshes;
-    meshes.reserve(model.meshes.size());
     for (const auto& mesh : model.meshes) {
         std::vector<Primitive> primitives;
         for (const auto& primitive : mesh.primitives) {
@@ -839,14 +927,6 @@ Model FinalizeModel(
             {
                 auto material = model.materials[primitive.material];
                 int texIdx = material.pbrMetallicRoughness.baseColorTexture.index;
-                // int texcoord = material.pbrMetallicRoughness.baseColorTexture.texCoord;
-                // int imageBufferIdx = baseTextureIdx + model.textures[texIdx].source;
-                // auto resourceBuffer = resourceBuffers[imageBufferIdx];
-                // D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc;
-                // srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-                // srvDesc.Format = resourceBuffer->GetDesc().Format;
-                // srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-                // srvDesc.Texture2D.MipLevels = 1;
                 drawCall.srvHandle = srvHandles[texIdx];
             }
 
@@ -878,6 +958,8 @@ Model FinalizeModel(
         result.meshes.push_back(Mesh{ primitives });
     }
 
+    ResolveMeshTransforms(model, result.meshes);
+
     return result;
 }
 
@@ -905,11 +987,11 @@ void ProcessAssets(App& app, const AppAssets& assets)
 
     std::vector<D3D12_GPU_DESCRIPTOR_HANDLE> srvHandles;
     ComPtr<ID3D12DescriptorHeap> mainDescriptorHeap;
-    CreateDescriptorHeap(app, assets.gltfModel, textureBuffers, mainDescriptorHeap, srvHandles);
+    ComPtr<ID3D12Resource> perMeshConstantBuffer;
+    CreateDescriptorsForModel(app, assets.gltfModel, textureBuffers, mainDescriptorHeap, srvHandles, perMeshConstantBuffer);
     app.mainDescriptorHeap = mainDescriptorHeap;
 
-    app.model = FinalizeModel(assets.gltfModel, resourceBuffers, srvHandles);
-    app.model.transform = glm::scale(glm::rotate(glm::mat4(1.0f), glm::radians(90.0f), glm::vec3(1, 0, 0)), glm::vec3(10.0f));
+    app.model = FinalizeModel(assets.gltfModel, resourceBuffers, srvHandles, perMeshConstantBuffer);
 
     for (auto& mesh : app.model.meshes) {
         for (auto& primitive : mesh.primitives) {
@@ -945,7 +1027,7 @@ void LoadScene(App& app, const AppAssets& assets)
         CD3DX12_ROOT_PARAMETER1 rootParameters[2];
 
         ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE);
-        ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC);
+        ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE);
         rootParameters[0].InitAsDescriptorTable(1, &ranges[0], D3D12_SHADER_VISIBILITY_VERTEX);
         rootParameters[1].InitAsDescriptorTable(1, &ranges[1], D3D12_SHADER_VISIBILITY_PIXEL);
 
@@ -1029,39 +1111,17 @@ void LoadScene(App& app, const AppAssets& assets)
     }
 
     ProcessAssets(app, assets);
+}
 
-    {
-        const UINT constantBufferSize = sizeof(ConstantBufferData);
-        CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_UPLOAD);
-        auto resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(constantBufferSize);
-        ASSERT_HRESULT(
-            device->CreateCommittedResource(
-                &heapProps,
-                D3D12_HEAP_FLAG_NONE,
-                &resourceDesc,
-                D3D12_RESOURCE_STATE_GENERIC_READ,
-                nullptr,
-                IID_PPV_ARGS(&app.constantBuffer)
-            )
-        );
-
-        D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
-        cbvDesc.BufferLocation = app.constantBuffer->GetGPUVirtualAddress();
-        cbvDesc.SizeInBytes = constantBufferSize;
-        device->CreateConstantBufferView(
-            &cbvDesc,
-            app.mainDescriptorHeap->GetCPUDescriptorHandleForHeapStart()
-        );
-
-        CD3DX12_RANGE readRange(0, 0);
-        ASSERT_HRESULT(
-            app.constantBuffer->Map(0, &readRange, reinterpret_cast<void**>(&app.constantBufferDataPtr))
-        );
+void UpdatePerMeshConstantBuffers(Model& model, const glm::mat4& viewProjection)
+{
+    PerMeshConstantData* perMeshArray = reinterpret_cast<PerMeshConstantData*>(model.perMeshBufferPtr);
+    for (int i = 0; i < model.meshes.size(); i++) {
+        auto& mesh = model.meshes[i];
+        auto modelMatrix = mesh.modelMatrix;
+        auto mvp = viewProjection * modelMatrix;
+        perMeshArray[i].MVP = mvp;
     }
-
-    UpdateConstantBuffer(app.constantBufferData, app.constantBufferDataPtr);
-
-    WaitForPreviousFrame(app);
 }
 
 void UpdateScene(App& app)
@@ -1070,28 +1130,25 @@ void UpdateScene(App& app)
     long long ticksSinceStart = currentTick - app.startTick;
     float timeSeconds = (float)ticksSinceStart / (float)1e9;
 
-    glm::mat4 translation = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, sin(timeSeconds) * 5.0f, 0.0f));
-    glm::mat4 scale = glm::scale(translation, glm::vec3(1.0f));
-    glm::mat4 rotation = glm::rotate(scale, glm::radians(0.0f), glm::vec3(1, 0, 0));
-    app.model.transform = rotation;
-
-    float camZ = sin(timeSeconds) * 500.0f;
-    float camX = cos(timeSeconds) * 500.0f;
+    float camZ = sin(timeSeconds) * 2.0f;
+    float camX = cos(timeSeconds) * 2.0f;
+    float camY = 0.4f;
 
     glm::mat4 projection = glm::perspective(glm::pi<float>() * 0.2f, (float)app.windowWidth / (float)app.windowHeight, 0.01f, 5000.0f);
-    glm::mat4 view = glm::lookAt(glm::vec3(camX, 100.0f, camZ), glm::vec3(0, 100.0f, 0), glm::vec3(0, 1, 0));
-    glm::mat4 model = app.model.transform;
-    app.constantBufferData.MVP = projection * view * model;
+    glm::mat4 view = glm::lookAt(glm::vec3(camX, camY, camZ), glm::vec3(0, camY, 0), glm::vec3(0, 1, 0));
+    glm::mat4 viewProjection = projection * view;
 
-    UpdateConstantBuffer(app.constantBufferData, app.constantBufferDataPtr);
+    UpdatePerMeshConstantBuffers(app.model, viewProjection);
 }
 
-void DrawModelCommandList(const Model& model, ID3D12GraphicsCommandList* commandList, ID3D12DescriptorHeap* mainDescriptorHeap)
+void DrawModelCommandList(const Model& model, ID3D12GraphicsCommandList* commandList, ID3D12DescriptorHeap* mainDescriptorHeap, int cbvOffsetIncrement)
 {
     ID3D12DescriptorHeap* ppHeaps[] = { mainDescriptorHeap };
     commandList->SetDescriptorHeaps(1, ppHeaps);
-    commandList->SetGraphicsRootDescriptorTable(0, mainDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
+    CD3DX12_GPU_DESCRIPTOR_HANDLE constantBufferHandle(mainDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
     for (const auto& mesh : model.meshes) {
+        // Set the per-mesh constant buffer
+        commandList->SetGraphicsRootDescriptorTable(0, constantBufferHandle);
         for (const auto& primitive : mesh.primitives) {
             commandList->SetGraphicsRootDescriptorTable(1, primitive.srvHandle);
             commandList->IASetPrimitiveTopology(primitive.primitiveTopology);
@@ -1100,6 +1157,7 @@ void DrawModelCommandList(const Model& model, ID3D12GraphicsCommandList* command
             commandList->IASetIndexBuffer(&primitive.indexBufferView);
             commandList->DrawIndexedInstanced(primitive.indexCount, 1, 0, 0, 0);
         }
+        constantBufferHandle.Offset(1, cbvOffsetIncrement);
     }
 }
 
@@ -1130,10 +1188,9 @@ void BuildCommandList(const App& app)
     // Record commands.
     const float clearColor[] = { 0.0f, 0.2f, 0.4f, 1.0f };
     commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
-
     commandList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 
-    DrawModelCommandList(app.model, commandList, app.mainDescriptorHeap.Get());
+    DrawModelCommandList(app.model, commandList, app.mainDescriptorHeap.Get(), app.cbvSrvUavDescriptorSize);
 
     // Indicate that the back buffer will now be used to present.
     barrier = CD3DX12_RESOURCE_BARRIER::Transition(app.renderTargets[app.frameIdx].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);

@@ -19,8 +19,6 @@ add_executable(mdxr
     src/mdxr.h
     src/mdxr.cpp
     src/tiny_gltf_impl.cpp
-    src/mesh.h
-    src/mesh.cpp
 
     # third party
     src/stb_image.h

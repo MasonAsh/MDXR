@@ -5,7 +5,6 @@
 #include <directx/d3dx12.h>
 #include <dxgi1_4.h>
 #include <wrl.h>
-#include "mesh.h"
 #include "glm/glm.hpp"
 
 using namespace Microsoft::WRL;
