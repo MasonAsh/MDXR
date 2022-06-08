@@ -156,8 +156,9 @@ struct App {
     unsigned int cbvSrvUavDescriptorSize = 0;
 };
 
-void SetupDepthStencil(App& app)
+void SetupDepthStencil(App& app, bool isResize)
 {
+    if (!isResize)
     {
         D3D12_DESCRIPTOR_HEAP_DESC dsHeapDesc = {};
         dsHeapDesc.NumDescriptors = 1;
@@ -176,6 +177,7 @@ void SetupDepthStencil(App& app)
     depthOptimizedClearValue.DepthStencil.Depth = 1.0f;
     depthOptimizedClearValue.DepthStencil.Stencil = 0;
 
+    ComPtr<ID3D12Resource> depthStencilBuffer;
     CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
     auto resourceDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_D32_FLOAT, app.windowWidth, app.windowHeight, 1, 0, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
     ASSERT_HRESULT(app.device->CreateCommittedResource(
@@ -184,14 +186,28 @@ void SetupDepthStencil(App& app)
         &resourceDesc,
         D3D12_RESOURCE_STATE_DEPTH_WRITE,
         &depthOptimizedClearValue,
-        IID_PPV_ARGS(&app.depthStencilBuffer)
+        IID_PPV_ARGS(&depthStencilBuffer)
     ));
+    app.depthStencilBuffer = depthStencilBuffer;
 
     app.device->CreateDepthStencilView(
         app.depthStencilBuffer.Get(),
         &dsDesc,
         app.dsHeap->GetCPUDescriptorHandleForHeapStart()
     );
+}
+
+void SetupRenderTargets(App& app)
+{
+    CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(app.rtvHeap->GetCPUDescriptorHandleForHeapStart());
+    for (int i = 0; i < FrameBufferCount; i++) {
+        ASSERT_HRESULT(
+            app.swapChain->GetBuffer(i, IID_PPV_ARGS(&app.renderTargets[i]))
+        );
+
+        app.device->CreateRenderTargetView(app.renderTargets[i].Get(), nullptr, rtvHandle);
+        rtvHandle.Offset(1, app.rtvDescriptorSize);
+    }
 }
 
 void InitD3D(App& app)
@@ -284,17 +300,8 @@ void InitD3D(App& app)
     app.rtvDescriptorSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     app.cbvSrvUavDescriptorSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
-    CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(app.rtvHeap->GetCPUDescriptorHandleForHeapStart());
-    for (int i = 0; i < FrameBufferCount; i++) {
-        ASSERT_HRESULT(
-            app.swapChain->GetBuffer(i, IID_PPV_ARGS(&app.renderTargets[i]))
-        );
-
-        device->CreateRenderTargetView(app.renderTargets[i].Get(), nullptr, rtvHandle);
-        rtvHandle.Offset(1, app.rtvDescriptorSize);
-    }
-
-    SetupDepthStencil(app);
+    SetupRenderTargets(app);
+    SetupDepthStencil(app, false);
 
     ASSERT_HRESULT(
         device->CreateCommandAllocator(
@@ -317,7 +324,7 @@ void InitWindow(App& app)
         SDL_WINDOWPOS_CENTERED,
         SDL_WINDOWPOS_CENTERED,
         app.windowWidth, app.windowHeight,
-        0
+        SDL_WINDOW_RESIZABLE
     );
 
     assert(window);
@@ -1140,8 +1147,6 @@ void LoadScene(App& app, const AppAssets& assets)
 
     ID3D12GraphicsCommandList* commandList = app.commandList.Get();
 
-    float aspectRatio = (float)app.windowWidth / (float)app.windowHeight;
-
     {
         app.fence.Initialize(app.device.Get());
         app.copyFence.Initialize(app.device.Get());
@@ -1257,6 +1262,26 @@ void RenderFrame(App& app)
     WaitForPreviousFrame(app);
 }
 
+void HandleResize(App& app, int newWidth, int newHeight)
+{
+    // Release references to the buffers before resizing.
+    for (auto& renderTarget : app.renderTargets) {
+        renderTarget = nullptr;
+    }
+
+    app.swapChain->ResizeBuffers(2, newWidth, newHeight, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
+    app.viewport.Width = newWidth;
+    app.viewport.Height = newHeight;
+    app.windowWidth = newWidth;
+    app.windowHeight = newHeight;
+    app.scissorRect = CD3DX12_RECT(0, 0, static_cast<LONG>(newWidth), static_cast<LONG>(newHeight));
+
+    SetupRenderTargets(app);
+    SetupDepthStencil(app, true);
+
+    app.frameIdx = app.swapChain->GetCurrentBackBufferIndex();
+}
+
 int RunApp(int argc, char** argv)
 {
     App app;
@@ -1279,6 +1304,12 @@ int RunApp(int argc, char** argv)
         while (SDL_PollEvent(&e) > 0) {
             if (e.type == SDL_QUIT) {
                 running = false;
+            } else if (e.type == SDL_WINDOWEVENT) {
+                if (e.window.event == SDL_WINDOWEVENT_RESIZED) {
+                    int newWidth = e.window.data1;
+                    int newHeight = e.window.data2;
+                    HandleResize(app, newWidth, newHeight);
+                }
             }
         }
 
