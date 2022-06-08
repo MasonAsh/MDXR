@@ -9,6 +9,8 @@
 #include <codecvt>
 #include <string>
 
+#include "glm/glm.hpp"
+
 #define ASSERT_HRESULT(hr) \
     if (!SUCCEEDED((hr))) { \
         _com_error err(hr); \
@@ -35,5 +37,16 @@ std::array<
         typename std::common_type<T...>::type>::type,
         sizeof...(T)>{std::forward<T>(values)...};
 }
+
+// Allow printing glm vectors with cout
+std::ostream& operator<< (std::ostream& out, const glm::vec3& vec) {
+    out << "{"
+        << vec.x << " " << vec.y << " " << vec.z
+        << "}";
+
+    return out;
+}
+
+#define DEBUG_VAR(vec) std::cout << #vec << ": " << vec << "\n";
 
 #endif // UTIL_H

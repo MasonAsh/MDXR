@@ -105,6 +105,26 @@ struct IncrementalFence {
     }
 };
 
+struct Camera {
+    glm::vec3 translation;
+
+    float yaw;
+    float pitch;
+
+    float maxPitch = glm::radians(70.0f);
+
+    float targetSpeed = 7.0f;
+    float maxSpeed = 20.0f;
+    float minSpeed = 1.0f;
+
+    bool locked = true;
+};
+
+struct MouseState {
+    int xrel, yrel;
+    float scrollDelta;
+};
+
 struct App {
     std::string dataDir;
     std::wstring wDataDir;
@@ -113,6 +133,7 @@ struct App {
     HWND hwnd;
 
     long long startTick;
+    long long lastFrameTick;
 
     int windowWidth = 1280;
     int windowHeight = 720;
@@ -154,6 +175,10 @@ struct App {
     unsigned int frameIdx;
     unsigned int rtvDescriptorSize = 0;
     unsigned int cbvSrvUavDescriptorSize = 0;
+
+    Camera camera;
+    const UINT8* keyState;
+    MouseState mouseState;
 };
 
 void SetupDepthStencil(App& app, bool isResize)
@@ -335,6 +360,8 @@ void InitWindow(App& app)
     SDL_VERSION(&wmInfo.version);
     assert(SDL_GetWindowWMInfo(window, &wmInfo));
     app.hwnd = wmInfo.info.win.window;
+
+    app.keyState = SDL_GetKeyboardState(nullptr);
 }
 
 void InitApp(App& app, int argc, char** argv)
@@ -399,7 +426,6 @@ ComPtr<ID3D12PipelineState> CreatePSO(
     psoDesc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
 
     ComPtr<ID3D12PipelineState> PSO;
-
     ASSERT_HRESULT(
         device->CreateGraphicsPipelineState(
             &psoDesc,
@@ -466,7 +492,7 @@ AppAssets LoadAssets(App& app)
             &assets.models[0],
             &err,
             &warn,
-            app.dataDir + "/FlightHelmet/FlightHelmet.gltf"
+            app.dataDir + "/floor/floor.gltf"
         )
     );
 
@@ -787,12 +813,18 @@ void TraverseNode(const tinygltf::Model& model, const tinygltf::Node& node, std:
     }
 }
 
+// Traverse the GLTF scene to get the correct model matrix for each mesh.
 void ResolveMeshTransforms(
     const tinygltf::Model& model,
     std::vector<Mesh>& meshes
 )
 {
-    for (const auto& node : model.scenes[model.defaultScene].nodes) {
+    if (model.scenes.size() == 0) {
+        return;
+    }
+
+    int scene = model.defaultScene != 0 ? model.defaultScene : 0;
+    for (const auto& node : model.scenes[scene].nodes) {
         TraverseNode(model, model.nodes[node], meshes, glm::mat4(1.0f));
     }
 }
@@ -835,9 +867,6 @@ Model FinalizeModel(
     result.perMeshConstantBuffer = perMeshConstantBuffer;
     CD3DX12_RANGE readRange(0, 0);
     ASSERT_HRESULT(perMeshConstantBuffer->Map(0, &readRange, reinterpret_cast<void**>(&result.perMeshBufferPtr)));
-
-    // textures begin immediately after the geometry buffers
-    int baseTextureIdx = model.buffers.size();
 
     for (const auto& mesh : model.meshes) {
         std::vector<Primitive> primitives;
@@ -1155,6 +1184,12 @@ void LoadScene(App& app, const AppAssets& assets)
     ProcessAssets(app, assets);
 }
 
+void InitializeScene(App& app) {
+    app.camera.translation = glm::vec3(-3.0f, 0.5f, 0.0f);
+    app.camera.pitch = 0.0f;
+    app.camera.yaw = 0.0f;
+}
+
 void UpdatePerMeshConstantBuffers(Model& model, const glm::mat4& viewProjection)
 {
     PerMeshConstantData* perMeshArray = reinterpret_cast<PerMeshConstantData*>(model.perMeshBufferPtr);
@@ -1166,18 +1201,68 @@ void UpdatePerMeshConstantBuffers(Model& model, const glm::mat4& viewProjection)
     }
 }
 
+// Updates the camera to behave like a flying camera.
+// WASD moves laterally and Q and E lower and raise the camera.
+// Only updates when the user is pressing the right mouse button.
+glm::mat4 UpdateFlyCamera(App& app, float deltaSeconds)
+{
+    glm::vec3 cameraMovement(0.0f);
+
+    if (!app.camera.locked) {
+        app.camera.targetSpeed += app.mouseState.scrollDelta * 1.0f;
+        app.camera.targetSpeed = glm::clamp(app.camera.targetSpeed, app.camera.minSpeed, app.camera.maxSpeed);
+        const float RADIANS_PER_PIXEL = glm::radians(0.1f);
+        app.camera.yaw += (float)app.mouseState.xrel * RADIANS_PER_PIXEL;
+        app.camera.pitch += (float)app.mouseState.yrel * RADIANS_PER_PIXEL;
+        app.camera.pitch = glm::clamp(app.camera.pitch, -app.camera.maxPitch, app.camera.maxPitch);
+    }
+
+    float yaw = app.camera.yaw;
+    float pitch = app.camera.pitch;
+
+    glm::vec3 cameraForward;
+    cameraForward.x = cos(-yaw) * cos(-pitch);
+    cameraForward.y = sin(-pitch);
+    cameraForward.z = sin(-yaw) * cos(-pitch);
+    cameraForward = glm::normalize(cameraForward);
+
+    float right = app.keyState[SDL_SCANCODE_D] ? 1.0f : 0.0f;
+    float left = app.keyState[SDL_SCANCODE_A] ? -1.0f : 0.0f;
+    float forward = app.keyState[SDL_SCANCODE_W] ? 1.0f : 0.0f;
+    float backward = app.keyState[SDL_SCANCODE_S] ? -1.0f : 0.0f;
+    float up = app.keyState[SDL_SCANCODE_E] ? 1.0f : 0.0f;
+    float down = app.keyState[SDL_SCANCODE_Q] ? -1.0f : 0.0f;
+
+    glm::vec3 inputVector = glm::vec3(right + left, up + down, forward + backward);
+
+
+    glm::vec3 upVector = glm::vec3(0.0f, 1.0f, 0.0f);
+
+    float speed = app.camera.targetSpeed * deltaSeconds;
+
+    if (!app.camera.locked) {
+        glm::vec3 vecUp(0.0f, 1.0f, 0.0f);
+        cameraMovement += inputVector.z * cameraForward;
+        cameraMovement -= inputVector.x * glm::normalize(glm::cross(cameraForward, vecUp));
+        cameraMovement.y += inputVector.y;
+        cameraMovement *= speed;
+        app.camera.translation += cameraMovement;
+    }
+
+    // Create view matrix
+    return glm::lookAt(app.camera.translation, app.camera.translation + cameraForward, glm::vec3(0, 1, 0));
+}
+
 void UpdateScene(App& app)
 {
     long long currentTick = high_resolution_clock::now().time_since_epoch().count();
     long long ticksSinceStart = currentTick - app.startTick;
     float timeSeconds = (float)ticksSinceStart / (float)1e9;
-
-    float camZ = sin(timeSeconds) * 2.0f;
-    float camX = cos(timeSeconds) * 2.0f;
-    float camY = 0.4f;
+    long long deltaTicks = currentTick - app.lastFrameTick;
+    float deltaSeconds = (float)deltaTicks / (float)1e9;
 
     glm::mat4 projection = glm::perspective(glm::pi<float>() * 0.2f, (float)app.windowWidth / (float)app.windowHeight, 0.01f, 5000.0f);
-    glm::mat4 view = glm::lookAt(glm::vec3(camX, camY, camZ), glm::vec3(0, camY, 0), glm::vec3(0, 1, 0));
+    glm::mat4 view = UpdateFlyCamera(app, deltaSeconds);
     glm::mat4 viewProjection = projection * view;
 
     for (auto& model : app.models) {
@@ -1290,6 +1375,8 @@ int RunApp(int argc, char** argv)
     InitWindow(app);
     InitD3D(app);
 
+    InitializeScene(app);
+
     {
         AppAssets assets = LoadAssets(app);
         LoadScene(app, assets);
@@ -1298,9 +1385,19 @@ int RunApp(int argc, char** argv)
     SDL_Event e;
 
     app.startTick = high_resolution_clock().now().time_since_epoch().count();
+    app.lastFrameTick = app.startTick;
+
+    glm::vec3 inputVector;
+
+    int mouseX, mouseY;
+    int buttonState = SDL_GetMouseState(&mouseX, &mouseY);
 
     bool running = true;
     while (running) {
+        long long frameTick = high_resolution_clock().now().time_since_epoch().count();
+        app.mouseState.xrel = 0;
+        app.mouseState.yrel = 0;
+        app.mouseState.scrollDelta = 0;
         while (SDL_PollEvent(&e) > 0) {
             if (e.type == SDL_QUIT) {
                 running = false;
@@ -1310,11 +1407,31 @@ int RunApp(int argc, char** argv)
                     int newHeight = e.window.data2;
                     HandleResize(app, newWidth, newHeight);
                 }
+            } else if (e.type == SDL_MOUSEMOTION) {
+                app.mouseState.xrel = e.motion.xrel;
+                app.mouseState.yrel = e.motion.yrel;
+            } else if (e.type == SDL_MOUSEWHEEL) {
+                app.mouseState.scrollDelta = e.wheel.preciseY;
+            }
+        }
+
+        buttonState = SDL_GetMouseState(&mouseX, &mouseY);
+
+        app.camera.locked = (buttonState & SDL_BUTTON_RMASK) == 0;
+        if (!app.camera.locked) {
+            if (!SDL_GetRelativeMouseMode()) {
+                SDL_SetRelativeMouseMode(SDL_TRUE);
+            }
+        } else {
+            if (SDL_GetRelativeMouseMode()) {
+                SDL_SetRelativeMouseMode(SDL_FALSE);
             }
         }
 
         UpdateScene(app);
         RenderFrame(app);
+
+        app.lastFrameTick = frameTick;
     }
 
     WaitForPreviousFrame(app);
