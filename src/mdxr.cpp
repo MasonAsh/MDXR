@@ -47,13 +47,15 @@ struct Model {
     std::vector<ComPtr<ID3D12Resource>> buffers;
     std::vector<Mesh> meshes;
 
+    ComPtr<ID3D12DescriptorHeap> mainDescriptorHeap;
+
     // All of the child mesh constant buffers stored in this constant buffer
     ComPtr<ID3D12Resource> perMeshConstantBuffer;
     UINT8* perMeshBufferPtr;
 };
 
 struct AppAssets {
-    tinygltf::Model gltfModel;
+    tinygltf::Model models[2];
 };
 
 struct IncrementalFence {
@@ -141,11 +143,13 @@ struct App {
 
     ComPtr<ID3D12PipelineState> unlitMeshPSO;
 
-    ComPtr<ID3D12DescriptorHeap> mainDescriptorHeap;
-
     ComPtr<ID3D12DescriptorHeap> srvHeap;
 
-    Model model;
+    // FIXME: Models should only exist as a concept in the scene graph.
+    // there is no reason the renderer itself has to group it like this.
+    // All the model data should be handled by special allocators and grouped into
+    // resource pools.
+    std::vector<Model> models;
 
     unsigned int frameIdx;
     unsigned int rtvDescriptorSize = 0;
@@ -447,17 +451,32 @@ AppAssets LoadAssets(App& app)
     AppAssets assets;
 
     tinygltf::TinyGLTF loader;
-    tinygltf::Model gltf;
     std::string err;
     std::string warn;
+
     assert(
         loader.LoadASCIIFromFile(
-            &assets.gltfModel,
+            &assets.models[0],
             &err,
             &warn,
             app.dataDir + "/FlightHelmet/FlightHelmet.gltf"
         )
     );
+
+    assert(
+        loader.LoadASCIIFromFile(
+            &assets.models[1],
+            &err,
+            &warn,
+            app.dataDir + "/Duck.gltf"
+        )
+    );
+    glm::dmat4 boxTransform(1.0);
+    boxTransform = glm::scale(boxTransform, glm::dvec3(0.08));
+    boxTransform = glm::translate(boxTransform, glm::dvec3(-120.0, 120.0, 160.0));
+    boxTransform = glm::rotate(boxTransform, glm::radians(290.0), glm::dvec3(0.0, 1.0, 0.0));
+    assets.models[1].nodes[2].matrix = std::vector<double>((double*)&boxTransform[0], (double*)&boxTransform[0] + 16);
+    //memcpy(assets.models[1].nodes[2].matrix.data(), &boxTransform[0], sizeof(glm::mat4));
 
     return assets;
 }
@@ -744,7 +763,7 @@ glm::mat4 GetNodeTransfomMatrix(const tinygltf::Node& node) {
 
         glm::mat4 T = glm::translate(glm::mat4(1.0f), translate);
         glm::mat4 R = glm::toMat4(rotation);
-        glm::mat4 S = glm::scale(glm::mat4(), scale);
+        glm::mat4 S = glm::scale(glm::mat4(1.0f), scale);
         return S * R * T;
     } else {
         return glm::mat4(1.0f);
@@ -757,7 +776,7 @@ void TraverseNode(const tinygltf::Model& model, const tinygltf::Node& node, std:
         meshes[node.mesh].modelMatrix = transform;
     }
     for (const auto& child : node.children) {
-        TraverseNode(model, model.nodes[child], meshes, accumulator);
+        TraverseNode(model, model.nodes[child], meshes, transform);
     }
 }
 
@@ -772,6 +791,7 @@ void ResolveMeshTransforms(
 }
 
 Model FinalizeModel(
+    App& app,
     const tinygltf::Model& model,
     const std::vector<ComPtr<ID3D12Resource>>& resourceBuffers,
     const std::vector<D3D12_GPU_DESCRIPTOR_HANDLE>& srvHandles,
@@ -927,7 +947,9 @@ Model FinalizeModel(
             {
                 auto material = model.materials[primitive.material];
                 int texIdx = material.pbrMetallicRoughness.baseColorTexture.index;
-                drawCall.srvHandle = srvHandles[texIdx];
+                if (texIdx != -1) {
+                    drawCall.srvHandle = srvHandles[texIdx];
+                }
             }
 
             {
@@ -960,40 +982,8 @@ Model FinalizeModel(
 
     ResolveMeshTransforms(model, result.meshes);
 
-    return result;
-}
-
-void ProcessAssets(App& app, const AppAssets& assets)
-{
-    auto resourceDescs = CreateResourceDescriptions(assets.gltfModel);
-
-    std::vector<UINT64> uploadOffsets;
-    auto uploadHeap = CreateUploadHeap(app, resourceDescs, uploadOffsets);
-
-    std::span<ComPtr<ID3D12Resource>> geometryBuffers;
-    std::span<ComPtr<ID3D12Resource>> textureBuffers;
-
-    // Can only call this ONCE before command list executed
-    // This will need to be adapted to handle N models.
-    auto resourceBuffers = UploadModelBuffers(
-        app,
-        assets.gltfModel,
-        uploadHeap,
-        resourceDescs,
-        uploadOffsets,
-        geometryBuffers,
-        textureBuffers
-    );
-
-    std::vector<D3D12_GPU_DESCRIPTOR_HANDLE> srvHandles;
-    ComPtr<ID3D12DescriptorHeap> mainDescriptorHeap;
-    ComPtr<ID3D12Resource> perMeshConstantBuffer;
-    CreateDescriptorsForModel(app, assets.gltfModel, textureBuffers, mainDescriptorHeap, srvHandles, perMeshConstantBuffer);
-    app.mainDescriptorHeap = mainDescriptorHeap;
-
-    app.model = FinalizeModel(assets.gltfModel, resourceBuffers, srvHandles, perMeshConstantBuffer);
-
-    for (auto& mesh : app.model.meshes) {
+    // FIXME: So many wasted PSOs.
+    for (auto& mesh : result.meshes) {
         for (auto& primitive : mesh.primitives) {
             primitive.PSO = CreateDiffuseMeshPSO(
                 app.device.Get(),
@@ -1004,12 +994,59 @@ void ProcessAssets(App& app, const AppAssets& assets)
         }
     }
 
+    return result;
+}
+
+void ProcessAssets(App& app, const AppAssets& assets)
+{
+    // TODO: easy candidate for multithreading
+    for (const auto& gltfModel : assets.models) {
+        auto resourceDescs = CreateResourceDescriptions(gltfModel);
+
+        std::vector<UINT64> uploadOffsets;
+        auto uploadHeap = CreateUploadHeap(app, resourceDescs, uploadOffsets);
+
+        std::span<ComPtr<ID3D12Resource>> geometryBuffers;
+        std::span<ComPtr<ID3D12Resource>> textureBuffers;
+
+        // Can only call this ONCE before command list executed
+        // This will need to be adapted to handle N models.
+        auto resourceBuffers = UploadModelBuffers(
+            app,
+            gltfModel,
+            uploadHeap,
+            resourceDescs,
+            uploadOffsets,
+            geometryBuffers,
+            textureBuffers
+        );
+
+        std::vector<D3D12_GPU_DESCRIPTOR_HANDLE> srvHandles;
+        ComPtr<ID3D12DescriptorHeap> mainDescriptorHeap;
+        ComPtr<ID3D12Resource> perMeshConstantBuffer;
+        CreateDescriptorsForModel(app, gltfModel, textureBuffers, mainDescriptorHeap, srvHandles, perMeshConstantBuffer);
+
+        Model model = FinalizeModel(app, gltfModel, resourceBuffers, srvHandles, perMeshConstantBuffer);
+        model.mainDescriptorHeap = mainDescriptorHeap;
+
+        app.models.push_back(model);
+
+        app.commandList->Close();
+
+        ID3D12CommandList* ppCommandLists[] = { app.commandList.Get() };
+        app.commandQueue->ExecuteCommandLists(1, ppCommandLists);
+        WaitForPreviousFrame(app);
+
+        ASSERT_HRESULT(
+            app.commandAllocator->Reset()
+        );
+
+        ASSERT_HRESULT(
+            app.commandList->Reset(app.commandAllocator.Get(), app.pipelineState.Get())
+        );
+    }
+
     app.commandList->Close();
-
-    ID3D12CommandList* ppCommandLists[] = { app.commandList.Get() };
-    app.commandQueue->ExecuteCommandLists(1, ppCommandLists);
-
-    WaitForPreviousFrame(app);
 }
 
 void LoadScene(App& app, const AppAssets& assets)
@@ -1138,11 +1175,14 @@ void UpdateScene(App& app)
     glm::mat4 view = glm::lookAt(glm::vec3(camX, camY, camZ), glm::vec3(0, camY, 0), glm::vec3(0, 1, 0));
     glm::mat4 viewProjection = projection * view;
 
-    UpdatePerMeshConstantBuffers(app.model, viewProjection);
+    for (auto& model : app.models) {
+        UpdatePerMeshConstantBuffers(model, viewProjection);
+    }
 }
 
-void DrawModelCommandList(const Model& model, ID3D12GraphicsCommandList* commandList, ID3D12DescriptorHeap* mainDescriptorHeap, int cbvOffsetIncrement)
+void DrawModelCommandList(const Model& model, ID3D12GraphicsCommandList* commandList, int cbvOffsetIncrement)
 {
+    ID3D12DescriptorHeap* mainDescriptorHeap = model.mainDescriptorHeap.Get();
     ID3D12DescriptorHeap* ppHeaps[] = { mainDescriptorHeap };
     commandList->SetDescriptorHeaps(1, ppHeaps);
     CD3DX12_GPU_DESCRIPTOR_HANDLE constantBufferHandle(mainDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
@@ -1190,7 +1230,9 @@ void BuildCommandList(const App& app)
     commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
     commandList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 
-    DrawModelCommandList(app.model, commandList, app.mainDescriptorHeap.Get(), app.cbvSrvUavDescriptorSize);
+    for (const auto& model : app.models) {
+        DrawModelCommandList(model, commandList, app.cbvSrvUavDescriptorSize);
+    }
 
     // Indicate that the back buffer will now be used to present.
     barrier = CD3DX12_RESOURCE_BARRIER::Transition(app.renderTargets[app.frameIdx].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
