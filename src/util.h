@@ -21,8 +21,11 @@
 
 inline std::wstring convert_to_wstring(std::string input)
 {
-    std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> converter;
-    std::wstring wide = converter.from_bytes(input);
+    int numWChars = MultiByteToWideChar(CP_UTF8, 0, input.c_str(), -1, NULL, 0);
+    wchar_t* wstr = new wchar_t[numWChars];
+    MultiByteToWideChar(CP_UTF8, 0, input.c_str(), -1, wstr, numWChars);
+    std::wstring wide(wstr, numWChars - 1);
+    delete[] wstr;
     return wide;
 }
 
@@ -48,5 +51,12 @@ std::ostream& operator<< (std::ostream& out, const glm::vec3& vec) {
 }
 
 #define DEBUG_VAR(vec) std::cout << #vec << ": " << vec << "\n";
+
+// Like assert, but the code still gets executed in release mode
+#ifdef _DEBUG
+#define CHECK(code) assert(code)
+#else
+#define CHECK(code) code
+#endif
 
 #endif // UTIL_H

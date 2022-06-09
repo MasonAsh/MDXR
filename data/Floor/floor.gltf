@@ -1,138 +1,138 @@
 {
-    "asset" : {
-        "generator" : "Khronos glTF Blender I/O v1.7.33",
-        "version" : "2.0"
+    "asset": {
+        "generator": "Khronos glTF Blender I/O v1.7.33",
+        "version": "2.0"
     },
-    "scene" : 0,
-    "scenes" : [
+    "scene": 0,
+    "scenes": [
         {
-            "name" : "Scene",
-            "nodes" : [
+            "name": "Scene",
+            "nodes": [
                 0
             ]
         }
     ],
-    "nodes" : [
+    "nodes": [
         {
-            "mesh" : 0,
-            "name" : "Plane",
-            "scale" : [
-                5,
-                5,
-                5
+            "mesh": 0,
+            "name": "Plane",
+            "scale": [
+                2,
+                2,
+                2
             ]
         }
     ],
-    "materials" : [
+    "materials": [
         {
-            "doubleSided" : true,
-            "name" : "Material.001",
-            "pbrMetallicRoughness" : {
-                "baseColorTexture" : {
-                    "index" : 0
+            "doubleSided": true,
+            "name": "Material.001",
+            "pbrMetallicRoughness": {
+                "baseColorTexture": {
+                    "index": 0
                 },
-                "metallicFactor" : 0,
-                "roughnessFactor" : 0.5
+                "metallicFactor": 0,
+                "roughnessFactor": 0.5
             }
         }
     ],
-    "meshes" : [
+    "meshes": [
         {
-            "name" : "Plane",
-            "primitives" : [
+            "name": "Plane",
+            "primitives": [
                 {
-                    "attributes" : {
-                        "POSITION" : 0,
-                        "NORMAL" : 1,
-                        "TEXCOORD_0" : 2
+                    "attributes": {
+                        "POSITION": 0,
+                        "NORMAL": 1,
+                        "TEXCOORD_0": 2
                     },
-                    "indices" : 3,
-                    "material" : 0
+                    "indices": 3,
+                    "material": 0
                 }
             ]
         }
     ],
-    "textures" : [
+    "textures": [
         {
-            "sampler" : 0,
-            "source" : 0
+            "sampler": 0,
+            "source": 0
         }
     ],
-    "images" : [
+    "images": [
         {
-            "mimeType" : "image/png",
-            "name" : "TexturesCom_Marble_Checkerboard_512_albedo",
-            "uri" : "TexturesCom_Marble_Checkerboard_512_albedo.png"
+            "mimeType": "image/png",
+            "name": "TexturesCom_Marble_Checkerboard_512_albedo",
+            "uri": "TexturesCom_Marble_Checkerboard_512_albedo.png"
         }
     ],
-    "accessors" : [
+    "accessors": [
         {
-            "bufferView" : 0,
-            "componentType" : 5126,
-            "count" : 24,
-            "max" : [
+            "bufferView": 0,
+            "componentType": 5126,
+            "count": 24,
+            "max": [
                 1,
                 0,
                 1
             ],
-            "min" : [
+            "min": [
                 -1,
                 -0.02619907259941101,
                 -1
             ],
-            "type" : "VEC3"
+            "type": "VEC3"
         },
         {
-            "bufferView" : 1,
-            "componentType" : 5126,
-            "count" : 24,
-            "type" : "VEC3"
+            "bufferView": 1,
+            "componentType": 5126,
+            "count": 24,
+            "type": "VEC3"
         },
         {
-            "bufferView" : 2,
-            "componentType" : 5126,
-            "count" : 24,
-            "type" : "VEC2"
+            "bufferView": 2,
+            "componentType": 5126,
+            "count": 24,
+            "type": "VEC2"
         },
         {
-            "bufferView" : 3,
-            "componentType" : 5123,
-            "count" : 36,
-            "type" : "SCALAR"
+            "bufferView": 3,
+            "componentType": 5123,
+            "count": 36,
+            "type": "SCALAR"
         }
     ],
-    "bufferViews" : [
+    "bufferViews": [
         {
-            "buffer" : 0,
-            "byteLength" : 288,
-            "byteOffset" : 0
+            "buffer": 0,
+            "byteLength": 288,
+            "byteOffset": 0
         },
         {
-            "buffer" : 0,
-            "byteLength" : 288,
-            "byteOffset" : 288
+            "buffer": 0,
+            "byteLength": 288,
+            "byteOffset": 288
         },
         {
-            "buffer" : 0,
-            "byteLength" : 192,
-            "byteOffset" : 576
+            "buffer": 0,
+            "byteLength": 192,
+            "byteOffset": 576
         },
         {
-            "buffer" : 0,
-            "byteLength" : 72,
-            "byteOffset" : 768
+            "buffer": 0,
+            "byteLength": 72,
+            "byteOffset": 768
         }
     ],
-    "samplers" : [
+    "samplers": [
         {
-            "magFilter" : 9729,
-            "minFilter" : 9987
+            "magFilter": 9729,
+            "minFilter": 9987
         }
     ],
-    "buffers" : [
+    "buffers": [
         {
-            "byteLength" : 840,
-            "uri" : "floor.bin"
+            "byteLength": 840,
+            "uri": "floor.bin"
         }
     ]
 }

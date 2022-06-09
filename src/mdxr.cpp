@@ -33,7 +33,7 @@ struct Primitive {
     D3D12_PRIMITIVE_TOPOLOGY primitiveTopology;
     ComPtr<ID3D12PipelineState> PSO;
     D3D12_GPU_DESCRIPTOR_HANDLE srvHandle;
-    int indexCount;
+    UINT indexCount;
 };
 
 struct Mesh {
@@ -55,7 +55,7 @@ struct Model {
 };
 
 struct AppAssets {
-    tinygltf::Model models[2];
+    tinygltf::Model models[3];
 };
 
 struct IncrementalFence {
@@ -237,7 +237,7 @@ void SetupRenderTargets(App& app)
 
 void InitD3D(App& app)
 {
-#ifdef _DEBUG
+    // #ifdef _DEBUG
     ComPtr<ID3D12Debug> debugController;
     if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debugController)))) {
         debugController->EnableDebugLayer();
@@ -248,7 +248,7 @@ void InitD3D(App& app)
     ComPtr<ID3D12Debug1> debugController1;
     ASSERT_HRESULT(debugController->QueryInterface(IID_PPV_ARGS(&debugController1)));
     debugController1->SetEnableGPUBasedValidation(true);
-#endif
+    // #endif
 
     ComPtr<IDXGIFactory4> dxgiFactory;
     ASSERT_HRESULT(CreateDXGIFactory2(DXGI_CREATE_FACTORY_DEBUG, IID_PPV_ARGS(&dxgiFactory)));
@@ -356,9 +356,13 @@ void InitWindow(App& app)
 
     app.window = window;
 
-    SDL_SysWMinfo wmInfo;
+    SDL_SysWMinfo wmInfo = {};
     SDL_VERSION(&wmInfo.version);
-    assert(SDL_GetWindowWMInfo(window, &wmInfo));
+    if (!SDL_GetWindowWMInfo(window, &wmInfo)) {
+        std::cout << "Failed to fetch window info from SDL\n";
+        std::cout << "SDL_GetError(): " << SDL_GetError() << std::endl;
+        abort();
+    }
     app.hwnd = wmInfo.info.win.window;
 
     app.keyState = SDL_GetKeyboardState(nullptr);
@@ -400,11 +404,13 @@ ComPtr<ID3D12PipelineState> CreatePSO(
 
     ComPtr<ID3DBlob> vertexShader;
     ComPtr<ID3DBlob> pixelShader;
+    const std::wstring vertexShaderPath = (wDataDir + L"/" + wShaderName + L".cvert");
+    const std::wstring pixelShaderPath = (wDataDir + L"/" + wShaderName + L".cpixel");
     ASSERT_HRESULT(
-        D3DReadFileToBlob((wDataDir + L"/" + wShaderName + L".cvert").c_str(), &vertexShader)
+        D3DReadFileToBlob(vertexShaderPath.c_str(), &vertexShader)
     );
     ASSERT_HRESULT(
-        D3DReadFileToBlob((wDataDir + L"/" + wShaderName + L".cpixel").c_str(), &pixelShader)
+        D3DReadFileToBlob(pixelShaderPath.c_str(), &pixelShader)
     );
 
     // Describe and create the graphics pipeline state object (PSO).
@@ -487,7 +493,7 @@ AppAssets LoadAssets(App& app)
     std::string err;
     std::string warn;
 
-    assert(
+    CHECK(
         loader.LoadASCIIFromFile(
             &assets.models[0],
             &err,
@@ -496,9 +502,18 @@ AppAssets LoadAssets(App& app)
         )
     );
 
-    assert(
+    CHECK(
         loader.LoadASCIIFromFile(
             &assets.models[1],
+            &err,
+            &warn,
+            app.dataDir + "/FlightHelmet/FlightHelmet.gltf"
+        )
+    );
+
+    CHECK(
+        loader.LoadASCIIFromFile(
+            &assets.models[2],
             &err,
             &warn,
             app.dataDir + "/Duck.gltf"
@@ -508,8 +523,9 @@ AppAssets LoadAssets(App& app)
     boxTransform = glm::scale(boxTransform, glm::dvec3(0.08));
     boxTransform = glm::translate(boxTransform, glm::dvec3(-120.0, 120.0, 160.0));
     boxTransform = glm::rotate(boxTransform, glm::radians(290.0), glm::dvec3(0.0, 1.0, 0.0));
-    assets.models[1].nodes[2].matrix = std::vector<double>((double*)&boxTransform[0], (double*)&boxTransform[0] + 16);
-    //memcpy(assets.models[1].nodes[2].matrix.data(), &boxTransform[0], sizeof(glm::mat4));
+    auto valuePtr = glm::value_ptr(boxTransform);
+    std::vector<double> vectorValues(valuePtr, valuePtr + 16);
+    assets.models[2].nodes[2].matrix = vectorValues;
 
     return assets;
 }
@@ -560,13 +576,12 @@ void CreateDescriptorsForModel(
 )
 {
     // Allocate 1 descriptor for the constant buffer and the rest for the textures.
-    const int numConstantBuffers = model.meshes.size();
-    ID3D12DescriptorHeap* heap;
-    int numDescriptors = numConstantBuffers + model.textures.size();
+    const size_t numConstantBuffers = model.meshes.size();
+    size_t numDescriptors = numConstantBuffers + model.textures.size();
     outHandles.reserve(numDescriptors);
 
     D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
-    heapDesc.NumDescriptors = numDescriptors;
+    heapDesc.NumDescriptors = (UINT)numDescriptors;
     heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     ASSERT_HRESULT(
@@ -576,7 +591,7 @@ void CreateDescriptorsForModel(
     UINT incrementSize = app.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
     {
-        const UINT constantBufferSize = sizeof(PerMeshConstantData) * model.meshes.size();
+        const UINT constantBufferSize = (UINT)sizeof(PerMeshConstantData) * (UINT)model.meshes.size();
         CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_UPLOAD);
         auto resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(constantBufferSize);
         ASSERT_HRESULT(
@@ -604,8 +619,8 @@ void CreateDescriptorsForModel(
     }
 
     {
-        CD3DX12_CPU_DESCRIPTOR_HANDLE cpuHandle(outHeap->GetCPUDescriptorHandleForHeapStart(), model.meshes.size(), incrementSize);
-        CD3DX12_GPU_DESCRIPTOR_HANDLE gpuHandle(outHeap->GetGPUDescriptorHandleForHeapStart(), model.meshes.size(), incrementSize);
+        CD3DX12_CPU_DESCRIPTOR_HANDLE cpuHandle(outHeap->GetCPUDescriptorHandleForHeapStart(), (int)model.meshes.size(), incrementSize);
+        CD3DX12_GPU_DESCRIPTOR_HANDLE gpuHandle(outHeap->GetGPUDescriptorHandleForHeapStart(), (int)model.meshes.size(), incrementSize);
         for (const auto& textureResource : textureResources) {
             auto textureDesc = textureResource->GetDesc();
             D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
@@ -633,7 +648,7 @@ D3D12_RESOURCE_DESC GetImageResourceDesc(const tinygltf::Image& image)
     desc.SampleDesc.Quality = 0;
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
 
-    assert(image.component == STBI_rgb_alpha);
+    CHECK(image.component == STBI_rgb_alpha);
 
     switch (image.pixel_type) {
     case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
@@ -776,30 +791,36 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
     outGeometryResources = std::span(resourceBuffers.begin(), endGeometryBuffer);
     outTextureResources = std::span(endGeometryBuffer, resourceBuffers.end());
 
-    app.commandList->ResourceBarrier(resourceBarriers.size(), resourceBarriers.data());
+    app.commandList->ResourceBarrier((UINT)resourceBarriers.size(), resourceBarriers.data());
 
     return resourceBuffers;
 }
 
 glm::mat4 GetNodeTransfomMatrix(const tinygltf::Node& node) {
     if (node.matrix.size() > 0) {
-        assert(node.matrix.size() == 16);
+        CHECK(node.matrix.size() == 16);
         return glm::make_mat4(node.matrix.data());;
-    } else if (node.translation.size() > 0) {
-        auto translationData = node.translation.data();
-        auto rotationData = node.rotation.data();
-        auto scaleData = node.scale.data();
-
-        glm::vec3 translate = glm::make_vec3(translationData);
-        glm::quat rotation = glm::make_quat(rotationData);
-        glm::vec3 scale = glm::make_vec3(scaleData);
+    } else {
+        glm::vec3 translate(0.0f);
+        glm::quat rotation = glm::quat_identity<float, glm::defaultp>();
+        glm::vec3 scale(1.0f);
+        if (node.translation.size() > 0) {
+            auto translationData = node.translation.data();
+            translate = glm::make_vec3(translationData);
+        }
+        if (node.rotation.size() > 0) {
+            auto rotationData = node.rotation.data();
+            rotation = glm::make_quat(rotationData);
+        }
+        if (node.scale.size() > 0) {
+            auto scaleData = node.scale.data();
+            scale = glm::make_vec3(scaleData);
+        }
 
         glm::mat4 T = glm::translate(glm::mat4(1.0f), translate);
         glm::mat4 R = glm::toMat4(rotation);
         glm::mat4 S = glm::scale(glm::mat4(1.0f), scale);
         return S * R * T;
-    } else {
-        return glm::mat4(1.0f);
     }
 }
 
@@ -885,7 +906,7 @@ Model FinalizeModel(
             // This needs to be done because certain GLTF models are designed in a way that 
             // doesn't allow us to have a one to one relationship between gltf buffer views 
             // and d3d buffer views.
-            std::map<int, int> vertexStartOffsetToBufferView;
+            std::map<D3D12_GPU_VIRTUAL_ADDRESS, UINT> vertexStartOffsetToBufferView;
 
             // Build per drawcall data 
             // input layout and vertex buffer views
@@ -904,7 +925,7 @@ Model FinalizeModel(
                     desc.SemanticIndex = semanticIndex;
                     desc.InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
                     desc.InstanceDataStepRate = 0;
-                    int byteStride;
+                    UINT byteStride;
                     switch (accessor.type) {
                     case TINYGLTF_TYPE_VEC2:
                         desc.Format = DXGI_FORMAT_R32G32_FLOAT;
@@ -925,22 +946,22 @@ Model FinalizeModel(
                     int bufferViewIdx = accessor.bufferView;
                     auto bufferView = model.bufferViews[bufferViewIdx];
 
-                    byteStride = bufferView.byteStride > 0 ? bufferView.byteStride : byteStride;
+                    byteStride = bufferView.byteStride > 0 ? (UINT)bufferView.byteStride : byteStride;
 
                     auto buffer = resourceBuffers[bufferView.buffer];
-                    int vertexStartOffset = bufferView.byteOffset + accessor.byteOffset - (accessor.byteOffset % byteStride);
-                    int vertexStartAddress = buffer->GetGPUVirtualAddress() + vertexStartOffset;
+                    UINT vertexStartOffset = (UINT)bufferView.byteOffset + (UINT)accessor.byteOffset - (UINT)(accessor.byteOffset % byteStride);
+                    D3D12_GPU_VIRTUAL_ADDRESS vertexStartAddress = buffer->GetGPUVirtualAddress() + vertexStartOffset;
 
-                    desc.AlignedByteOffset = accessor.byteOffset - vertexStartOffset + bufferView.byteOffset;
+                    desc.AlignedByteOffset = (UINT)accessor.byteOffset - vertexStartOffset + (UINT)bufferView.byteOffset;
 
                     // No d3d buffer view attached to this range of vertices yet, add one
                     if (!vertexStartOffsetToBufferView.contains(vertexStartAddress)) {
                         D3D12_VERTEX_BUFFER_VIEW view;
                         view.BufferLocation = vertexStartAddress;
-                        view.SizeInBytes = accessor.count * byteStride;
+                        view.SizeInBytes = (UINT)accessor.count * byteStride;
                         view.StrideInBytes = byteStride;
                         vertexBufferViews.push_back(view);
-                        vertexStartOffsetToBufferView[vertexStartAddress] = vertexBufferViews.size() - 1;
+                        vertexStartOffsetToBufferView[vertexStartAddress] = (UINT)vertexBufferViews.size() - 1;
                     }
                     desc.InputSlot = vertexStartOffsetToBufferView[vertexStartAddress];
 
@@ -995,7 +1016,7 @@ Model FinalizeModel(
                 int indexBufferViewIdx = accessor.bufferView;
                 auto bufferView = model.bufferViews[indexBufferViewIdx];
                 ibv.BufferLocation = resourceBuffers[bufferView.buffer]->GetGPUVirtualAddress() + bufferView.byteOffset + accessor.byteOffset;
-                ibv.SizeInBytes = bufferView.byteLength - accessor.byteOffset;
+                ibv.SizeInBytes = (UINT)(bufferView.byteLength - accessor.byteOffset);
                 switch (accessor.componentType) {
                 case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
                     ibv.Format = DXGI_FORMAT_R8_UINT;
@@ -1007,7 +1028,7 @@ Model FinalizeModel(
                     ibv.Format = DXGI_FORMAT_R32_UINT;
                     break;
                 };
-                drawCall.indexCount = accessor.count;
+                drawCall.indexCount = (UINT)accessor.count;
             }
 
             primitives.push_back(drawCall);
@@ -1108,12 +1129,12 @@ void LoadScene(App& app, const AppAssets& assets)
 
         // FIXME: This is going to have to be dynamic...
         D3D12_STATIC_SAMPLER_DESC sampler = {};
-        sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+        sampler.Filter = D3D12_FILTER_ANISOTROPIC;
         sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
         sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
         sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
         sampler.MipLODBias = 0;
-        sampler.MaxAnisotropy = 0;
+        sampler.MaxAnisotropy = 4;
         sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
         sampler.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
         sampler.MinLOD = 0.0f;
@@ -1283,7 +1304,7 @@ void DrawModelCommandList(const Model& model, ID3D12GraphicsCommandList* command
             commandList->SetGraphicsRootDescriptorTable(1, primitive.srvHandle);
             commandList->IASetPrimitiveTopology(primitive.primitiveTopology);
             commandList->SetPipelineState(primitive.PSO.Get());
-            commandList->IASetVertexBuffers(0, primitive.vertexBufferViews.size(), primitive.vertexBufferViews.data());
+            commandList->IASetVertexBuffers(0, (UINT)primitive.vertexBufferViews.size(), primitive.vertexBufferViews.data());
             commandList->IASetIndexBuffer(&primitive.indexBufferView);
             commandList->DrawIndexedInstanced(primitive.indexCount, 1, 0, 0, 0);
         }
@@ -1355,8 +1376,8 @@ void HandleResize(App& app, int newWidth, int newHeight)
     }
 
     app.swapChain->ResizeBuffers(2, newWidth, newHeight, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
-    app.viewport.Width = newWidth;
-    app.viewport.Height = newHeight;
+    app.viewport.Width = (float)newWidth;
+    app.viewport.Height = (float)newHeight;
     app.windowWidth = newWidth;
     app.windowHeight = newHeight;
     app.scissorRect = CD3DX12_RECT(0, 0, static_cast<LONG>(newWidth), static_cast<LONG>(newHeight));
@@ -1386,8 +1407,6 @@ int RunApp(int argc, char** argv)
 
     app.startTick = high_resolution_clock().now().time_since_epoch().count();
     app.lastFrameTick = app.startTick;
-
-    glm::vec3 inputVector;
 
     int mouseX, mouseY;
     int buttonState = SDL_GetMouseState(&mouseX, &mouseY);
@@ -1421,10 +1440,12 @@ int RunApp(int argc, char** argv)
         if (!app.camera.locked) {
             if (!SDL_GetRelativeMouseMode()) {
                 SDL_SetRelativeMouseMode(SDL_TRUE);
+                SDL_SetWindowGrab(app.window, SDL_TRUE);
             }
         } else {
             if (SDL_GetRelativeMouseMode()) {
                 SDL_SetRelativeMouseMode(SDL_FALSE);
+                SDL_SetWindowGrab(app.window, SDL_FALSE);
             }
         }
 
@@ -1456,4 +1477,4 @@ int RunMDXR(int argc, char** argv)
 #endif
 
     return status;
-}
+    }
