@@ -33,7 +33,6 @@ target_compile_definitions(mdxr
     PRIVATE
         GLM_FORCE_RADIANS
         GLM_FORCE_DEPTH_ZERO_TO_ONE
-        GLM_FORCE_LEFT_HANDED
         _CRT_SECURE_NO_WARNINGS
     PUBLIC
         $<$<CONFIG:Debug>:D3DCOMPILE_DEBUG=1>

@@ -413,13 +413,17 @@ ComPtr<ID3D12PipelineState> CreatePSO(
         D3DReadFileToBlob(pixelShaderPath.c_str(), &pixelShader)
     );
 
+    // GLTF expects CCW winding order
+    CD3DX12_RASTERIZER_DESC rasterizerState(D3D12_DEFAULT);
+    rasterizerState.FrontCounterClockwise = TRUE;
+
     // Describe and create the graphics pipeline state object (PSO).
     D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
     psoDesc.InputLayout = { inputLayout.data(), (UINT)inputLayout.size() };
     psoDesc.pRootSignature = rootSignature;
     psoDesc.VS = { reinterpret_cast<UINT8*>(vertexShader->GetBufferPointer()), vertexShader->GetBufferSize() };
     psoDesc.PS = { reinterpret_cast<UINT8*>(pixelShader->GetBufferPointer()), pixelShader->GetBufferSize() };
-    psoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+    psoDesc.RasterizerState = rasterizerState;
     psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
     psoDesc.DepthStencilState.DepthEnable = TRUE;
     psoDesc.DepthStencilState.StencilEnable = FALSE;
@@ -1206,9 +1210,9 @@ void LoadScene(App& app, const AppAssets& assets)
 }
 
 void InitializeScene(App& app) {
-    app.camera.translation = glm::vec3(-3.0f, 0.5f, 0.0f);
+    app.camera.translation = glm::vec3(0.0f, 0.5f, 3.0f);
     app.camera.pitch = 0.0f;
-    app.camera.yaw = 0.0f;
+    app.camera.yaw = glm::pi<float>();
 }
 
 void UpdatePerMeshConstantBuffers(Model& model, const glm::mat4& viewProjection)
@@ -1233,8 +1237,8 @@ glm::mat4 UpdateFlyCamera(App& app, float deltaSeconds)
         app.camera.targetSpeed += app.mouseState.scrollDelta * 1.0f;
         app.camera.targetSpeed = glm::clamp(app.camera.targetSpeed, app.camera.minSpeed, app.camera.maxSpeed);
         const float RADIANS_PER_PIXEL = glm::radians(0.1f);
-        app.camera.yaw += (float)app.mouseState.xrel * RADIANS_PER_PIXEL;
-        app.camera.pitch += (float)app.mouseState.yrel * RADIANS_PER_PIXEL;
+        app.camera.yaw -= (float)app.mouseState.xrel * RADIANS_PER_PIXEL;
+        app.camera.pitch -= (float)app.mouseState.yrel * RADIANS_PER_PIXEL;
         app.camera.pitch = glm::clamp(app.camera.pitch, -app.camera.maxPitch, app.camera.maxPitch);
     }
 
@@ -1242,9 +1246,9 @@ glm::mat4 UpdateFlyCamera(App& app, float deltaSeconds)
     float pitch = app.camera.pitch;
 
     glm::vec3 cameraForward;
-    cameraForward.x = cos(-yaw) * cos(-pitch);
-    cameraForward.y = sin(-pitch);
-    cameraForward.z = sin(-yaw) * cos(-pitch);
+    cameraForward.z = cos(yaw) * cos(pitch);
+    cameraForward.y = sin(pitch);
+    cameraForward.x = sin(yaw) * cos(pitch);
     cameraForward = glm::normalize(cameraForward);
 
     float right = app.keyState[SDL_SCANCODE_D] ? 1.0f : 0.0f;
@@ -1264,13 +1268,12 @@ glm::mat4 UpdateFlyCamera(App& app, float deltaSeconds)
     if (!app.camera.locked) {
         glm::vec3 vecUp(0.0f, 1.0f, 0.0f);
         cameraMovement += inputVector.z * cameraForward;
-        cameraMovement -= inputVector.x * glm::normalize(glm::cross(cameraForward, vecUp));
+        cameraMovement += inputVector.x * glm::normalize(glm::cross(cameraForward, vecUp));
         cameraMovement.y += inputVector.y;
         cameraMovement *= speed;
         app.camera.translation += cameraMovement;
     }
 
-    // Create view matrix
     return glm::lookAt(app.camera.translation, app.camera.translation + cameraForward, glm::vec3(0, 1, 0));
 }
 
@@ -1282,7 +1285,7 @@ void UpdateScene(App& app)
     long long deltaTicks = currentTick - app.lastFrameTick;
     float deltaSeconds = (float)deltaTicks / (float)1e9;
 
-    glm::mat4 projection = glm::perspective(glm::pi<float>() * 0.2f, (float)app.windowWidth / (float)app.windowHeight, 0.01f, 5000.0f);
+    glm::mat4 projection = glm::perspective(glm::pi<float>() * 0.2f, (float)app.windowWidth / (float)app.windowHeight, 0.1f, 1000.0f);
     glm::mat4 view = UpdateFlyCamera(app, deltaSeconds);
     glm::mat4 viewProjection = projection * view;
 
@@ -1477,4 +1480,4 @@ int RunMDXR(int argc, char** argv)
 #endif
 
     return status;
-    }
+}
