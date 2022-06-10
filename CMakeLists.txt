@@ -13,6 +13,16 @@ include_directories(${SDL2_INCLUDE_DIR})
 
 add_subdirectory(DirectX-Headers)
 
+set(IMGUI_SOURCES
+    thirdparty/imgui/imgui.cpp
+    thirdparty/imgui/imgui_demo.cpp
+    thirdparty/imgui/imgui_draw.cpp
+    thirdparty/imgui/imgui_widgets.cpp
+    thirdparty/imgui/imgui_tables.cpp
+    thirdparty/imgui/backends/imgui_impl_sdl.cpp
+    thirdparty/imgui/backends/imgui_impl_dx12.cpp
+)
+
 add_executable(mdxr
     src/main.cpp
     src/util.h
@@ -25,9 +35,13 @@ add_executable(mdxr
     src/stb_image_write.h
     src/json.hpp
     src/tiny_gltf.h
+
+    ${IMGUI_SOURCES}
 )
 
 include_directories(thirdparty/include)
+include_directories(thirdparty/imgui/)
+include_directories(thirdparty/imgui/backends)
 
 target_compile_definitions(mdxr
     PRIVATE

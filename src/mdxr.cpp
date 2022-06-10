@@ -15,6 +15,9 @@
 #include <span>
 #include <glm/gtc/type_ptr.hpp>
 #include <glm/gtx/quaternion.hpp>
+#include "imgui.h"
+#include "imgui_impl_dx12.h"
+#include "imgui_impl_sdl.h"
 
 using namespace std::chrono;
 
@@ -179,6 +182,11 @@ struct App {
     Camera camera;
     const UINT8* keyState;
     MouseState mouseState;
+
+    struct {
+        ComPtr<ID3D12DescriptorHeap> srvHeap;
+        bool aboutWindowOpen = true;
+    } imgui;
 };
 
 void SetupDepthStencil(App& app, bool isResize)
@@ -1348,6 +1356,10 @@ void BuildCommandList(const App& app)
         DrawModelCommandList(model, commandList, app.cbvSrvUavDescriptorSize);
     }
 
+    ID3D12DescriptorHeap* ppHeaps[] = { app.imgui.srvHeap.Get() };
+    commandList->SetDescriptorHeaps(1, ppHeaps);
+    ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), commandList);
+
     // Indicate that the back buffer will now be used to present.
     barrier = CD3DX12_RESOURCE_BARRIER::Transition(app.renderTargets[app.frameIdx].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
     commandList->ResourceBarrier(1, &barrier);
@@ -1391,6 +1403,67 @@ void HandleResize(App& app, int newWidth, int newHeight)
     app.frameIdx = app.swapChain->GetCurrentBackBufferIndex();
 }
 
+void InitImGui(App& app)
+{
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::StyleColorsDark();
+
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC desc = {};
+        desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        desc.NumDescriptors = 1;
+        desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        ASSERT_HRESULT(app.device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&app.imgui.srvHeap)));
+    }
+
+    CHECK(
+        ImGui_ImplSDL2_InitForD3D(app.window)
+    );
+
+    CHECK(
+        ImGui_ImplDX12_Init(
+            app.device.Get(),
+            FrameBufferCount,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            app.imgui.srvHeap.Get(),
+            app.imgui.srvHeap->GetCPUDescriptorHandleForHeapStart(),
+            app.imgui.srvHeap->GetGPUDescriptorHandleForHeapStart()
+        )
+    );
+
+
+}
+
+void CleanImGui()
+{
+    ImGui_ImplDX12_Shutdown();
+    ImGui_ImplSDL2_Shutdown();
+    ImGui::DestroyContext();
+}
+
+void BeginGUI(App& app)
+{
+    ImGui_ImplDX12_NewFrame();
+    ImGui_ImplSDL2_NewFrame();
+    ImGui::NewFrame();
+
+
+    if (ImGui::BeginMainMenuBar()) {
+        if (ImGui::BeginMenu("Windows")) {
+            ImGui::Checkbox("About", &app.imgui.aboutWindowOpen);
+            ImGui::EndMenu();
+        }
+        ImGui::EndMainMenuBar();
+    }
+
+
+    if (app.imgui.aboutWindowOpen) {
+        ImGui::ShowAboutWindow(&app.imgui.aboutWindowOpen);
+    }
+}
+
 int RunApp(int argc, char** argv)
 {
     App app;
@@ -1398,6 +1471,7 @@ int RunApp(int argc, char** argv)
     InitApp(app, argc, argv);
     InitWindow(app);
     InitD3D(app);
+    InitImGui(app);
 
     InitializeScene(app);
 
@@ -1421,6 +1495,7 @@ int RunApp(int argc, char** argv)
         app.mouseState.yrel = 0;
         app.mouseState.scrollDelta = 0;
         while (SDL_PollEvent(&e) > 0) {
+            ImGui_ImplSDL2_ProcessEvent(&e);
             if (e.type == SDL_QUIT) {
                 running = false;
             } else if (e.type == SDL_WINDOWEVENT) {
@@ -1452,7 +1527,10 @@ int RunApp(int argc, char** argv)
             }
         }
 
+        BeginGUI(app);
         UpdateScene(app);
+        ImGui::Render();
+
         RenderFrame(app);
 
         app.lastFrameTick = frameTick;
@@ -1460,6 +1538,7 @@ int RunApp(int argc, char** argv)
 
     WaitForPreviousFrame(app);
 
+    CleanImGui();
     SDL_DestroyWindow(app.window);
 
     return 0;
