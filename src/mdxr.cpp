@@ -128,6 +128,18 @@ struct MouseState {
     float scrollDelta;
 };
 
+
+enum class GBufferTarget {
+    Diffuse,
+    Normal,
+    Count,
+};
+
+struct PointLight {
+    glm::vec3 translation;
+    glm::vec3 intensity;
+};
+
 struct App {
     std::string dataDir;
     std::wstring wDataDir;
@@ -186,7 +198,15 @@ struct App {
     struct {
         ComPtr<ID3D12DescriptorHeap> srvHeap;
         bool aboutWindowOpen = true;
-    } imgui;
+    } ImGui;
+
+    struct {
+        std::array<ComPtr<ID3D12Resource>, (size_t)GBufferTarget::Count> renderTargets;
+        ComPtr<ID3D12DescriptorHeap> srvHeap;
+    } GBuffer;
+
+    ComPtr<ID3D12PipelineState> lightingPSO;
+    ComPtr<ID3D12RootSignature> lightingRootSignature;
 };
 
 void SetupDepthStencil(App& app, bool isResize)
@@ -241,6 +261,317 @@ void SetupRenderTargets(App& app)
         app.device->CreateRenderTargetView(app.renderTargets[i].Get(), nullptr, rtvHandle);
         rtvHandle.Offset(1, app.rtvDescriptorSize);
     }
+}
+
+D3D12_GRAPHICS_PIPELINE_STATE_DESC DefaultPSODesc()
+{
+    // GLTF expects CCW winding order
+    CD3DX12_RASTERIZER_DESC rasterizerState(D3D12_DEFAULT);
+    rasterizerState.FrontCounterClockwise = TRUE;
+
+    // Describe and create the graphics pipeline state object (PSO).
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
+    psoDesc.RasterizerState = rasterizerState;
+    psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
+    psoDesc.DepthStencilState.DepthEnable = TRUE;
+    psoDesc.DepthStencilState.StencilEnable = FALSE;
+    psoDesc.SampleMask = UINT_MAX;
+    psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    psoDesc.NumRenderTargets = 1;
+    psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    psoDesc.SampleDesc.Count = 1;
+    psoDesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
+    psoDesc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+
+    return psoDesc;
+}
+
+ComPtr<ID3D12PipelineState> CreatePSO(
+    ID3D12Device* device,
+    const std::string& dataDir,
+    const std::string& shaderName,
+    ID3D12RootSignature* rootSignature,
+    std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout,
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc
+)
+{
+    std::wstring wDataDir = convert_to_wstring(dataDir);
+    std::wstring wShaderName = convert_to_wstring(shaderName);
+
+    ComPtr<ID3DBlob> vertexShader;
+    ComPtr<ID3DBlob> pixelShader;
+    const std::wstring vertexShaderPath = (wDataDir + L"/" + wShaderName + L".cvert");
+    const std::wstring pixelShaderPath = (wDataDir + L"/" + wShaderName + L".cpixel");
+    ASSERT_HRESULT(
+        D3DReadFileToBlob(vertexShaderPath.c_str(), &vertexShader)
+    );
+    ASSERT_HRESULT(
+        D3DReadFileToBlob(pixelShaderPath.c_str(), &pixelShader)
+    );
+
+    psoDesc.pRootSignature = rootSignature;
+    psoDesc.VS = { reinterpret_cast<UINT8*>(vertexShader->GetBufferPointer()), vertexShader->GetBufferSize() };
+    psoDesc.PS = { reinterpret_cast<UINT8*>(pixelShader->GetBufferPointer()), pixelShader->GetBufferSize() };
+    psoDesc.InputLayout = { inputLayout.data(), (UINT)inputLayout.size() };
+
+    ComPtr<ID3D12PipelineState> PSO;
+    ASSERT_HRESULT(
+        device->CreateGraphicsPipelineState(
+            &psoDesc,
+            IID_PPV_ARGS(&PSO)
+        )
+    );
+
+    return PSO;
+}
+
+ComPtr<ID3D12PipelineState> CreateUnlitMeshPSO(
+    ID3D12Device* device,
+    const std::string& dataDir,
+    ID3D12RootSignature* rootSignature,
+    const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
+)
+{
+    auto psoDesc = DefaultPSODesc();
+    return CreatePSO(
+        device,
+        dataDir,
+        "unlit_mesh",
+        rootSignature,
+        inputLayout,
+        psoDesc
+    );
+}
+
+ComPtr<ID3D12PipelineState> CreateDiffuseMeshPSO(
+    ID3D12Device* device,
+    const std::string& dataDir,
+    ID3D12RootSignature* rootSignature,
+    const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
+)
+{
+    auto psoDesc = DefaultPSODesc();
+    return CreatePSO(
+        device,
+        dataDir,
+        "diffuse_mesh",
+        rootSignature,
+        inputLayout,
+        psoDesc
+    );
+}
+
+ComPtr<ID3D12PipelineState> CreateMeshGBufferPSO(
+    ID3D12Device* device,
+    const std::string& dataDir,
+    ID3D12RootSignature* rootSignature,
+    const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
+)
+{
+    auto psoDesc = DefaultPSODesc();
+    return CreatePSO(
+        device,
+        dataDir,
+        "mesh_gbuffer",
+        rootSignature,
+        inputLayout,
+        psoDesc
+    );
+}
+
+ComPtr<ID3D12PipelineState> CreateGBufferLightingPSO(
+    ID3D12Device* device,
+    const std::string& dataDir,
+    ID3D12RootSignature* rootSignature,
+    const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
+)
+{
+    // Unlike other PSOs, we go clockwise here.
+    CD3DX12_RASTERIZER_DESC rasterizerState(D3D12_DEFAULT);
+    auto psoDesc = DefaultPSODesc();
+    psoDesc.DepthStencilState.DepthEnable = FALSE;
+    psoDesc.DepthStencilState.StencilEnable = FALSE;
+    psoDesc.RasterizerState = rasterizerState;
+    return CreatePSO(
+        device,
+        dataDir,
+        "gbuffer_lighting",
+        rootSignature,
+        inputLayout,
+        psoDesc
+    );
+}
+
+D3D12_RESOURCE_DESC GBufferResourceDesc(GBufferTarget target, int windowWidth, int windowHeight)
+{
+    D3D12_RESOURCE_DESC desc = {};
+    desc.MipLevels = 1;
+    desc.Width = windowWidth;
+    desc.Height = windowHeight;
+    desc.DepthOrArraySize = 1;
+    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Quality = 0;
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+    // https://www.3dgep.com/forward-plus/#:~:text=G%2Dbuffer%20pass.-,Layout%20Summary,G%2Dbuffer%20layout%20looks%20similar%20to%20the%20table%20shown%20below.,-R
+    switch (target)
+    {
+    case GBufferTarget::Diffuse:
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        break;
+    case GBufferTarget::Normal:
+        desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        break;
+    };
+
+    return desc;
+}
+
+void SetupGBuffer(App& app, bool isResize)
+{
+    if (!isResize) {
+        // Create SRV heap for the render targets
+        D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+        heapDesc.NumDescriptors = (UINT)GBufferTarget::Count;
+        heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        ASSERT_HRESULT(
+            app.device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&app.GBuffer.srvHeap))
+        );
+    } else {
+        // If we're resizing then we need to release existing gbuffer
+        for (auto& renderTarget : app.GBuffer.renderTargets) {
+            renderTarget = nullptr;
+        }
+    }
+
+
+    CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(app.rtvHeap->GetCPUDescriptorHandleForHeapStart(), FrameBufferCount, app.rtvDescriptorSize);
+    CD3DX12_CPU_DESCRIPTOR_HANDLE srvHandle(app.GBuffer.srvHeap->GetCPUDescriptorHandleForHeapStart());
+    for (int i = 0; i < app.GBuffer.renderTargets.size(); i++) {
+        CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
+        auto resourceDesc = GBufferResourceDesc(static_cast<GBufferTarget>(i), app.windowWidth, app.windowHeight);
+        auto resourceState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+        D3D12_CLEAR_VALUE clearValue = {};
+        clearValue.Format = resourceDesc.Format;
+        clearValue.DepthStencil.Depth = 1.0f;
+        clearValue.DepthStencil.Stencil = 0;
+        float clearColor[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        memcpy(clearValue.Color, clearColor, sizeof(clearValue.Color));
+
+        ASSERT_HRESULT(
+            app.device->CreateCommittedResource(
+                &heapProps,
+                D3D12_HEAP_FLAG_NONE,
+                &resourceDesc,
+                resourceState,
+                &clearValue,
+                IID_PPV_ARGS(&app.GBuffer.renderTargets[i])
+            )
+        );
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvDesc.Format = resourceDesc.Format;
+        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Texture2D.MipLevels = 1;
+
+        app.device->CreateRenderTargetView(app.GBuffer.renderTargets[i].Get(), nullptr, rtvHandle);
+        app.device->CreateShaderResourceView(app.GBuffer.renderTargets[i].Get(), &srvDesc, srvHandle);
+
+        rtvHandle.Offset(1, app.rtvDescriptorSize);
+        srvHandle.Offset(1, app.cbvSrvUavDescriptorSize);
+    }
+}
+
+void SetupFullscreenQuad(App& app)
+{
+    // std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout;
+    // std::vector<D3D12_VERTEX_BUFFER_VIEW> vertexBufferViews;
+    // D3D12_INDEX_BUFFER_VIEW indexBufferView;
+    // D3D12_PRIMITIVE_TOPOLOGY primitiveTopology;
+    // ComPtr<ID3D12PipelineState> PSO;
+    // D3D12_GPU_DESCRIPTOR_HANDLE srvHandle;
+    // UINT indexCount;
+
+    // D3D12_INPUT_ELEMENT_DESC positionElem{ "POSITION", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
+    // inputLayout.push_back(positionElem);
+}
+
+void SetupLightingPass(App& app)
+{
+    {
+        D3D12_FEATURE_DATA_ROOT_SIGNATURE featureData = {};
+        featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_1;
+        if (FAILED(app.device->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &featureData, sizeof(featureData))))
+        {
+            featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_0;
+        }
+
+        CD3DX12_DESCRIPTOR_RANGE1 ranges[1];
+        CD3DX12_ROOT_PARAMETER1 rootParameters[1];
+
+        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE);
+        rootParameters[0].InitAsDescriptorTable(1, &ranges[0], D3D12_SHADER_VISIBILITY_PIXEL);
+
+        D3D12_ROOT_SIGNATURE_FLAGS rootSignatureFlags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+        D3D12_STATIC_SAMPLER_DESC sampler = {};
+        sampler.Filter = D3D12_FILTER_ANISOTROPIC;
+        sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+        sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+        sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+        sampler.MipLODBias = 0;
+        sampler.MaxAnisotropy = 0;
+        sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+        sampler.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+        sampler.MinLOD = 0.0f;
+        sampler.MaxLOD = D3D12_FLOAT32_MAX;
+        sampler.ShaderRegister = 0;
+        sampler.RegisterSpace = 0;
+        sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rootSignatureDesc;
+        rootSignatureDesc.Init_1_1(
+            _countof(rootParameters),
+            rootParameters,
+            1,
+            &sampler,
+            rootSignatureFlags
+        );
+
+        ComPtr<ID3DBlob> signature;
+        ComPtr<ID3DBlob> error;
+        ASSERT_HRESULT(
+            D3DX12SerializeVersionedRootSignature(
+                &rootSignatureDesc,
+                featureData.HighestVersion,
+                &signature,
+                &error
+            )
+        );
+        ASSERT_HRESULT(
+            app.device->CreateRootSignature(
+                0,
+                signature->GetBufferPointer(),
+                signature->GetBufferSize(),
+                IID_PPV_ARGS(&app.lightingRootSignature)
+            )
+        );
+    }
+
+    // GBuffer lighting does not need an input layout, as the vertices are created
+    // entirely in the vertex buffer without any input vertices.
+    std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout;
+
+    app.lightingPSO = CreateGBufferLightingPSO(
+        app.device.Get(),
+        app.dataDir,
+        app.lightingRootSignature.Get(),
+        inputLayout
+    );
 }
 
 void InitD3D(App& app)
@@ -322,7 +653,7 @@ void InitD3D(App& app)
 
     {
         D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc = {};
-        rtvHeapDesc.NumDescriptors = FrameBufferCount;
+        rtvHeapDesc.NumDescriptors = FrameBufferCount + (int)GBufferTarget::Count;
         rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
         rtvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
         ASSERT_HRESULT(
@@ -335,6 +666,9 @@ void InitD3D(App& app)
 
     SetupRenderTargets(app);
     SetupDepthStencil(app, false);
+    SetupGBuffer(app, false);
+
+    SetupLightingPass(app);
 
     ASSERT_HRESULT(
         device->CreateCommandAllocator(
@@ -399,92 +733,6 @@ void InitApp(App& app, int argc, char** argv)
     app.wDataDir = convert_to_wstring(app.dataDir);
 }
 
-ComPtr<ID3D12PipelineState> CreatePSO(
-    ID3D12Device* device,
-    const std::string& dataDir,
-    const std::string& shaderName,
-    ID3D12RootSignature* rootSignature,
-    const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
-)
-{
-    std::wstring wDataDir = convert_to_wstring(dataDir);
-    std::wstring wShaderName = convert_to_wstring(shaderName);
-
-    ComPtr<ID3DBlob> vertexShader;
-    ComPtr<ID3DBlob> pixelShader;
-    const std::wstring vertexShaderPath = (wDataDir + L"/" + wShaderName + L".cvert");
-    const std::wstring pixelShaderPath = (wDataDir + L"/" + wShaderName + L".cpixel");
-    ASSERT_HRESULT(
-        D3DReadFileToBlob(vertexShaderPath.c_str(), &vertexShader)
-    );
-    ASSERT_HRESULT(
-        D3DReadFileToBlob(pixelShaderPath.c_str(), &pixelShader)
-    );
-
-    // GLTF expects CCW winding order
-    CD3DX12_RASTERIZER_DESC rasterizerState(D3D12_DEFAULT);
-    rasterizerState.FrontCounterClockwise = TRUE;
-
-    // Describe and create the graphics pipeline state object (PSO).
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
-    psoDesc.InputLayout = { inputLayout.data(), (UINT)inputLayout.size() };
-    psoDesc.pRootSignature = rootSignature;
-    psoDesc.VS = { reinterpret_cast<UINT8*>(vertexShader->GetBufferPointer()), vertexShader->GetBufferSize() };
-    psoDesc.PS = { reinterpret_cast<UINT8*>(pixelShader->GetBufferPointer()), pixelShader->GetBufferSize() };
-    psoDesc.RasterizerState = rasterizerState;
-    psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
-    psoDesc.DepthStencilState.DepthEnable = TRUE;
-    psoDesc.DepthStencilState.StencilEnable = FALSE;
-    psoDesc.SampleMask = UINT_MAX;
-    psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    psoDesc.NumRenderTargets = 1;
-    psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-    psoDesc.SampleDesc.Count = 1;
-    psoDesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
-    psoDesc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
-
-    ComPtr<ID3D12PipelineState> PSO;
-    ASSERT_HRESULT(
-        device->CreateGraphicsPipelineState(
-            &psoDesc,
-            IID_PPV_ARGS(&PSO)
-        )
-    );
-
-    return PSO;
-}
-
-ComPtr<ID3D12PipelineState> CreateUnlitMeshPSO(
-    ID3D12Device* device,
-    const std::string& dataDir,
-    ID3D12RootSignature* rootSignature,
-    const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
-)
-{
-    return CreatePSO(
-        device,
-        dataDir,
-        "unlit_mesh",
-        rootSignature,
-        inputLayout
-    );
-}
-
-ComPtr<ID3D12PipelineState> CreateDiffuseMeshPSO(
-    ID3D12Device* device,
-    const std::string& dataDir,
-    ID3D12RootSignature* rootSignature,
-    const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
-)
-{
-    return CreatePSO(
-        device,
-        dataDir,
-        "diffuse_mesh",
-        rootSignature,
-        inputLayout
-    );
-}
 
 void WaitForPreviousFrame(App& app)
 {
@@ -1054,7 +1302,7 @@ Model FinalizeModel(
     // FIXME: So many wasted PSOs.
     for (auto& mesh : result.meshes) {
         for (auto& primitive : mesh.primitives) {
-            primitive.PSO = CreateDiffuseMeshPSO(
+            primitive.PSO = CreateMeshGBufferPSO(
                 app.device.Get(),
                 app.dataDir,
                 app.rootSignature.Get(),
@@ -1323,6 +1571,73 @@ void DrawModelCommandList(const Model& model, ID3D12GraphicsCommandList* command
     }
 }
 
+void DrawFullscreenQuad(const App& app, ID3D12GraphicsCommandList* commandList, ID3D12PipelineState* PSO)
+{
+    ID3D12DescriptorHeap* srvHeap = app.GBuffer.srvHeap.Get();
+    ID3D12DescriptorHeap* ppHeaps[] = { srvHeap };
+    commandList->SetDescriptorHeaps(1, ppHeaps);
+    commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    commandList->SetGraphicsRootDescriptorTable(0, app.GBuffer.srvHeap->GetGPUDescriptorHandleForHeapStart());
+    commandList->SetPipelineState(PSO);
+    commandList->IASetVertexBuffers(0, 0, nullptr);
+    commandList->DrawInstanced(4, 1, 0, 0);
+}
+
+void GBufferPass(const App& app, ID3D12GraphicsCommandList* commandList)
+{
+    // Transition our GBuffers into being render targets.
+    std::array<D3D12_RESOURCE_BARRIER, (size_t)GBufferTarget::Count> barriers;
+    for (int i = 0; i < (int)GBufferTarget::Count; i++) {
+        barriers[i] = CD3DX12_RESOURCE_BARRIER::Transition(app.GBuffer.renderTargets[i].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    }
+    commandList->ResourceBarrier((UINT)barriers.size(), barriers.data());
+
+    CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(app.rtvHeap->GetCPUDescriptorHandleForHeapStart(), FrameBufferCount, app.rtvDescriptorSize);
+    CD3DX12_CPU_DESCRIPTOR_HANDLE dsvHandle(app.dsHeap->GetCPUDescriptorHandleForHeapStart());
+    commandList->OMSetRenderTargets((UINT)GBufferTarget::Count, &rtvHandle, TRUE, &dsvHandle);
+
+    // Record commands.
+    const float clearColor[] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
+    commandList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+
+    for (const auto& model : app.models) {
+        DrawModelCommandList(model, commandList, app.cbvSrvUavDescriptorSize);
+    }
+
+    // Transition them back to being shader resource views so that they can be used in the lighting shaders.
+    for (int i = 0; i < (int)GBufferTarget::Count; i++) {
+        barriers[i] = CD3DX12_RESOURCE_BARRIER::Transition(app.GBuffer.renderTargets[i].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
+    commandList->ResourceBarrier((UINT)barriers.size(), barriers.data());
+}
+
+void FinalPass(const App& app, ID3D12GraphicsCommandList* commandList)
+{
+    auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(app.renderTargets[app.frameIdx].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    commandList->ResourceBarrier(1, &barrier);
+
+    CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(app.rtvHeap->GetCPUDescriptorHandleForHeapStart(), app.frameIdx, app.rtvDescriptorSize);
+
+    commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
+
+    // Record commands.
+    const float clearColor[] = { 0.0f, 0.2f, 0.4f, 1.0f };
+    commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
+
+    commandList->SetGraphicsRootSignature(app.lightingRootSignature.Get());
+
+    DrawFullscreenQuad(app, commandList, app.lightingPSO.Get());
+
+    ID3D12DescriptorHeap* ppHeaps[] = { app.ImGui.srvHeap.Get() };
+    commandList->SetDescriptorHeaps(1, ppHeaps);
+    ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), commandList);
+
+    // Indicate that the back buffer will now be used to present.
+    barrier = CD3DX12_RESOURCE_BARRIER::Transition(app.renderTargets[app.frameIdx].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+    commandList->ResourceBarrier(1, &barrier);
+}
+
 void BuildCommandList(const App& app)
 {
     ID3D12GraphicsCommandList* commandList = app.commandList.Get();
@@ -1340,29 +1655,8 @@ void BuildCommandList(const App& app)
     commandList->RSSetViewports(1, &app.viewport);
     commandList->RSSetScissorRects(1, &app.scissorRect);
 
-    auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(app.renderTargets[app.frameIdx].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    commandList->ResourceBarrier(1, &barrier);
-
-    CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(app.rtvHeap->GetCPUDescriptorHandleForHeapStart(), app.frameIdx, app.rtvDescriptorSize);
-    CD3DX12_CPU_DESCRIPTOR_HANDLE dsvHandle(app.dsHeap->GetCPUDescriptorHandleForHeapStart());
-    commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, &dsvHandle);
-
-    // Record commands.
-    const float clearColor[] = { 0.0f, 0.2f, 0.4f, 1.0f };
-    commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
-    commandList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
-
-    for (const auto& model : app.models) {
-        DrawModelCommandList(model, commandList, app.cbvSrvUavDescriptorSize);
-    }
-
-    ID3D12DescriptorHeap* ppHeaps[] = { app.imgui.srvHeap.Get() };
-    commandList->SetDescriptorHeaps(1, ppHeaps);
-    ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), commandList);
-
-    // Indicate that the back buffer will now be used to present.
-    barrier = CD3DX12_RESOURCE_BARRIER::Transition(app.renderTargets[app.frameIdx].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
-    commandList->ResourceBarrier(1, &barrier);
+    GBufferPass(app, commandList);
+    FinalPass(app, commandList);
 
     ASSERT_HRESULT(
         commandList->Close()
@@ -1399,6 +1693,7 @@ void HandleResize(App& app, int newWidth, int newHeight)
 
     SetupRenderTargets(app);
     SetupDepthStencil(app, true);
+    SetupGBuffer(app, true);
 
     app.frameIdx = app.swapChain->GetCurrentBackBufferIndex();
 }
@@ -1415,7 +1710,7 @@ void InitImGui(App& app)
         desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         desc.NumDescriptors = 1;
         desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-        ASSERT_HRESULT(app.device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&app.imgui.srvHeap)));
+        ASSERT_HRESULT(app.device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&app.ImGui.srvHeap)));
     }
 
     CHECK(
@@ -1427,13 +1722,11 @@ void InitImGui(App& app)
             app.device.Get(),
             FrameBufferCount,
             DXGI_FORMAT_R8G8B8A8_UNORM,
-            app.imgui.srvHeap.Get(),
-            app.imgui.srvHeap->GetCPUDescriptorHandleForHeapStart(),
-            app.imgui.srvHeap->GetGPUDescriptorHandleForHeapStart()
+            app.ImGui.srvHeap.Get(),
+            app.ImGui.srvHeap->GetCPUDescriptorHandleForHeapStart(),
+            app.ImGui.srvHeap->GetGPUDescriptorHandleForHeapStart()
         )
     );
-
-
 }
 
 void CleanImGui()
@@ -1448,20 +1741,6 @@ void BeginGUI(App& app)
     ImGui_ImplDX12_NewFrame();
     ImGui_ImplSDL2_NewFrame();
     ImGui::NewFrame();
-
-
-    if (ImGui::BeginMainMenuBar()) {
-        if (ImGui::BeginMenu("Windows")) {
-            ImGui::Checkbox("About", &app.imgui.aboutWindowOpen);
-            ImGui::EndMenu();
-        }
-        ImGui::EndMainMenuBar();
-    }
-
-
-    if (app.imgui.aboutWindowOpen) {
-        ImGui::ShowAboutWindow(&app.imgui.aboutWindowOpen);
-    }
 }
 
 int RunApp(int argc, char** argv)
