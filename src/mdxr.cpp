@@ -507,8 +507,7 @@ void SetupLightingPass(App& app)
     {
         D3D12_FEATURE_DATA_ROOT_SIGNATURE featureData = {};
         featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_1;
-        if (FAILED(app.device->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &featureData, sizeof(featureData))))
-        {
+        if (FAILED(app.device->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &featureData, sizeof(featureData)))) {
             featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_0;
         }
 
@@ -829,34 +828,36 @@ ComPtr<ID3D12Resource> CreateUploadHeap(App& app, const std::vector<D3D12_RESOUR
 }
 
 void CreateDescriptorsForModel(
+    Model& outputModel,
     App& app,
-    const tinygltf::Model& model,
-    const std::span<ComPtr<ID3D12Resource>> textureResources,
-    ComPtr<ID3D12DescriptorHeap>& outHeap,
-    UINT& baseTexturesDescriptorIndex,
-    ComPtr<ID3D12Resource>& perPrimitiveConstantBuffer
+    const tinygltf::Model& inputModel,
+    const std::span<ComPtr<ID3D12Resource>> textureResources
 )
 {
     // Allocate 1 descriptor for the constant buffer and the rest for the textures.
     size_t numConstantBuffers = 0;
-    for (const auto& mesh : model.meshes) {
+    for (const auto& mesh : inputModel.meshes) {
         numConstantBuffers += mesh.primitives.size();
     }
-    size_t numDescriptors = numConstantBuffers + model.textures.size();
-    baseTexturesDescriptorIndex = numConstantBuffers;
+    size_t numDescriptors = numConstantBuffers + inputModel.textures.size();
+    outputModel.baseTextureDescriptorIdx = (UINT)numConstantBuffers;
+
+    ComPtr<ID3D12DescriptorHeap> mainDescriptorHeap;
 
     D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
     heapDesc.NumDescriptors = (UINT)numDescriptors;
     heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     ASSERT_HRESULT(
-        app.device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&outHeap))
+        app.device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&mainDescriptorHeap))
     );
 
-    UINT incrementSize = app.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    UINT incrementSize = app.cbvSrvUavDescriptorSize;
 
+    // Create per-primitive constant buffer
+    ComPtr<ID3D12Resource> perPrimitiveConstantBuffer;
     {
-        const UINT constantBufferSize = (UINT)sizeof(PerPrimitiveConstantData) * (UINT)model.meshes.size();
+        const UINT constantBufferSize = (UINT)sizeof(PerPrimitiveConstantData) * (UINT)inputModel.meshes.size();
         CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_UPLOAD);
         auto resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(constantBufferSize);
         ASSERT_HRESULT(
@@ -870,8 +871,8 @@ void CreateDescriptorsForModel(
             )
         );
 
-        CD3DX12_CPU_DESCRIPTOR_HANDLE cpuHandle(outHeap->GetCPUDescriptorHandleForHeapStart(), 0, incrementSize);
-        for (int i = 0; i < model.meshes.size(); i++) {
+        CD3DX12_CPU_DESCRIPTOR_HANDLE cpuHandle(mainDescriptorHeap->GetCPUDescriptorHandleForHeapStart(), 0, incrementSize);
+        for (int i = 0; i < inputModel.meshes.size(); i++) {
             D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
             cbvDesc.BufferLocation = perPrimitiveConstantBuffer->GetGPUVirtualAddress() + (i * sizeof(PerPrimitiveConstantData));
             cbvDesc.SizeInBytes = sizeof(PerPrimitiveConstantData);
@@ -883,8 +884,9 @@ void CreateDescriptorsForModel(
         }
     }
 
+    // Create SRVs
     {
-        CD3DX12_CPU_DESCRIPTOR_HANDLE cpuHandle(outHeap->GetCPUDescriptorHandleForHeapStart(), (int)model.meshes.size(), incrementSize);
+        CD3DX12_CPU_DESCRIPTOR_HANDLE cpuHandle(mainDescriptorHeap->GetCPUDescriptorHandleForHeapStart(), (int)inputModel.meshes.size(), incrementSize);
         for (const auto& textureResource : textureResources) {
             auto textureDesc = textureResource->GetDesc();
             D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
@@ -896,6 +898,11 @@ void CreateDescriptorsForModel(
             cpuHandle.Offset(1, incrementSize);
         }
     }
+
+    outputModel.mainDescriptorHeap = mainDescriptorHeap;
+    outputModel.perPrimitiveConstantBuffer = perPrimitiveConstantBuffer;
+    CD3DX12_RANGE readRange(0, 0);
+    ASSERT_HRESULT(perPrimitiveConstantBuffer->Map(0, &readRange, reinterpret_cast<void**>(&outputModel.perPrimitiveBufferPtr)));
 }
 
 D3D12_RESOURCE_DESC GetImageResourceDesc(const tinygltf::Image& image)
@@ -941,8 +948,9 @@ std::vector<D3D12_RESOURCE_DESC> CreateResourceDescriptions(const tinygltf::Mode
 }
 
 std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
+    Model& outputModel,
     App& app,
-    const tinygltf::Model& model,
+    const tinygltf::Model& inputModel,
     ComPtr<ID3D12Resource> uploadHeap,
     const std::vector<D3D12_RESOURCE_DESC>& resourceDescs,
     const std::vector<UINT64>& uploadOffsets,
@@ -951,7 +959,7 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
 )
 {
     std::vector<ComPtr<ID3D12Resource>> resourceBuffers;
-    resourceBuffers.reserve(model.buffers.size() + model.images.size());
+    resourceBuffers.reserve(inputModel.buffers.size() + inputModel.images.size());
 
     // Copy all GLTF buffer data to the upload heap
     size_t uploadHeapPosition = 0;
@@ -959,15 +967,15 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
     CD3DX12_RANGE readRange(0, 0);
     uploadHeap->Map(0, &readRange, reinterpret_cast<void**>(&uploadHeapPtr));
     int bufferIdx = 0;
-    for (bufferIdx = 0; bufferIdx < model.buffers.size(); bufferIdx++) {
-        auto buffer = model.buffers[bufferIdx];
+    for (bufferIdx = 0; bufferIdx < inputModel.buffers.size(); bufferIdx++) {
+        auto buffer = inputModel.buffers[bufferIdx];
         auto uploadHeapPosition = uploadOffsets[bufferIdx];
         memcpy(uploadHeapPtr + uploadHeapPosition, buffer.data.data(), buffer.data.size());
     }
     int imageIdx = 0;
     for (; bufferIdx < uploadOffsets.size(); imageIdx++, bufferIdx++)
     {
-        auto image = model.images[imageIdx];
+        auto image = inputModel.images[imageIdx];
         auto uploadHeapPosition = uploadOffsets[bufferIdx];
         memcpy(uploadHeapPtr + uploadHeapPosition, image.image.data(), image.image.size());
     }
@@ -976,8 +984,8 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
     std::vector<CD3DX12_RESOURCE_BARRIER> resourceBarriers;
 
     // Copy all the gltf buffer data to a dedicated geometry buffer
-    for (bufferIdx = 0; bufferIdx < model.buffers.size(); bufferIdx++) {
-        const auto& gltfBuffer = model.buffers[bufferIdx];
+    for (bufferIdx = 0; bufferIdx < inputModel.buffers.size(); bufferIdx++) {
+        const auto& gltfBuffer = inputModel.buffers[bufferIdx];
         ComPtr<ID3D12Resource> geometryBuffer;
         CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
         auto resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(gltfBuffer.data.size());
@@ -1006,8 +1014,8 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
     }
 
     // Upload images to buffers
-    for (; bufferIdx < model.buffers.size() + model.images.size(); bufferIdx++) {
-        const auto& gltfImage = model.images[bufferIdx - model.buffers.size()];
+    for (; bufferIdx < inputModel.buffers.size() + inputModel.images.size(); bufferIdx++) {
+        const auto& gltfImage = inputModel.images[bufferIdx - inputModel.buffers.size()];
         ComPtr<ID3D12Resource> buffer;
         CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
         auto resourceDesc = GetImageResourceDesc(gltfImage);
@@ -1049,9 +1057,11 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
         ));
     }
 
-    auto endGeometryBuffer = resourceBuffers.begin() + model.buffers.size();
+    auto endGeometryBuffer = resourceBuffers.begin() + inputModel.buffers.size();
     outGeometryResources = std::span(resourceBuffers.begin(), endGeometryBuffer);
     outTextureResources = std::span(endGeometryBuffer, resourceBuffers.end());
+
+    outputModel.buffers = resourceBuffers;
 
     app.commandList->ResourceBarrier((UINT)resourceBarriers.size(), resourceBarriers.data());
 
@@ -1112,12 +1122,10 @@ void ResolveMeshTransforms(
     }
 }
 
-Model FinalizeModel(
+void FinalizeModel(
+    Model& outputModel,
     App& app,
-    const tinygltf::Model& model,
-    const std::vector<ComPtr<ID3D12Resource>>& resourceBuffers,
-    const UINT baseTextureDescriptorIdx,
-    ComPtr<ID3D12Resource> perPrimitiveConstantBuffer
+    const tinygltf::Model& inputModel
 )
 {
     // Just storing these strings so that we don't have to keep the Model object around.
@@ -1144,15 +1152,9 @@ Model FinalizeModel(
         }
     };
 
-    Model result;
-    result.buffers = resourceBuffers;
-    result.baseTextureDescriptorIdx = baseTextureDescriptorIdx;
+    const std::vector<ComPtr<ID3D12Resource>>& resourceBuffers = outputModel.buffers;
 
-    result.perPrimitiveConstantBuffer = perPrimitiveConstantBuffer;
-    CD3DX12_RANGE readRange(0, 0);
-    ASSERT_HRESULT(perPrimitiveConstantBuffer->Map(0, &readRange, reinterpret_cast<void**>(&result.perPrimitiveBufferPtr)));
-
-    for (const auto& mesh : model.meshes) {
+    for (const auto& mesh : inputModel.meshes) {
         std::vector<Primitive> primitives;
         for (const auto& primitive : mesh.primitives) {
             Primitive drawCall;
@@ -1167,7 +1169,7 @@ Model FinalizeModel(
             // the value is an index into the vertexBufferViews array.
             // 
             // This needs to be done because certain GLTF models are designed in a way that 
-            // doesn't allow us to have a one to one relationship between gltf buffer views 
+            // doesn't allow us to have a one-to-one relationship between gltf buffer views 
             // and d3d buffer views.
             std::map<D3D12_GPU_VIRTUAL_ADDRESS, UINT> vertexStartOffsetToBufferView;
 
@@ -1183,7 +1185,7 @@ Model FinalizeModel(
                 if (semanticName != SEMANTIC_NAMES.end()) {
                     D3D12_INPUT_ELEMENT_DESC desc;
                     int accessorIdx = attrib.second;
-                    auto& accessor = model.accessors[accessorIdx];
+                    auto& accessor = inputModel.accessors[accessorIdx];
                     desc.SemanticName = semanticName->c_str();
                     desc.SemanticIndex = semanticIndex;
                     desc.InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
@@ -1207,7 +1209,7 @@ Model FinalizeModel(
                     // Accessors can be linked to the same bufferview, so here we keep
                     // track of what input slot is linked to a bufferview.
                     int bufferViewIdx = accessor.bufferView;
-                    auto bufferView = model.bufferViews[bufferViewIdx];
+                    auto bufferView = inputModel.bufferViews[bufferViewIdx];
 
                     byteStride = bufferView.byteStride > 0 ? (UINT)bufferView.byteStride : byteStride;
 
@@ -1267,7 +1269,7 @@ Model FinalizeModel(
             int normalIdx = -1;
             if (primitive.material != -1)
             {
-                auto material = model.materials[primitive.material];
+                auto material = inputModel.materials[primitive.material];
                 diffuseIdx = material.pbrMetallicRoughness.baseColorTexture.index;
                 normalIdx = material.normalTexture.index;
             }
@@ -1277,9 +1279,9 @@ Model FinalizeModel(
             {
                 D3D12_INDEX_BUFFER_VIEW& ibv = drawCall.indexBufferView;
                 int accessorIdx = primitive.indices;
-                auto& accessor = model.accessors[accessorIdx];
+                auto& accessor = inputModel.accessors[accessorIdx];
                 int indexBufferViewIdx = accessor.bufferView;
-                auto bufferView = model.bufferViews[indexBufferViewIdx];
+                auto bufferView = inputModel.bufferViews[indexBufferViewIdx];
                 ibv.BufferLocation = resourceBuffers[bufferView.buffer]->GetGPUVirtualAddress() + bufferView.byteOffset + accessor.byteOffset;
                 ibv.SizeInBytes = (UINT)(bufferView.byteLength - accessor.byteOffset);
                 switch (accessor.componentType) {
@@ -1299,13 +1301,13 @@ Model FinalizeModel(
             primitives.push_back(drawCall);
         }
 
-        result.meshes.push_back(Mesh{ primitives });
+        outputModel.meshes.push_back(Mesh{ primitives });
     }
 
-    ResolveMeshTransforms(model, result.meshes);
+    ResolveMeshTransforms(inputModel, outputModel.meshes);
 
     // FIXME: So many wasted PSOs.
-    for (auto& mesh : result.meshes) {
+    for (auto& mesh : outputModel.meshes) {
         for (auto& primitive : mesh.primitives) {
             primitive.PSO = CreateMeshGBufferPSO(
                 app.device.Get(),
@@ -1315,14 +1317,35 @@ Model FinalizeModel(
             );
         }
     }
+}
 
-    return result;
+// For the time being we cannot handle GLTF meshes without normals, tangents and UVs.
+bool ValidateGLTFModel(const tinygltf::Model& model)
+{
+    for (const auto& mesh : model.meshes)
+    {
+        for (const auto& primitive : mesh.primitives)
+        {
+            const auto& attributes = primitive.attributes;
+            bool hasNormals = primitive.attributes.contains("NORMAL");
+            bool hasTangents = primitive.attributes.contains("TANGENT");
+            bool hasTexcoords = primitive.attributes.contains("TEXCOORD") || primitive.attributes.contains("TEXCOORD_0");
+            if (!hasNormals || !hasTangents || !hasTexcoords) {
+                std::cout << "Model with mesh " << mesh.name << " is missing required vertex attributes and will be skipped\n";
+                return false;
+            }
+        }
+    }
 }
 
 void ProcessAssets(App& app, const AppAssets& assets)
 {
     // TODO: easy candidate for multithreading
     for (const auto& gltfModel : assets.models) {
+        if (!ValidateGLTFModel(gltfModel)) {
+            continue;
+        }
+
         auto resourceDescs = CreateResourceDescriptions(gltfModel);
 
         std::vector<UINT64> uploadOffsets;
@@ -1331,9 +1354,12 @@ void ProcessAssets(App& app, const AppAssets& assets)
         std::span<ComPtr<ID3D12Resource>> geometryBuffers;
         std::span<ComPtr<ID3D12Resource>> textureBuffers;
 
+        Model model;
+
         // Can only call this ONCE before command list executed
         // This will need to be adapted to handle N models.
         auto resourceBuffers = UploadModelBuffers(
+            model,
             app,
             gltfModel,
             uploadHeap,
@@ -1343,13 +1369,8 @@ void ProcessAssets(App& app, const AppAssets& assets)
             textureBuffers
         );
 
-        ComPtr<ID3D12DescriptorHeap> mainDescriptorHeap;
-        ComPtr<ID3D12Resource> perPrimitiveConstantBuffer;
-        UINT baseTextureDescriptorIdx;
-        CreateDescriptorsForModel(app, gltfModel, textureBuffers, mainDescriptorHeap, baseTextureDescriptorIdx, perPrimitiveConstantBuffer);
-
-        Model model = FinalizeModel(app, gltfModel, resourceBuffers, baseTextureDescriptorIdx, perPrimitiveConstantBuffer);
-        model.mainDescriptorHeap = mainDescriptorHeap;
+        CreateDescriptorsForModel(model, app, gltfModel, textureBuffers);
+        FinalizeModel(model, app, gltfModel);
 
         app.models.push_back(model);
 
@@ -1481,15 +1502,18 @@ void InitializeScene(App& app) {
     app.camera.yaw = glm::pi<float>();
 }
 
-void UpdatePerPrimitiveConstantBuffers(Model& model, const glm::mat4& viewProjection)
+void UpdatePerPrimitiveConstantBuffers(Model& model, const glm::mat4& projection, const glm::mat4& view)
 {
+    glm::mat4 viewProjection = projection * view;
     PerPrimitiveConstantData* perPrimitiveBuffer = reinterpret_cast<PerPrimitiveConstantData*>(model.perPrimitiveBufferPtr);
     for (int i = 0; i < model.meshes.size(); i++) {
         auto& mesh = model.meshes[i];
         auto modelMatrix = mesh.modelMatrix;
         auto mvp = viewProjection * modelMatrix;
+        auto mv = view * modelMatrix;
         for (const auto& primitive : mesh.primitives) {
             perPrimitiveBuffer->MVP = mvp;
+            perPrimitiveBuffer->MV = mv;
             perPrimitiveBuffer->diffuseTextureIdx = primitive.TextureIndices.diffuse;
             perPrimitiveBuffer->normalTextureIdx = primitive.TextureIndices.normal;
             perPrimitiveBuffer++;
@@ -1558,10 +1582,9 @@ void UpdateScene(App& app)
 
     glm::mat4 projection = glm::perspective(glm::pi<float>() * 0.2f, (float)app.windowWidth / (float)app.windowHeight, 0.1f, 1000.0f);
     glm::mat4 view = UpdateFlyCamera(app, deltaSeconds);
-    glm::mat4 viewProjection = projection * view;
 
     for (auto& model : app.models) {
-        UpdatePerPrimitiveConstantBuffers(model, viewProjection);
+        UpdatePerPrimitiveConstantBuffers(model, projection, view);
     }
 }
 
@@ -1823,7 +1846,7 @@ int RunApp(int argc, char** argv)
                 SDL_SetRelativeMouseMode(SDL_FALSE);
                 SDL_SetWindowGrab(app.window, SDL_FALSE);
             }
-        }
+    }
 
         BeginGUI(app);
         UpdateScene(app);
@@ -1832,7 +1855,7 @@ int RunApp(int argc, char** argv)
         RenderFrame(app);
 
         app.lastFrameTick = frameTick;
-    }
+}
 
     WaitForPreviousFrame(app);
 
@@ -1840,7 +1863,7 @@ int RunApp(int argc, char** argv)
     SDL_DestroyWindow(app.window);
 
     return 0;
-}
+    }
 
 int RunMDXR(int argc, char** argv)
 {
