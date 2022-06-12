@@ -23,11 +23,15 @@ using namespace std::chrono;
 
 const int FrameBufferCount = 2;
 
-struct PerMeshConstantData {
+struct PerPrimitiveConstantData {
+    // MVP & MV are PerMesh, but most meshes only have one primitive.
     glm::mat4 MVP;
-    float padding[48]; // 256 aligned
+    glm::mat4 MV;
+    UINT diffuseTextureIdx;
+    UINT normalTextureIdx;
+    float padding[30];
 };
-static_assert((sizeof(PerMeshConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
+static_assert((sizeof(PerPrimitiveConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
 
 struct Primitive {
     std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout;
@@ -35,15 +39,19 @@ struct Primitive {
     D3D12_INDEX_BUFFER_VIEW indexBufferView;
     D3D12_PRIMITIVE_TOPOLOGY primitiveTopology;
     ComPtr<ID3D12PipelineState> PSO;
-    D3D12_GPU_DESCRIPTOR_HANDLE srvHandle;
     UINT indexCount;
+    PerPrimitiveConstantData constantData;
+
+    struct {
+        UINT diffuse;
+        UINT normal;
+    } TextureIndices;
 };
 
 struct Mesh {
     std::vector<Primitive> primitives;
 
     glm::mat4 modelMatrix;
-    PerMeshConstantData constantData;
 };
 
 struct Model {
@@ -52,9 +60,11 @@ struct Model {
 
     ComPtr<ID3D12DescriptorHeap> mainDescriptorHeap;
 
+    UINT baseTextureDescriptorIdx;
+
     // All of the child mesh constant buffers stored in this constant buffer
-    ComPtr<ID3D12Resource> perMeshConstantBuffer;
-    UINT8* perMeshBufferPtr;
+    ComPtr<ID3D12Resource> perPrimitiveConstantBuffer;
+    UINT8* perPrimitiveBufferPtr;
 };
 
 struct AppAssets {
@@ -116,9 +126,9 @@ struct Camera {
 
     float maxPitch = glm::radians(70.0f);
 
-    float targetSpeed = 7.0f;
+    float targetSpeed = 5.0f;
     float maxSpeed = 20.0f;
-    float minSpeed = 1.0f;
+    float minSpeed = 0.5f;
 
     bool locked = true;
 };
@@ -361,6 +371,8 @@ ComPtr<ID3D12PipelineState> CreateDiffuseMeshPSO(
     );
 }
 
+D3D12_RESOURCE_DESC GBufferResourceDesc(GBufferTarget target, int windowWidth, int windowHeight);
+
 ComPtr<ID3D12PipelineState> CreateMeshGBufferPSO(
     ID3D12Device* device,
     const std::string& dataDir,
@@ -369,6 +381,10 @@ ComPtr<ID3D12PipelineState> CreateMeshGBufferPSO(
 )
 {
     auto psoDesc = DefaultPSODesc();
+    psoDesc.NumRenderTargets = (int)GBufferTarget::Count;
+    for (int i = 0; i < (int)GBufferTarget::Count; i++) {
+        psoDesc.RTVFormats[i] = GBufferResourceDesc((GBufferTarget)i, 0, 0).Format;
+    }
     return CreatePSO(
         device,
         dataDir,
@@ -486,20 +502,6 @@ void SetupGBuffer(App& app, bool isResize)
     }
 }
 
-void SetupFullscreenQuad(App& app)
-{
-    // std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout;
-    // std::vector<D3D12_VERTEX_BUFFER_VIEW> vertexBufferViews;
-    // D3D12_INDEX_BUFFER_VIEW indexBufferView;
-    // D3D12_PRIMITIVE_TOPOLOGY primitiveTopology;
-    // ComPtr<ID3D12PipelineState> PSO;
-    // D3D12_GPU_DESCRIPTOR_HANDLE srvHandle;
-    // UINT indexCount;
-
-    // D3D12_INPUT_ELEMENT_DESC positionElem{ "POSITION", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
-    // inputLayout.push_back(positionElem);
-}
-
 void SetupLightingPass(App& app)
 {
     {
@@ -513,7 +515,7 @@ void SetupLightingPass(App& app)
         CD3DX12_DESCRIPTOR_RANGE1 ranges[1];
         CD3DX12_ROOT_PARAMETER1 rootParameters[1];
 
-        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE);
+        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE);
         rootParameters[0].InitAsDescriptorTable(1, &ranges[0], D3D12_SHADER_VISIBILITY_PIXEL);
 
         D3D12_ROOT_SIGNATURE_FLAGS rootSignatureFlags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
@@ -831,14 +833,17 @@ void CreateDescriptorsForModel(
     const tinygltf::Model& model,
     const std::span<ComPtr<ID3D12Resource>> textureResources,
     ComPtr<ID3D12DescriptorHeap>& outHeap,
-    std::vector<D3D12_GPU_DESCRIPTOR_HANDLE>& outHandles,
-    ComPtr<ID3D12Resource>& perMeshConstantBuffer
+    UINT& baseTexturesDescriptorIndex,
+    ComPtr<ID3D12Resource>& perPrimitiveConstantBuffer
 )
 {
     // Allocate 1 descriptor for the constant buffer and the rest for the textures.
-    const size_t numConstantBuffers = model.meshes.size();
+    size_t numConstantBuffers = 0;
+    for (const auto& mesh : model.meshes) {
+        numConstantBuffers += mesh.primitives.size();
+    }
     size_t numDescriptors = numConstantBuffers + model.textures.size();
-    outHandles.reserve(numDescriptors);
+    baseTexturesDescriptorIndex = numConstantBuffers;
 
     D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
     heapDesc.NumDescriptors = (UINT)numDescriptors;
@@ -851,7 +856,7 @@ void CreateDescriptorsForModel(
     UINT incrementSize = app.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
     {
-        const UINT constantBufferSize = (UINT)sizeof(PerMeshConstantData) * (UINT)model.meshes.size();
+        const UINT constantBufferSize = (UINT)sizeof(PerPrimitiveConstantData) * (UINT)model.meshes.size();
         CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_UPLOAD);
         auto resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(constantBufferSize);
         ASSERT_HRESULT(
@@ -861,15 +866,15 @@ void CreateDescriptorsForModel(
                 &resourceDesc,
                 D3D12_RESOURCE_STATE_GENERIC_READ,
                 nullptr,
-                IID_PPV_ARGS(&perMeshConstantBuffer)
+                IID_PPV_ARGS(&perPrimitiveConstantBuffer)
             )
         );
 
         CD3DX12_CPU_DESCRIPTOR_HANDLE cpuHandle(outHeap->GetCPUDescriptorHandleForHeapStart(), 0, incrementSize);
         for (int i = 0; i < model.meshes.size(); i++) {
             D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
-            cbvDesc.BufferLocation = perMeshConstantBuffer->GetGPUVirtualAddress() + (i * sizeof(PerMeshConstantData));
-            cbvDesc.SizeInBytes = sizeof(PerMeshConstantData);
+            cbvDesc.BufferLocation = perPrimitiveConstantBuffer->GetGPUVirtualAddress() + (i * sizeof(PerPrimitiveConstantData));
+            cbvDesc.SizeInBytes = sizeof(PerPrimitiveConstantData);
             app.device->CreateConstantBufferView(
                 &cbvDesc,
                 cpuHandle
@@ -880,7 +885,6 @@ void CreateDescriptorsForModel(
 
     {
         CD3DX12_CPU_DESCRIPTOR_HANDLE cpuHandle(outHeap->GetCPUDescriptorHandleForHeapStart(), (int)model.meshes.size(), incrementSize);
-        CD3DX12_GPU_DESCRIPTOR_HANDLE gpuHandle(outHeap->GetGPUDescriptorHandleForHeapStart(), (int)model.meshes.size(), incrementSize);
         for (const auto& textureResource : textureResources) {
             auto textureDesc = textureResource->GetDesc();
             D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
@@ -889,9 +893,7 @@ void CreateDescriptorsForModel(
             srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
             srvDesc.Texture2D.MipLevels = 1;
             app.device->CreateShaderResourceView(textureResource.Get(), &srvDesc, cpuHandle);
-            outHandles.push_back((D3D12_GPU_DESCRIPTOR_HANDLE)gpuHandle);
             cpuHandle.Offset(1, incrementSize);
-            gpuHandle.Offset(1, incrementSize);
         }
     }
 }
@@ -1114,8 +1116,8 @@ Model FinalizeModel(
     App& app,
     const tinygltf::Model& model,
     const std::vector<ComPtr<ID3D12Resource>>& resourceBuffers,
-    const std::vector<D3D12_GPU_DESCRIPTOR_HANDLE>& srvHandles,
-    ComPtr<ID3D12Resource> perMeshConstantBuffer
+    const UINT baseTextureDescriptorIdx,
+    ComPtr<ID3D12Resource> perPrimitiveConstantBuffer
 )
 {
     // Just storing these strings so that we don't have to keep the Model object around.
@@ -1144,10 +1146,11 @@ Model FinalizeModel(
 
     Model result;
     result.buffers = resourceBuffers;
+    result.baseTextureDescriptorIdx = baseTextureDescriptorIdx;
 
-    result.perMeshConstantBuffer = perMeshConstantBuffer;
+    result.perPrimitiveConstantBuffer = perPrimitiveConstantBuffer;
     CD3DX12_RANGE readRange(0, 0);
-    ASSERT_HRESULT(perMeshConstantBuffer->Map(0, &readRange, reinterpret_cast<void**>(&result.perMeshBufferPtr)));
+    ASSERT_HRESULT(perPrimitiveConstantBuffer->Map(0, &readRange, reinterpret_cast<void**>(&result.perPrimitiveBufferPtr)));
 
     for (const auto& mesh : model.meshes) {
         std::vector<Primitive> primitives;
@@ -1260,14 +1263,16 @@ Model FinalizeModel(
                 }
             }
 
+            int diffuseIdx = -1;
+            int normalIdx = -1;
             if (primitive.material != -1)
             {
                 auto material = model.materials[primitive.material];
-                int texIdx = material.pbrMetallicRoughness.baseColorTexture.index;
-                if (texIdx != -1) {
-                    drawCall.srvHandle = srvHandles[texIdx];
-                }
+                diffuseIdx = material.pbrMetallicRoughness.baseColorTexture.index;
+                normalIdx = material.normalTexture.index;
             }
+            drawCall.TextureIndices.diffuse = diffuseIdx;
+            drawCall.TextureIndices.normal = normalIdx;
 
             {
                 D3D12_INDEX_BUFFER_VIEW& ibv = drawCall.indexBufferView;
@@ -1338,12 +1343,12 @@ void ProcessAssets(App& app, const AppAssets& assets)
             textureBuffers
         );
 
-        std::vector<D3D12_GPU_DESCRIPTOR_HANDLE> srvHandles;
         ComPtr<ID3D12DescriptorHeap> mainDescriptorHeap;
-        ComPtr<ID3D12Resource> perMeshConstantBuffer;
-        CreateDescriptorsForModel(app, gltfModel, textureBuffers, mainDescriptorHeap, srvHandles, perMeshConstantBuffer);
+        ComPtr<ID3D12Resource> perPrimitiveConstantBuffer;
+        UINT baseTextureDescriptorIdx;
+        CreateDescriptorsForModel(app, gltfModel, textureBuffers, mainDescriptorHeap, baseTextureDescriptorIdx, perPrimitiveConstantBuffer);
 
-        Model model = FinalizeModel(app, gltfModel, resourceBuffers, srvHandles, perMeshConstantBuffer);
+        Model model = FinalizeModel(app, gltfModel, resourceBuffers, baseTextureDescriptorIdx, perPrimitiveConstantBuffer);
         model.mainDescriptorHeap = mainDescriptorHeap;
 
         app.models.push_back(model);
@@ -1381,8 +1386,8 @@ void LoadScene(App& app, const AppAssets& assets)
         CD3DX12_ROOT_PARAMETER1 rootParameters[2];
 
         ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE);
-        ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE);
-        rootParameters[0].InitAsDescriptorTable(1, &ranges[0], D3D12_SHADER_VISIBILITY_VERTEX);
+        ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, -1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE);
+        rootParameters[0].InitAsDescriptorTable(1, &ranges[0], D3D12_SHADER_VISIBILITY_ALL);
         rootParameters[1].InitAsDescriptorTable(1, &ranges[1], D3D12_SHADER_VISIBILITY_PIXEL);
 
         D3D12_ROOT_SIGNATURE_FLAGS rootSignatureFlags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
@@ -1414,14 +1419,19 @@ void LoadScene(App& app, const AppAssets& assets)
 
         ComPtr<ID3DBlob> signature;
         ComPtr<ID3DBlob> error;
-        ASSERT_HRESULT(
+        if (!SUCCEEDED(
             D3DX12SerializeVersionedRootSignature(
                 &rootSignatureDesc,
                 featureData.HighestVersion,
                 &signature,
                 &error
             )
-        );
+        )) {
+            std::cout << "Error: root signature compilation failed\n";
+            std::cout << (char*)error->GetBufferPointer();
+            abort();
+        }
+
         ASSERT_HRESULT(
             device->CreateRootSignature(
                 0,
@@ -1471,14 +1481,19 @@ void InitializeScene(App& app) {
     app.camera.yaw = glm::pi<float>();
 }
 
-void UpdatePerMeshConstantBuffers(Model& model, const glm::mat4& viewProjection)
+void UpdatePerPrimitiveConstantBuffers(Model& model, const glm::mat4& viewProjection)
 {
-    PerMeshConstantData* perMeshArray = reinterpret_cast<PerMeshConstantData*>(model.perMeshBufferPtr);
+    PerPrimitiveConstantData* perPrimitiveBuffer = reinterpret_cast<PerPrimitiveConstantData*>(model.perPrimitiveBufferPtr);
     for (int i = 0; i < model.meshes.size(); i++) {
         auto& mesh = model.meshes[i];
         auto modelMatrix = mesh.modelMatrix;
         auto mvp = viewProjection * modelMatrix;
-        perMeshArray[i].MVP = mvp;
+        for (const auto& primitive : mesh.primitives) {
+            perPrimitiveBuffer->MVP = mvp;
+            perPrimitiveBuffer->diffuseTextureIdx = primitive.TextureIndices.diffuse;
+            perPrimitiveBuffer->normalTextureIdx = primitive.TextureIndices.normal;
+            perPrimitiveBuffer++;
+        }
     }
 }
 
@@ -1546,7 +1561,7 @@ void UpdateScene(App& app)
     glm::mat4 viewProjection = projection * view;
 
     for (auto& model : app.models) {
-        UpdatePerMeshConstantBuffers(model, viewProjection);
+        UpdatePerPrimitiveConstantBuffers(model, viewProjection);
     }
 }
 
@@ -1555,19 +1570,23 @@ void DrawModelCommandList(const Model& model, ID3D12GraphicsCommandList* command
     ID3D12DescriptorHeap* mainDescriptorHeap = model.mainDescriptorHeap.Get();
     ID3D12DescriptorHeap* ppHeaps[] = { mainDescriptorHeap };
     commandList->SetDescriptorHeaps(1, ppHeaps);
+    // Set the texture array. Textures are dynamically indexed from the constant buffer.
+    {
+        CD3DX12_GPU_DESCRIPTOR_HANDLE texturesHandle(model.mainDescriptorHeap->GetGPUDescriptorHandleForHeapStart(), model.baseTextureDescriptorIdx, cbvOffsetIncrement);
+        commandList->SetGraphicsRootDescriptorTable(1, texturesHandle);
+    }
     CD3DX12_GPU_DESCRIPTOR_HANDLE constantBufferHandle(mainDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
     for (const auto& mesh : model.meshes) {
-        // Set the per-mesh constant buffer
-        commandList->SetGraphicsRootDescriptorTable(0, constantBufferHandle);
         for (const auto& primitive : mesh.primitives) {
-            commandList->SetGraphicsRootDescriptorTable(1, primitive.srvHandle);
+            // Set the per-primitive constant buffer
+            commandList->SetGraphicsRootDescriptorTable(0, constantBufferHandle);
             commandList->IASetPrimitiveTopology(primitive.primitiveTopology);
             commandList->SetPipelineState(primitive.PSO.Get());
             commandList->IASetVertexBuffers(0, (UINT)primitive.vertexBufferViews.size(), primitive.vertexBufferViews.data());
             commandList->IASetIndexBuffer(&primitive.indexBufferView);
             commandList->DrawIndexedInstanced(primitive.indexCount, 1, 0, 0, 0);
+            constantBufferHandle.Offset(1, cbvOffsetIncrement);
         }
-        constantBufferHandle.Offset(1, cbvOffsetIncrement);
     }
 }
 

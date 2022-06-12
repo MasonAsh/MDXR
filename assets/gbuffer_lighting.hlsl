@@ -1,4 +1,4 @@
-struct PerMeshData {
+struct PerPrimitiveData {
     float4x4 MVP;
     float4x4 MV;
 };
@@ -8,10 +8,13 @@ struct PSInput {
     float2 uv : TEXCOORD;
 };
 
-ConstantBuffer<PerMeshData> PerMesh : register(b0);
+ConstantBuffer<PerPrimitiveData> PerPrimitive : register(b0);
 
-Texture2D diffuseTexture : register(t0);
-SamplerState samp : register(t0);
+#define DIFFUSE_BUFFER 0
+#define NORMAL_BUFFER 1
+
+Texture2D GBuffer[2] : register(t0);
+SamplerState samp : register(s0);
 
 PSInput VSMain(uint id : SV_VertexID)
 {
@@ -23,5 +26,5 @@ PSInput VSMain(uint id : SV_VertexID)
 
 float4 PSMain(PSInput input) : SV_TARGET
 {
-    return diffuseTexture.Sample(samp, input.uv);
+    return GBuffer[DIFFUSE_BUFFER].Sample(samp, input.uv);
 }
