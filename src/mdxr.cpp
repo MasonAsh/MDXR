@@ -22,6 +22,8 @@
 using namespace std::chrono;
 
 const int FrameBufferCount = 2;
+const int MaxLightCount = 10;
+const DXGI_FORMAT DepthFormat = DXGI_FORMAT_D32_FLOAT;
 
 struct PerPrimitiveConstantData {
     // MVP & MV are PerMesh, but most meshes only have one primitive.
@@ -33,12 +35,63 @@ struct PerPrimitiveConstantData {
 };
 static_assert((sizeof(PerPrimitiveConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
 
+struct ManagedPSO {
+    ComPtr<ID3D12PipelineState> PSO;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc;
+    std::wstring vertexShaderPath;
+    std::wstring pixelShaderPath;
+    std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout;
+
+    ID3D12PipelineState* Get()
+    {
+        return PSO.Get();
+    }
+
+    // FIXME: This leaks. Shouldn't be a big deal since this is just for debugging, but something to keep in mind.
+    void reload(ID3D12Device* device)
+    {
+        ComPtr<ID3DBlob> vertexShader;
+        ComPtr<ID3DBlob> pixelShader;
+        ASSERT_HRESULT(
+            D3DReadFileToBlob(vertexShaderPath.c_str(), &vertexShader)
+        );
+        ASSERT_HRESULT(
+            D3DReadFileToBlob(pixelShaderPath.c_str(), &pixelShader)
+        );
+        desc.VS = { reinterpret_cast<UINT8*>(vertexShader->GetBufferPointer()), vertexShader->GetBufferSize() };
+        desc.PS = { reinterpret_cast<UINT8*>(pixelShader->GetBufferPointer()), pixelShader->GetBufferSize() };
+        ID3D12PipelineState* NewPSO;
+        if (!SUCCEEDED(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&NewPSO)))) {
+            std::wcout << L"Error: PSO reload failed for PSO with\n"
+                << L"Vertex shader: " << vertexShaderPath << L"\n"
+                << L"Pixel shader: " << pixelShaderPath << L"\n";
+            return;
+        }
+        PSO = NewPSO;
+    }
+};
+
+typedef std::shared_ptr<ManagedPSO> ManagedPSORef;
+
+struct PSOManager {
+    std::vector<std::weak_ptr<ManagedPSO>> PSOs;
+
+    void reload(ID3D12Device* device)
+    {
+        for (auto& PSO : PSOs) {
+            if (std::shared_ptr<ManagedPSO> pso = PSO.lock()) {
+                pso->reload(device);
+            }
+        }
+    }
+};
+
 struct Primitive {
     std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout;
     std::vector<D3D12_VERTEX_BUFFER_VIEW> vertexBufferViews;
     D3D12_INDEX_BUFFER_VIEW indexBufferView;
     D3D12_PRIMITIVE_TOPOLOGY primitiveTopology;
-    ComPtr<ID3D12PipelineState> PSO;
+    ManagedPSORef PSO;
     UINT indexCount;
     PerPrimitiveConstantData constantData;
 
@@ -69,6 +122,62 @@ struct Model {
 
 struct AppAssets {
     tinygltf::Model models[3];
+};
+
+struct DescriptorReference {
+    ID3D12DescriptorHeap* heap;
+    int descriptorOffset;
+
+    DescriptorReference()
+        : heap(nullptr)
+        , descriptorOffset(0)
+    {
+    }
+
+    DescriptorReference(ID3D12DescriptorHeap* heap, int descriptorOffset)
+        : heap(heap)
+        , descriptorOffset(descriptorOffset)
+    {
+    }
+
+    CD3DX12_CPU_DESCRIPTOR_HANDLE CPUHandle() const {
+        return CD3DX12_CPU_DESCRIPTOR_HANDLE(heap->GetCPUDescriptorHandleForHeapStart(), descriptorOffset);
+    }
+
+    CD3DX12_GPU_DESCRIPTOR_HANDLE GPUHandle() const {
+        return CD3DX12_GPU_DESCRIPTOR_HANDLE(heap->GetGPUDescriptorHandleForHeapStart(), descriptorOffset);
+    }
+};
+
+// Fixed capacity descriptor heap. Aborts when the size outgrows initial capacity.
+struct DescriptorArena {
+    ComPtr<ID3D12DescriptorHeap> descriptorHeap;
+    size_t capacity;
+    size_t size;
+    UINT descriptorIncrementSize;
+
+    void Initialize(ID3D12Device* device, D3D12_DESCRIPTOR_HEAP_DESC heapDesc)
+    {
+        descriptorIncrementSize = device->GetDescriptorHandleIncrementSize(heapDesc.Type);
+        ASSERT_HRESULT(
+            device->CreateDescriptorHeap(
+                &heapDesc,
+                IID_PPV_ARGS(&descriptorHeap)
+            )
+        );
+        capacity = heapDesc.NumDescriptors;
+        size = 0;
+    }
+
+    DescriptorReference AllocateDescriptors(UINT count) {
+        DescriptorReference reference(descriptorHeap.Get(), descriptorIncrementSize * size);
+        size += count;
+        if (size > capacity) {
+            std::cout << "Error: descriptor heap is not large enough\n";
+            abort();
+        }
+        return reference;
+    }
 };
 
 struct IncrementalFence {
@@ -139,16 +248,37 @@ struct MouseState {
 };
 
 
-enum class GBufferTarget {
-    Diffuse,
-    Normal,
-    Count,
+enum GBufferTarget {
+    GBuffer_Diffuse,
+    GBuffer_Normal,
+    GBuffer_Depth,
+    GBuffer_Count,
 };
 
-struct PointLight {
-    glm::vec3 translation;
-    glm::vec3 intensity;
+const int GBuffer_RTVCount = GBuffer_Depth;
+
+struct LightPassConstantData {
+    glm::mat4 inverseProjectionMatrix;
+    UINT debug;
+    float pad[47];
 };
+static_assert((sizeof(LightPassConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
+
+struct LightConstantData {
+    glm::vec4 position;
+    glm::vec4 direction;
+
+    glm::vec4 positionViewSpace;
+    glm::vec4 directionViewSpace;
+
+    glm::vec4 color;
+
+    float range;
+    float intensity;
+
+    float pad[42];
+};
+static_assert((sizeof(LightConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
 
 struct App {
     std::string dataDir;
@@ -187,8 +317,6 @@ struct App {
     ComPtr<ID3D12GraphicsCommandList> copyCommandList;
     IncrementalFence copyFence;
 
-    ComPtr<ID3D12PipelineState> unlitMeshPSO;
-
     ComPtr<ID3D12DescriptorHeap> srvHeap;
 
     // FIXME: Models should only exist as a concept in the scene graph.
@@ -210,13 +338,30 @@ struct App {
         bool aboutWindowOpen = true;
     } ImGui;
 
+    DescriptorArena lightingPassDescriptorArena;
     struct {
-        std::array<ComPtr<ID3D12Resource>, (size_t)GBufferTarget::Count> renderTargets;
-        ComPtr<ID3D12DescriptorHeap> srvHeap;
+        std::array<ComPtr<ID3D12Resource>, GBuffer_Count - 1> renderTargets;
+        DescriptorReference baseSrvReference;
     } GBuffer;
 
-    ComPtr<ID3D12PipelineState> lightingPSO;
+    ManagedPSORef lightingPSO;
     ComPtr<ID3D12RootSignature> lightingRootSignature;
+
+    struct {
+        ComPtr<ID3D12DescriptorHeap> descriptorHeap;
+        ComPtr<ID3D12Resource> constantBuffer;
+
+        // These two are stored in the same constant buffer.
+        // The lights are stored at offset (LightPassConstantData)
+        LightPassConstantData* passData;
+        LightConstantData* lights;
+
+        DescriptorReference cbvHandle;
+
+        int numLights;
+    } LightBuffer;
+
+    PSOManager psoManager;
 };
 
 void SetupDepthStencil(App& app, bool isResize)
@@ -231,12 +376,12 @@ void SetupDepthStencil(App& app, bool isResize)
     }
 
     D3D12_DEPTH_STENCIL_VIEW_DESC dsDesc = {};
-    dsDesc.Format = DXGI_FORMAT_D32_FLOAT;
+    dsDesc.Format = DepthFormat;
     dsDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
     dsDesc.Flags = D3D12_DSV_FLAG_NONE;
 
     D3D12_CLEAR_VALUE depthOptimizedClearValue = {};
-    depthOptimizedClearValue.Format = DXGI_FORMAT_D32_FLOAT;
+    depthOptimizedClearValue.Format = DepthFormat;
     depthOptimizedClearValue.DepthStencil.Depth = 1.0f;
     depthOptimizedClearValue.DepthStencil.Stencil = 0;
 
@@ -247,7 +392,7 @@ void SetupDepthStencil(App& app, bool isResize)
         &heapProps,
         D3D12_HEAP_FLAG_NONE,
         &resourceDesc,
-        D3D12_RESOURCE_STATE_DEPTH_WRITE,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
         &depthOptimizedClearValue,
         IID_PPV_ARGS(&depthStencilBuffer)
     ));
@@ -296,7 +441,8 @@ D3D12_GRAPHICS_PIPELINE_STATE_DESC DefaultPSODesc()
     return psoDesc;
 }
 
-ComPtr<ID3D12PipelineState> CreatePSO(
+ManagedPSORef CreatePSO(
+    PSOManager& manager,
     ID3D12Device* device,
     const std::string& dataDir,
     const std::string& shaderName,
@@ -319,23 +465,31 @@ ComPtr<ID3D12PipelineState> CreatePSO(
         D3DReadFileToBlob(pixelShaderPath.c_str(), &pixelShader)
     );
 
-    psoDesc.pRootSignature = rootSignature;
-    psoDesc.VS = { reinterpret_cast<UINT8*>(vertexShader->GetBufferPointer()), vertexShader->GetBufferSize() };
-    psoDesc.PS = { reinterpret_cast<UINT8*>(pixelShader->GetBufferPointer()), pixelShader->GetBufferSize() };
-    psoDesc.InputLayout = { inputLayout.data(), (UINT)inputLayout.size() };
+    auto mPso = std::make_shared<ManagedPSO>();
+    mPso->desc = psoDesc;
+    mPso->inputLayout = inputLayout;
 
-    ComPtr<ID3D12PipelineState> PSO;
+    mPso->desc.pRootSignature = rootSignature;
+    mPso->desc.VS = { reinterpret_cast<UINT8*>(vertexShader->GetBufferPointer()), vertexShader->GetBufferSize() };
+    mPso->desc.PS = { reinterpret_cast<UINT8*>(pixelShader->GetBufferPointer()), pixelShader->GetBufferSize() };
+    mPso->desc.InputLayout = { mPso->inputLayout.data(), (UINT)mPso->inputLayout.size() };
+
     ASSERT_HRESULT(
         device->CreateGraphicsPipelineState(
-            &psoDesc,
-            IID_PPV_ARGS(&PSO)
+            &mPso->desc,
+            IID_PPV_ARGS(&mPso->PSO)
         )
     );
+    mPso->vertexShaderPath = vertexShaderPath;
+    mPso->pixelShaderPath = pixelShaderPath;
 
-    return PSO;
+    manager.PSOs.emplace_back(mPso);
+
+    return mPso;
 }
 
-ComPtr<ID3D12PipelineState> CreateUnlitMeshPSO(
+ManagedPSORef CreateUnlitMeshPSO(
+    PSOManager& manager,
     ID3D12Device* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
@@ -344,6 +498,7 @@ ComPtr<ID3D12PipelineState> CreateUnlitMeshPSO(
 {
     auto psoDesc = DefaultPSODesc();
     return CreatePSO(
+        manager,
         device,
         dataDir,
         "unlit_mesh",
@@ -353,7 +508,8 @@ ComPtr<ID3D12PipelineState> CreateUnlitMeshPSO(
     );
 }
 
-ComPtr<ID3D12PipelineState> CreateDiffuseMeshPSO(
+ManagedPSORef CreateDiffuseMeshPSO(
+    PSOManager& manager,
     ID3D12Device* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
@@ -362,6 +518,7 @@ ComPtr<ID3D12PipelineState> CreateDiffuseMeshPSO(
 {
     auto psoDesc = DefaultPSODesc();
     return CreatePSO(
+        manager,
         device,
         dataDir,
         "diffuse_mesh",
@@ -373,7 +530,8 @@ ComPtr<ID3D12PipelineState> CreateDiffuseMeshPSO(
 
 D3D12_RESOURCE_DESC GBufferResourceDesc(GBufferTarget target, int windowWidth, int windowHeight);
 
-ComPtr<ID3D12PipelineState> CreateMeshGBufferPSO(
+ManagedPSORef CreateMeshGBufferPSO(
+    PSOManager& manager,
     ID3D12Device* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
@@ -381,11 +539,12 @@ ComPtr<ID3D12PipelineState> CreateMeshGBufferPSO(
 )
 {
     auto psoDesc = DefaultPSODesc();
-    psoDesc.NumRenderTargets = (int)GBufferTarget::Count;
-    for (int i = 0; i < (int)GBufferTarget::Count; i++) {
+    psoDesc.NumRenderTargets = GBuffer_Count;
+    for (int i = 0; i < GBuffer_Count; i++) {
         psoDesc.RTVFormats[i] = GBufferResourceDesc((GBufferTarget)i, 0, 0).Format;
     }
     return CreatePSO(
+        manager,
         device,
         dataDir,
         "mesh_gbuffer",
@@ -395,7 +554,8 @@ ComPtr<ID3D12PipelineState> CreateMeshGBufferPSO(
     );
 }
 
-ComPtr<ID3D12PipelineState> CreateGBufferLightingPSO(
+ManagedPSORef CreateGBufferLightingPSO(
+    PSOManager& manager,
     ID3D12Device* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
@@ -408,7 +568,24 @@ ComPtr<ID3D12PipelineState> CreateGBufferLightingPSO(
     psoDesc.DepthStencilState.DepthEnable = FALSE;
     psoDesc.DepthStencilState.StencilEnable = FALSE;
     psoDesc.RasterizerState = rasterizerState;
+
+    // Blend settings for accumulation buffer
+    D3D12_RENDER_TARGET_BLEND_DESC blendDesc;
+    blendDesc.BlendEnable = TRUE;
+    blendDesc.LogicOpEnable = FALSE;
+    blendDesc.SrcBlend = D3D12_BLEND_ONE;
+    blendDesc.DestBlend = D3D12_BLEND_ONE;
+    blendDesc.BlendOp = D3D12_BLEND_OP_ADD;
+    blendDesc.SrcBlendAlpha = D3D12_BLEND_ONE;
+    blendDesc.DestBlendAlpha = D3D12_BLEND_ZERO;
+    blendDesc.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    blendDesc.LogicOp = D3D12_LOGIC_OP_NOOP;
+    blendDesc.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+    psoDesc.BlendState.RenderTarget[0] = blendDesc;
+
     return CreatePSO(
+        manager,
         device,
         dataDir,
         "gbuffer_lighting",
@@ -433,11 +610,15 @@ D3D12_RESOURCE_DESC GBufferResourceDesc(GBufferTarget target, int windowWidth, i
     // https://www.3dgep.com/forward-plus/#:~:text=G%2Dbuffer%20pass.-,Layout%20Summary,G%2Dbuffer%20layout%20looks%20similar%20to%20the%20table%20shown%20below.,-R
     switch (target)
     {
-    case GBufferTarget::Diffuse:
+    case GBuffer_Diffuse:
         desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         break;
-    case GBufferTarget::Normal:
+    case GBuffer_Normal:
         desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        break;
+    case GBuffer_Depth:
+        desc.Format = DXGI_FORMAT_D32_FLOAT;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
         break;
     };
 
@@ -449,12 +630,11 @@ void SetupGBuffer(App& app, bool isResize)
     if (!isResize) {
         // Create SRV heap for the render targets
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
-        heapDesc.NumDescriptors = (UINT)GBufferTarget::Count;
+        heapDesc.NumDescriptors = (UINT)GBuffer_Count + MaxLightCount + 1;
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        ASSERT_HRESULT(
-            app.device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&app.GBuffer.srvHeap))
-        );
+        app.lightingPassDescriptorArena.Initialize(app.device.Get(), heapDesc);
+        app.GBuffer.baseSrvReference = app.lightingPassDescriptorArena.AllocateDescriptors(GBuffer_Count);
     } else {
         // If we're resizing then we need to release existing gbuffer
         for (auto& renderTarget : app.GBuffer.renderTargets) {
@@ -464,8 +644,8 @@ void SetupGBuffer(App& app, bool isResize)
 
 
     CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(app.rtvHeap->GetCPUDescriptorHandleForHeapStart(), FrameBufferCount, app.rtvDescriptorSize);
-    CD3DX12_CPU_DESCRIPTOR_HANDLE srvHandle(app.GBuffer.srvHeap->GetCPUDescriptorHandleForHeapStart());
-    for (int i = 0; i < app.GBuffer.renderTargets.size(); i++) {
+    CD3DX12_CPU_DESCRIPTOR_HANDLE srvHandle = app.GBuffer.baseSrvReference.CPUHandle();
+    for (int i = 0; i < GBuffer_Depth; i++) {
         CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
         auto resourceDesc = GBufferResourceDesc(static_cast<GBufferTarget>(i), app.windowWidth, app.windowHeight);
         auto resourceState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
@@ -494,12 +674,74 @@ void SetupGBuffer(App& app, bool isResize)
         srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         srvDesc.Texture2D.MipLevels = 1;
 
-        app.device->CreateRenderTargetView(app.GBuffer.renderTargets[i].Get(), nullptr, rtvHandle);
         app.device->CreateShaderResourceView(app.GBuffer.renderTargets[i].Get(), &srvDesc, srvHandle);
+        app.device->CreateRenderTargetView(app.GBuffer.renderTargets[i].Get(), nullptr, rtvHandle);
 
         rtvHandle.Offset(1, app.rtvDescriptorSize);
         srvHandle.Offset(1, app.cbvSrvUavDescriptorSize);
     }
+
+    // Depth buffer is special and does not get a render target.
+    // We still need an SRV to sample in the deferred shader.
+    D3D12_SHADER_RESOURCE_VIEW_DESC depthSrvDesc = {};
+    depthSrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    depthSrvDesc.Format = DXGI_FORMAT_R32_FLOAT; // Can't use D32_FLOAT with SRVs...
+    depthSrvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    depthSrvDesc.Texture2D.MipLevels = 1;
+    app.device->CreateShaderResourceView(app.depthStencilBuffer.Get(), &depthSrvDesc, srvHandle);
+}
+
+void CreateConstantBufferAndViews(
+    App& app,
+    ComPtr<ID3D12Resource>& buffer,
+    size_t elementSize,
+    UINT count,
+    D3D12_CPU_DESCRIPTOR_HANDLE baseDescriptorHandle
+)
+{
+    const UINT constantBufferSize = (UINT)elementSize * count;
+    CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_UPLOAD);
+    auto resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(constantBufferSize);
+    ASSERT_HRESULT(
+        app.device->CreateCommittedResource(
+            &heapProps,
+            D3D12_HEAP_FLAG_NONE,
+            &resourceDesc,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            nullptr,
+            IID_PPV_ARGS(&buffer)
+        )
+    );
+
+    CD3DX12_CPU_DESCRIPTOR_HANDLE cpuHandle(baseDescriptorHandle);
+    for (int i = 0; i < count; i++) {
+        D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
+        cbvDesc.BufferLocation = buffer->GetGPUVirtualAddress() + (i * elementSize);
+        cbvDesc.SizeInBytes = elementSize;
+        app.device->CreateConstantBufferView(
+            &cbvDesc,
+            cpuHandle
+        );
+        cpuHandle.Offset(1, app.cbvSrvUavDescriptorSize);
+    }
+}
+
+void SetupLightBuffer(App& app)
+{
+    auto descriptorHandle = app.lightingPassDescriptorArena.AllocateDescriptors(MaxLightCount + 1);
+
+    CreateConstantBufferAndViews(
+        app,
+        app.LightBuffer.constantBuffer,
+        sizeof(LightConstantData),
+        MaxLightCount + 1,
+        descriptorHandle.CPUHandle()
+    );
+
+    app.LightBuffer.constantBuffer->Map(0, nullptr, (void**)&app.LightBuffer.passData);
+    // Lights are stored immediately after the pass data
+    app.LightBuffer.lights = reinterpret_cast<LightConstantData*>(app.LightBuffer.passData + 1);
+    app.LightBuffer.cbvHandle = descriptorHandle;
 }
 
 void SetupLightingPass(App& app)
@@ -511,11 +753,19 @@ void SetupLightingPass(App& app)
             featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_0;
         }
 
-        CD3DX12_DESCRIPTOR_RANGE1 ranges[1];
-        CD3DX12_ROOT_PARAMETER1 rootParameters[1];
+        CD3DX12_DESCRIPTOR_RANGE1 ranges[3];
+        CD3DX12_ROOT_PARAMETER1 rootParameters[3];
 
-        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE);
+        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, GBuffer_Count, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE);
+        ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 1, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE);
+        ranges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, -1, 2, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE);
+
+        // GBuffer
         rootParameters[0].InitAsDescriptorTable(1, &ranges[0], D3D12_SHADER_VISIBILITY_PIXEL);
+        // Light index
+        rootParameters[1].InitAsConstants(1, 0);
+        // Pass data & lights buffer
+        rootParameters[2].InitAsDescriptorTable(2, &ranges[1], D3D12_SHADER_VISIBILITY_PIXEL);
 
         D3D12_ROOT_SIGNATURE_FLAGS rootSignatureFlags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
 
@@ -545,14 +795,18 @@ void SetupLightingPass(App& app)
 
         ComPtr<ID3DBlob> signature;
         ComPtr<ID3DBlob> error;
-        ASSERT_HRESULT(
+        if (!SUCCEEDED(
             D3DX12SerializeVersionedRootSignature(
                 &rootSignatureDesc,
                 featureData.HighestVersion,
                 &signature,
                 &error
             )
-        );
+        )) {
+            std::cout << "Error: root signature compilation failed\n";
+            std::cout << (char*)error->GetBufferPointer();
+            abort();
+        }
         ASSERT_HRESULT(
             app.device->CreateRootSignature(
                 0,
@@ -563,11 +817,14 @@ void SetupLightingPass(App& app)
         );
     }
 
+    SetupLightBuffer(app);
+
     // GBuffer lighting does not need an input layout, as the vertices are created
     // entirely in the vertex buffer without any input vertices.
     std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout;
 
     app.lightingPSO = CreateGBufferLightingPSO(
+        app.psoManager,
         app.device.Get(),
         app.dataDir,
         app.lightingRootSignature.Get(),
@@ -654,7 +911,7 @@ void InitD3D(App& app)
 
     {
         D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc = {};
-        rtvHeapDesc.NumDescriptors = FrameBufferCount + (int)GBufferTarget::Count;
+        rtvHeapDesc.NumDescriptors = FrameBufferCount + GBuffer_RTVCount;
         rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
         rtvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
         ASSERT_HRESULT(
@@ -857,31 +1114,39 @@ void CreateDescriptorsForModel(
     // Create per-primitive constant buffer
     ComPtr<ID3D12Resource> perPrimitiveConstantBuffer;
     {
-        const UINT constantBufferSize = (UINT)sizeof(PerPrimitiveConstantData) * (UINT)inputModel.meshes.size();
-        CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_UPLOAD);
-        auto resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(constantBufferSize);
-        ASSERT_HRESULT(
-            app.device->CreateCommittedResource(
-                &heapProps,
-                D3D12_HEAP_FLAG_NONE,
-                &resourceDesc,
-                D3D12_RESOURCE_STATE_GENERIC_READ,
-                nullptr,
-                IID_PPV_ARGS(&perPrimitiveConstantBuffer)
-            )
-        );
-
         CD3DX12_CPU_DESCRIPTOR_HANDLE cpuHandle(mainDescriptorHeap->GetCPUDescriptorHandleForHeapStart(), 0, incrementSize);
-        for (int i = 0; i < inputModel.meshes.size(); i++) {
-            D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
-            cbvDesc.BufferLocation = perPrimitiveConstantBuffer->GetGPUVirtualAddress() + (i * sizeof(PerPrimitiveConstantData));
-            cbvDesc.SizeInBytes = sizeof(PerPrimitiveConstantData);
-            app.device->CreateConstantBufferView(
-                &cbvDesc,
-                cpuHandle
-            );
-            cpuHandle.Offset(1, incrementSize);
-        }
+        CreateConstantBufferAndViews(
+            app,
+            perPrimitiveConstantBuffer,
+            sizeof(PerPrimitiveConstantData),
+            inputModel.meshes.size(),
+            cpuHandle
+        );
+        // const UINT constantBufferSize = (UINT)sizeof(PerPrimitiveConstantData) * (UINT)inputModel.meshes.size();
+        // CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_UPLOAD);
+        // auto resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(constantBufferSize);
+        // ASSERT_HRESULT(
+        //     app.device->CreateCommittedResource(
+        //         &heapProps,
+        //         D3D12_HEAP_FLAG_NONE,
+        //         &resourceDesc,
+        //         D3D12_RESOURCE_STATE_GENERIC_READ,
+        //         nullptr,
+        //         IID_PPV_ARGS(&perPrimitiveConstantBuffer)
+        //     )
+        // );
+
+        // CD3DX12_CPU_DESCRIPTOR_HANDLE cpuHandle(mainDescriptorHeap->GetCPUDescriptorHandleForHeapStart(), 0, incrementSize);
+        // for (int i = 0; i < inputModel.meshes.size(); i++) {
+        //     D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
+        //     cbvDesc.BufferLocation = perPrimitiveConstantBuffer->GetGPUVirtualAddress() + (i * sizeof(PerPrimitiveConstantData));
+        //     cbvDesc.SizeInBytes = sizeof(PerPrimitiveConstantData);
+        //     app.device->CreateConstantBufferView(
+        //         &cbvDesc,
+        //         cpuHandle
+        //     );
+        //     cpuHandle.Offset(1, incrementSize);
+        // }
     }
 
     // Create SRVs
@@ -1310,6 +1575,7 @@ void FinalizeModel(
     for (auto& mesh : outputModel.meshes) {
         for (auto& primitive : mesh.primitives) {
             primitive.PSO = CreateMeshGBufferPSO(
+                app.psoManager,
                 app.device.Get(),
                 app.dataDir,
                 app.rootSignature.Get(),
@@ -1336,6 +1602,8 @@ bool ValidateGLTFModel(const tinygltf::Model& model)
             }
         }
     }
+
+    return true;
 }
 
 void ProcessAssets(App& app, const AppAssets& assets)
@@ -1496,10 +1764,30 @@ void LoadScene(App& app, const AppAssets& assets)
     ProcessAssets(app, assets);
 }
 
-void InitializeScene(App& app) {
+void InitializeCamera(App& app)
+{
     app.camera.translation = glm::vec3(0.0f, 0.5f, 3.0f);
     app.camera.pitch = 0.0f;
     app.camera.yaw = glm::pi<float>();
+}
+
+void InitializeLights(App& app)
+{
+    app.LightBuffer.numLights = 1;
+    for (int i = 0; i < MaxLightCount; i++) {
+        float angle = i * glm::two_pi<float>() / 4;
+        float x = cos(angle);
+        float z = sin(angle);
+        app.LightBuffer.lights[i].color = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f);
+        app.LightBuffer.lights[i].intensity = 1.5f;
+        app.LightBuffer.lights[i].position = glm::vec4(x, 2.0f, z, 1.0f);
+        app.LightBuffer.lights[i].range = 5.0f;
+    }
+}
+
+void InitializeScene(App& app) {
+    InitializeCamera(app);
+    InitializeLights(app);
 }
 
 void UpdatePerPrimitiveConstantBuffers(Model& model, const glm::mat4& projection, const glm::mat4& view)
@@ -1518,6 +1806,15 @@ void UpdatePerPrimitiveConstantBuffers(Model& model, const glm::mat4& projection
             perPrimitiveBuffer->normalTextureIdx = primitive.TextureIndices.normal;
             perPrimitiveBuffer++;
         }
+    }
+}
+
+void UpdateLightConstantBuffers(App& app, const glm::mat4& projection, const glm::mat4& view) {
+    app.LightBuffer.passData->inverseProjectionMatrix = glm::inverse(projection);
+    for (int i = 0; i < app.LightBuffer.numLights; i++) {
+        auto& lightData = app.LightBuffer.lights[i];
+        lightData.positionViewSpace = view * lightData.position;
+        lightData.directionViewSpace = view * lightData.direction;
     }
 }
 
@@ -1583,6 +1880,8 @@ void UpdateScene(App& app)
     glm::mat4 projection = glm::perspective(glm::pi<float>() * 0.2f, (float)app.windowWidth / (float)app.windowHeight, 0.1f, 1000.0f);
     glm::mat4 view = UpdateFlyCamera(app, deltaSeconds);
 
+    UpdateLightConstantBuffers(app, projection, view);
+
     for (auto& model : app.models) {
         UpdatePerPrimitiveConstantBuffers(model, projection, view);
     }
@@ -1604,7 +1903,7 @@ void DrawModelCommandList(const Model& model, ID3D12GraphicsCommandList* command
             // Set the per-primitive constant buffer
             commandList->SetGraphicsRootDescriptorTable(0, constantBufferHandle);
             commandList->IASetPrimitiveTopology(primitive.primitiveTopology);
-            commandList->SetPipelineState(primitive.PSO.Get());
+            commandList->SetPipelineState(primitive.PSO->Get());
             commandList->IASetVertexBuffers(0, (UINT)primitive.vertexBufferViews.size(), primitive.vertexBufferViews.data());
             commandList->IASetIndexBuffer(&primitive.indexBufferView);
             commandList->DrawIndexedInstanced(primitive.indexCount, 1, 0, 0, 0);
@@ -1613,14 +1912,8 @@ void DrawModelCommandList(const Model& model, ID3D12GraphicsCommandList* command
     }
 }
 
-void DrawFullscreenQuad(const App& app, ID3D12GraphicsCommandList* commandList, ID3D12PipelineState* PSO)
+void DrawFullscreenQuad(const App& app, ID3D12GraphicsCommandList* commandList)
 {
-    ID3D12DescriptorHeap* srvHeap = app.GBuffer.srvHeap.Get();
-    ID3D12DescriptorHeap* ppHeaps[] = { srvHeap };
-    commandList->SetDescriptorHeaps(1, ppHeaps);
-    commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-    commandList->SetGraphicsRootDescriptorTable(0, app.GBuffer.srvHeap->GetGPUDescriptorHandleForHeapStart());
-    commandList->SetPipelineState(PSO);
     commandList->IASetVertexBuffers(0, 0, nullptr);
     commandList->DrawInstanced(4, 1, 0, 0);
 }
@@ -1628,19 +1921,25 @@ void DrawFullscreenQuad(const App& app, ID3D12GraphicsCommandList* commandList, 
 void GBufferPass(const App& app, ID3D12GraphicsCommandList* commandList)
 {
     // Transition our GBuffers into being render targets.
-    std::array<D3D12_RESOURCE_BARRIER, (size_t)GBufferTarget::Count> barriers;
-    for (int i = 0; i < (int)GBufferTarget::Count; i++) {
+    std::array<D3D12_RESOURCE_BARRIER, GBuffer_Count> barriers;
+    for (int i = 0; i < GBuffer_RTVCount; i++) {
         barriers[i] = CD3DX12_RESOURCE_BARRIER::Transition(app.GBuffer.renderTargets[i].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
     }
+    // Depth buffer is special
+    barriers[GBuffer_Depth] = CD3DX12_RESOURCE_BARRIER::Transition(app.depthStencilBuffer.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     commandList->ResourceBarrier((UINT)barriers.size(), barriers.data());
 
-    CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(app.rtvHeap->GetCPUDescriptorHandleForHeapStart(), FrameBufferCount, app.rtvDescriptorSize);
+    CD3DX12_CPU_DESCRIPTOR_HANDLE baseRtvHandle(app.rtvHeap->GetCPUDescriptorHandleForHeapStart(), FrameBufferCount, app.rtvDescriptorSize);
+    CD3DX12_CPU_DESCRIPTOR_HANDLE endGBufferHandle(app.rtvHeap->GetCPUDescriptorHandleForHeapStart(), FrameBufferCount + GBuffer_RTVCount, app.rtvDescriptorSize);
     CD3DX12_CPU_DESCRIPTOR_HANDLE dsvHandle(app.dsHeap->GetCPUDescriptorHandleForHeapStart());
-    commandList->OMSetRenderTargets((UINT)GBufferTarget::Count, &rtvHandle, TRUE, &dsvHandle);
+    commandList->OMSetRenderTargets(GBuffer_RTVCount, &baseRtvHandle, TRUE, &dsvHandle);
 
     // Record commands.
     const float clearColor[] = { 0.0f, 0.0f, 0.0f, 1.0f };
-    commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
+    // Clear render targets
+    for (auto handle = baseRtvHandle; handle != endGBufferHandle; handle.Offset(1, app.rtvDescriptorSize)) {
+        commandList->ClearRenderTargetView(handle, clearColor, 0, nullptr);
+    }
     commandList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 
     for (const auto& model : app.models) {
@@ -1648,9 +1947,11 @@ void GBufferPass(const App& app, ID3D12GraphicsCommandList* commandList)
     }
 
     // Transition them back to being shader resource views so that they can be used in the lighting shaders.
-    for (int i = 0; i < (int)GBufferTarget::Count; i++) {
+    for (int i = 0; i < GBuffer_RTVCount; i++) {
         barriers[i] = CD3DX12_RESOURCE_BARRIER::Transition(app.GBuffer.renderTargets[i].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     }
+    // Depth buffer is special
+    barriers[GBuffer_Depth] = CD3DX12_RESOURCE_BARRIER::Transition(app.depthStencilBuffer.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     commandList->ResourceBarrier((UINT)barriers.size(), barriers.data());
 }
 
@@ -1664,12 +1965,24 @@ void FinalPass(const App& app, ID3D12GraphicsCommandList* commandList)
     commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
 
     // Record commands.
-    const float clearColor[] = { 0.0f, 0.2f, 0.4f, 1.0f };
+    const float clearColor[] = { 0.0f, 0.0f, 0.0f, 1.0f };
     commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
 
     commandList->SetGraphicsRootSignature(app.lightingRootSignature.Get());
 
-    DrawFullscreenQuad(app, commandList, app.lightingPSO.Get());
+    {
+        auto descriptorHeap = app.lightingPassDescriptorArena.descriptorHeap;
+        ID3D12DescriptorHeap* ppHeaps[] = { descriptorHeap.Get() };
+        commandList->SetDescriptorHeaps(_countof(ppHeaps), ppHeaps);
+        commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        commandList->SetGraphicsRootDescriptorTable(0, app.GBuffer.baseSrvReference.GPUHandle());
+        commandList->SetGraphicsRootDescriptorTable(2, app.LightBuffer.cbvHandle.GPUHandle());
+        commandList->SetPipelineState(app.lightingPSO->Get());
+        for (int i = 0; i < app.LightBuffer.numLights; i++) {
+            commandList->SetGraphicsRoot32BitConstant(1, i, 0);
+            DrawFullscreenQuad(app, commandList);
+        }
+    }
 
     ID3D12DescriptorHeap* ppHeaps[] = { app.ImGui.srvHeap.Get() };
     commandList->SetDescriptorHeaps(1, ppHeaps);
@@ -1778,11 +2091,83 @@ void CleanImGui()
     ImGui::DestroyContext();
 }
 
+void DrawToolsWindow(App& app)
+{
+    static bool toolsOpen = true;
+    if (ImGui::Begin("Tools", &toolsOpen)) {
+        if (ImGui::Button("Reset Camera")) {
+            InitializeCamera(app);
+        }
+
+        if (ImGui::Button("Reload Shaders")) {
+            app.psoManager.reload(app.device.Get());
+        }
+
+        if (ImGui::Checkbox("Shader Debug Flag", (bool*)&app.LightBuffer.passData->debug)) {
+
+        }
+
+        ImGui::End();
+    }
+}
+
+void DrawLightsEditor(App& app)
+{
+    static bool lightsOpen = true;
+    static int selectedLightIdx = 0;
+
+    char labels[MaxLightCount][20];
+    for (int i = 0; i < MaxLightCount; i++) {
+        std::string label = "Light #" + std::to_string(i);
+        strcpy_s(labels[i], label.c_str());
+    }
+
+    if (ImGui::Begin("Lights", &lightsOpen)) {
+        ImGui::BeginGroup();
+        if (ImGui::Button("New light")) {
+            app.LightBuffer.numLights = glm::min(app.LightBuffer.numLights + 1, MaxLightCount);
+        }
+        if (ImGui::Button("Remove light")) {
+            app.LightBuffer.numLights = glm::max(app.LightBuffer.numLights - 1, 0);
+        }
+        ImGui::EndGroup();
+
+        // const char* const* pLabels = (const char* const*)labels;
+        if (ImGui::BeginListBox("Lights")) {
+            for (int i = 0; i < app.LightBuffer.numLights; i++) {
+                std::string label = "Light #" + std::to_string(i);
+                if (ImGui::Selectable(label.c_str(), i == selectedLightIdx))
+                {
+                    selectedLightIdx = i;
+                    break;
+                }
+            }
+            ImGui::EndListBox();
+        }
+
+        ImGui::Separator();
+        if (selectedLightIdx != -1) {
+            auto& light = app.LightBuffer.lights[selectedLightIdx];
+            ImGui::ColorEdit3("Color", (float*)&light.color);
+            ImGui::DragFloat3("Position", (float*)&light.position);
+            ImGui::DragFloat("Range", &light.range, 0.1f, 0.0f, 1000.0f, nullptr, 1.0f);
+            ImGui::DragFloat("Intensity", &light.intensity, 0.05f, 0.0f, 100.0f, nullptr, 1.0f);
+        } else {
+            ImGui::Text("No light selected");
+        }
+
+        ImGui::End();
+    }
+}
+
 void BeginGUI(App& app)
 {
     ImGui_ImplDX12_NewFrame();
     ImGui_ImplSDL2_NewFrame();
     ImGui::NewFrame();
+
+    DrawToolsWindow(app);
+    DrawLightsEditor(app);
 }
 
 int RunApp(int argc, char** argv)
@@ -1794,12 +2179,12 @@ int RunApp(int argc, char** argv)
     InitD3D(app);
     InitImGui(app);
 
-    InitializeScene(app);
-
     {
         AppAssets assets = LoadAssets(app);
         LoadScene(app, assets);
     }
+
+    InitializeScene(app);
 
     SDL_Event e;
 
@@ -1830,6 +2215,10 @@ int RunApp(int argc, char** argv)
                 app.mouseState.yrel = e.motion.yrel;
             } else if (e.type == SDL_MOUSEWHEEL) {
                 app.mouseState.scrollDelta = e.wheel.preciseY;
+            } else if (e.type == SDL_KEYUP) {
+                if (e.key.keysym.sym == SDLK_F5) {
+                    app.psoManager.reload(app.device.Get());
+                }
             }
         }
 
@@ -1846,7 +2235,7 @@ int RunApp(int argc, char** argv)
                 SDL_SetRelativeMouseMode(SDL_FALSE);
                 SDL_SetWindowGrab(app.window, SDL_FALSE);
             }
-    }
+        }
 
         BeginGUI(app);
         UpdateScene(app);
@@ -1855,7 +2244,7 @@ int RunApp(int argc, char** argv)
         RenderFrame(app);
 
         app.lastFrameTick = frameTick;
-}
+    }
 
     WaitForPreviousFrame(app);
 
@@ -1863,7 +2252,7 @@ int RunApp(int argc, char** argv)
     SDL_DestroyWindow(app.window);
 
     return 0;
-    }
+}
 
 int RunMDXR(int argc, char** argv)
 {
