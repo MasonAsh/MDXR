@@ -370,7 +370,7 @@ struct App {
 
     struct {
         ComPtr<ID3D12DescriptorHeap> srvHeap;
-        bool aboutWindowOpen = true;
+        bool lightsOpen = true;
     } ImGui;
 
     struct {
@@ -2047,7 +2047,7 @@ void UpdateScene(App& app)
     long long deltaTicks = currentTick - app.lastFrameTick;
     float deltaSeconds = (float)deltaTicks / (float)1e9;
 
-    glm::mat4 projection = glm::perspective(glm::pi<float>() * 0.2f, (float)app.windowWidth / (float)app.windowHeight, 0.1f, 1000.0f);
+    glm::mat4 projection = glm::perspective(glm::pi<float>() * 0.2f, (float)app.windowWidth / (float)app.windowHeight, 0.1f, 4000.0f);
     glm::mat4 view = UpdateFlyCamera(app, deltaSeconds);
 
     UpdateLightConstantBuffers(app, projection, view);
@@ -2059,11 +2059,6 @@ void UpdateScene(App& app)
 
 void DrawModelCommandList(const Model& model, ID3D12GraphicsCommandList* commandList, int cbvOffsetIncrement)
 {
-    // Set the texture array. Textures are dynamically indexed from the constant buffer.
-    // {
-    //     CD3DX12_GPU_DESCRIPTOR_HANDLE texturesHandle(model.mainDescriptorHeap->GetGPUDescriptorHandleForHeapStart(), model.baseTextureDescriptorIdx, cbvOffsetIncrement);
-    //     commandList->SetGraphicsRootDescriptorTable(1, texturesHandle);
-    // }
     int constantBufferIdx = model.primitiveDataDescriptors.index;
     for (const auto& mesh : model.meshes) {
         for (const auto& primitive : mesh.primitives) {
@@ -2109,17 +2104,6 @@ void BindAndClearGBufferRTVs(const App& app, ID3D12GraphicsCommandList* commandL
 
 }
 
-// Draws all unlit meshes directly to the backbuffer.
-// void UnlitPass(const App& app, ID3D12GraphicsCommandList* commandList)
-// {
-//     auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(app.renderTargets[app.frameIdx].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
-//     commandList->ResourceBarrier(1, &barrier);
-
-//     for (const auto& model : app.models) {
-//         DrawModelCommandList(model, commandList, app.cbvSrvUavDescriptorSize);
-//     }
-// }
-
 void TransitionRTVsForRendering(const App& app, ID3D12GraphicsCommandList* commandList)
 {
     // Transition our GBuffers into being render targets.
@@ -2161,14 +2145,13 @@ void GBufferPass(const App& app, ID3D12GraphicsCommandList* commandList)
     for (const auto& model : app.models) {
         DrawModelCommandList(model, commandList, app.cbvSrvUavDescriptorSize);
     }
-
-    TransitionGBufferForLighting(app, commandList);
 }
 
 void FinalPass(const App& app, ID3D12GraphicsCommandList* commandList)
 {
-    CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(app.rtvHeap->GetCPUDescriptorHandleForHeapStart(), app.frameIdx, app.rtvDescriptorSize);
+    TransitionGBufferForLighting(app, commandList);
 
+    CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(app.rtvHeap->GetCPUDescriptorHandleForHeapStart(), app.frameIdx, app.rtvDescriptorSize);
     commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
 
     {
@@ -2304,29 +2287,8 @@ void CleanImGui()
     ImGui::DestroyContext();
 }
 
-void DrawToolsWindow(App& app)
-{
-    static bool toolsOpen = true;
-    if (ImGui::Begin("Tools", &toolsOpen)) {
-        if (ImGui::Button("Reset Camera")) {
-            InitializeCamera(app);
-        }
-
-        if (ImGui::Button("Reload Shaders")) {
-            app.psoManager.reload(app.device.Get());
-        }
-
-        if (ImGui::Checkbox("Shader Debug Flag", (bool*)&app.LightBuffer.passData->debug)) {
-
-        }
-
-        ImGui::End();
-    }
-}
-
 void DrawLightsEditor(App& app)
 {
-    static bool lightsOpen = true;
     static int selectedLightIdx = 0;
 
     char labels[MaxLightCount][20];
@@ -2335,15 +2297,14 @@ void DrawLightsEditor(App& app)
         strcpy_s(labels[i], label.c_str());
     }
 
-    if (ImGui::Begin("Lights", &lightsOpen)) {
-        ImGui::BeginGroup();
+    if (app.ImGui.lightsOpen && ImGui::Begin("Lights", &app.ImGui.lightsOpen, 0)) {
         if (ImGui::Button("New light")) {
             app.LightBuffer.count = glm::min(app.LightBuffer.count + 1, MaxLightCount);
         }
+        ImGui::SameLine();
         if (ImGui::Button("Remove light")) {
             app.LightBuffer.count = glm::max(app.LightBuffer.count - 1, 0);
         }
-        ImGui::EndGroup();
 
         // const char* const* pLabels = (const char* const*)labels;
         if (ImGui::BeginListBox("Lights")) {
@@ -2373,14 +2334,37 @@ void DrawLightsEditor(App& app)
     }
 }
 
+void DrawMenuBar(App& app)
+{
+    if (ImGui::BeginMainMenuBar())
+    {
+        if (ImGui::BeginMenu("Tools")) {
+            if (ImGui::MenuItem("Reload Shaders")) {
+                app.psoManager.reload(app.device.Get());
+            }
+            if (ImGui::MenuItem("Reset Camera")) {
+                InitializeCamera(app);
+            }
+            if (ImGui::Checkbox("Shader Debug Flag", (bool*)&app.LightBuffer.passData->debug)) {}
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Windows"))
+        {
+            ImGui::Checkbox("Lights", &app.ImGui.lightsOpen);
+            ImGui::EndMenu();
+        }
+        ImGui::EndMainMenuBar();
+    }
+}
+
 void BeginGUI(App& app)
 {
     ImGui_ImplDX12_NewFrame();
     ImGui_ImplSDL2_NewFrame();
     ImGui::NewFrame();
 
-    DrawToolsWindow(app);
     DrawLightsEditor(app);
+    DrawMenuBar(app);
 }
 
 int RunApp(int argc, char** argv)
@@ -2482,4 +2466,4 @@ int RunMDXR(int argc, char** argv)
 #endif
 
     return status;
-}
+    }
