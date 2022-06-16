@@ -54,3 +54,10 @@ target_compile_definitions(mdxr
 )
 
 target_link_libraries(mdxr ${SDL2_LIBRARY} ${SDL2MAIN_LIBRARY} DirectX-Headers DirectX-Guids D3d12 DXGI D3DCompiler DXGuid)
+
+# file(COPY ${CMAKE_SOURCE_DIR}/D3D12 DESTINATION ${TARGET_FILE_DIR})
+
+add_custom_command(TARGET mdxr POST_BUILD 
+               COMMAND ${CMAKE_COMMAND} -E copy_directory
+               "${CMAKE_SOURCE_DIR}/D3D12"              
+                $<TARGET_FILE_DIR:mdxr>/D3D12)

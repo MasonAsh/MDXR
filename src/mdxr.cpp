@@ -23,15 +23,24 @@ using namespace std::chrono;
 
 const int FrameBufferCount = 2;
 const int MaxLightCount = 10;
+const int MaxMaterialCount = 64;
+const int MaxDescriptors = 2048;
 const DXGI_FORMAT DepthFormat = DXGI_FORMAT_D32_FLOAT;
+
+enum ConstantIndex {
+    ConstantIndex_PrimitiveData,
+    ConstantIndex_MaterialData,
+    ConstantIndex_Light,
+    ConstantIndex_LightPassData,
+
+    ConstantIndex_Count
+};
 
 struct PerPrimitiveConstantData {
     // MVP & MV are PerMesh, but most meshes only have one primitive.
     glm::mat4 MVP;
     glm::mat4 MV;
-    UINT diffuseTextureIdx;
-    UINT normalTextureIdx;
-    float padding[30];
+    float padding[32];
 };
 static_assert((sizeof(PerPrimitiveConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
 
@@ -86,6 +95,51 @@ struct PSOManager {
     }
 };
 
+enum MaterialType {
+    MaterialType_Unlit,
+    MaterialType_PBR,
+};
+
+struct MaterialConstantData {
+    UINT diffuseTextureIdx;
+    UINT normalTextureIdx;
+
+    glm::vec3 ambientFactor;
+
+    UINT materialType;
+
+    float padding[58];
+};
+static_assert((sizeof(MaterialConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
+
+struct DescriptorReference {
+    ID3D12DescriptorHeap* heap;
+    int incrementSize;
+    int index;
+
+    DescriptorReference()
+        : heap(nullptr)
+        , incrementSize(0)
+        , index(-1)
+    {
+    }
+
+    DescriptorReference(ID3D12DescriptorHeap* heap, int index, int incrementSize)
+        : heap(heap)
+        , index(index)
+        , incrementSize(incrementSize)
+    {
+    }
+
+    CD3DX12_CPU_DESCRIPTOR_HANDLE CPUHandle() const {
+        return CD3DX12_CPU_DESCRIPTOR_HANDLE(heap->GetCPUDescriptorHandleForHeapStart(), index, incrementSize);
+    }
+
+    CD3DX12_GPU_DESCRIPTOR_HANDLE GPUHandle() const {
+        return CD3DX12_GPU_DESCRIPTOR_HANDLE(heap->GetGPUDescriptorHandleForHeapStart(), index, incrementSize);
+    }
+};
+
 struct Primitive {
     std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout;
     std::vector<D3D12_VERTEX_BUFFER_VIEW> vertexBufferViews;
@@ -95,10 +149,7 @@ struct Primitive {
     UINT indexCount;
     PerPrimitiveConstantData constantData;
 
-    struct {
-        UINT diffuse;
-        UINT normal;
-    } TextureIndices;
+    UINT materialIndex;
 };
 
 struct Mesh {
@@ -111,9 +162,8 @@ struct Model {
     std::vector<ComPtr<ID3D12Resource>> buffers;
     std::vector<Mesh> meshes;
 
-    ComPtr<ID3D12DescriptorHeap> mainDescriptorHeap;
-
-    UINT baseTextureDescriptorIdx;
+    DescriptorReference primitiveDataDescriptors;
+    DescriptorReference baseTextureDescriptor;
 
     // All of the child mesh constant buffers stored in this constant buffer
     ComPtr<ID3D12Resource> perPrimitiveConstantBuffer;
@@ -121,32 +171,7 @@ struct Model {
 };
 
 struct AppAssets {
-    tinygltf::Model models[3];
-};
-
-struct DescriptorReference {
-    ID3D12DescriptorHeap* heap;
-    int descriptorOffset;
-
-    DescriptorReference()
-        : heap(nullptr)
-        , descriptorOffset(0)
-    {
-    }
-
-    DescriptorReference(ID3D12DescriptorHeap* heap, int descriptorOffset)
-        : heap(heap)
-        , descriptorOffset(descriptorOffset)
-    {
-    }
-
-    CD3DX12_CPU_DESCRIPTOR_HANDLE CPUHandle() const {
-        return CD3DX12_CPU_DESCRIPTOR_HANDLE(heap->GetCPUDescriptorHandleForHeapStart(), descriptorOffset);
-    }
-
-    CD3DX12_GPU_DESCRIPTOR_HANDLE GPUHandle() const {
-        return CD3DX12_GPU_DESCRIPTOR_HANDLE(heap->GetGPUDescriptorHandleForHeapStart(), descriptorOffset);
-    }
+    tinygltf::Model models[4];
 };
 
 // Fixed capacity descriptor heap. Aborts when the size outgrows initial capacity.
@@ -155,9 +180,11 @@ struct DescriptorArena {
     size_t capacity;
     size_t size;
     UINT descriptorIncrementSize;
+    std::string debugName;
 
-    void Initialize(ID3D12Device* device, D3D12_DESCRIPTOR_HEAP_DESC heapDesc)
+    void Initialize(ID3D12Device* device, D3D12_DESCRIPTOR_HEAP_DESC heapDesc, const std::string& debugName)
     {
+        this->debugName = debugName;
         descriptorIncrementSize = device->GetDescriptorHandleIncrementSize(heapDesc.Type);
         ASSERT_HRESULT(
             device->CreateDescriptorHeap(
@@ -169,8 +196,14 @@ struct DescriptorArena {
         size = 0;
     }
 
-    DescriptorReference AllocateDescriptors(UINT count) {
-        DescriptorReference reference(descriptorHeap.Get(), descriptorIncrementSize * size);
+    DescriptorReference AllocateDescriptors(UINT count, const char* debugName) {
+        if (debugName != nullptr) {
+            std::cout << this->debugName << " allocation info: " <<
+                "\n\tIndex: " << this->size <<
+                "\n\tCount: " << count <<
+                "\n\tReason: " << debugName << "\n";
+        }
+        DescriptorReference reference(descriptorHeap.Get(), size, descriptorIncrementSize);
         size += count;
         if (size > capacity) {
             std::cout << "Error: descriptor heap is not large enough\n";
@@ -259,8 +292,9 @@ const int GBuffer_RTVCount = GBuffer_Depth;
 
 struct LightPassConstantData {
     glm::mat4 inverseProjectionMatrix;
+    UINT baseGBufferIndex;
     UINT debug;
-    float pad[47];
+    float pad[46];
 };
 static_assert((sizeof(LightPassConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
 
@@ -287,6 +321,7 @@ struct App {
     SDL_Window* window;
     HWND hwnd;
 
+    bool running;
     long long startTick;
     long long lastFrameTick;
 
@@ -338,17 +373,29 @@ struct App {
         bool aboutWindowOpen = true;
     } ImGui;
 
+    struct {
+        DescriptorArena descriptorHeap;
+    } GBufferPass;
+
+    struct {
+        ComPtr<ID3D12Resource> constantBuffer;
+        MaterialConstantData* materials;
+        int count;
+        DescriptorReference descriptorReference;
+    } MaterialBuffer;
+
     DescriptorArena lightingPassDescriptorArena;
     struct {
         std::array<ComPtr<ID3D12Resource>, GBuffer_Count - 1> renderTargets;
         DescriptorReference baseSrvReference;
     } GBuffer;
 
-    ManagedPSORef lightingPSO;
-    ComPtr<ID3D12RootSignature> lightingRootSignature;
+    struct {
+        ManagedPSORef PSO;
+        ComPtr<ID3D12RootSignature> rootSignature;
+    } LightPass;
 
     struct {
-        ComPtr<ID3D12DescriptorHeap> descriptorHeap;
         ComPtr<ID3D12Resource> constantBuffer;
 
         // These two are stored in the same constant buffer.
@@ -358,7 +405,7 @@ struct App {
 
         DescriptorReference cbvHandle;
 
-        int numLights;
+        int count;
     } LightBuffer;
 
     PSOManager psoManager;
@@ -530,7 +577,7 @@ ManagedPSORef CreateDiffuseMeshPSO(
 
 D3D12_RESOURCE_DESC GBufferResourceDesc(GBufferTarget target, int windowWidth, int windowHeight);
 
-ManagedPSORef CreateMeshGBufferPSO(
+ManagedPSORef CreateMeshPBRPSO(
     PSOManager& manager,
     ID3D12Device* device,
     const std::string& dataDir,
@@ -539,15 +586,39 @@ ManagedPSORef CreateMeshGBufferPSO(
 )
 {
     auto psoDesc = DefaultPSODesc();
-    psoDesc.NumRenderTargets = GBuffer_Count;
-    for (int i = 0; i < GBuffer_Count; i++) {
+    psoDesc.NumRenderTargets = GBuffer_RTVCount + 1;
+    for (int i = 1; i < psoDesc.NumRenderTargets; i++) {
         psoDesc.RTVFormats[i] = GBufferResourceDesc((GBufferTarget)i, 0, 0).Format;
     }
     return CreatePSO(
         manager,
         device,
         dataDir,
-        "mesh_gbuffer",
+        "mesh_gbuffer_pbr",
+        rootSignature,
+        inputLayout,
+        psoDesc
+    );
+}
+
+ManagedPSORef CreateMeshUnlitPSO(
+    PSOManager& manager,
+    ID3D12Device* device,
+    const std::string& dataDir,
+    ID3D12RootSignature* rootSignature,
+    const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
+)
+{
+    auto psoDesc = DefaultPSODesc();
+    psoDesc.NumRenderTargets = GBuffer_RTVCount + 1;
+    for (int i = 1; i < psoDesc.NumRenderTargets; i++) {
+        psoDesc.RTVFormats[i] = GBufferResourceDesc((GBufferTarget)i, 0, 0).Format;
+    }
+    return CreatePSO(
+        manager,
+        device,
+        dataDir,
+        "mesh_gbuffer_unlit",
         rootSignature,
         inputLayout,
         psoDesc
@@ -633,8 +704,8 @@ void SetupGBuffer(App& app, bool isResize)
         heapDesc.NumDescriptors = (UINT)GBuffer_Count + MaxLightCount + 1;
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        app.lightingPassDescriptorArena.Initialize(app.device.Get(), heapDesc);
-        app.GBuffer.baseSrvReference = app.lightingPassDescriptorArena.AllocateDescriptors(GBuffer_Count);
+        app.lightingPassDescriptorArena.Initialize(app.device.Get(), heapDesc, "LightPassArena");
+        app.GBuffer.baseSrvReference = app.lightingPassDescriptorArena.AllocateDescriptors(GBuffer_Count, "GBuffer SRVs");
     } else {
         // If we're resizing then we need to release existing gbuffer
         for (auto& renderTarget : app.GBuffer.renderTargets) {
@@ -726,9 +797,77 @@ void CreateConstantBufferAndViews(
     }
 }
 
+void CreateMainRootSignature(App& app)
+{
+    ID3D12Device* device = app.device.Get();
+    D3D12_FEATURE_DATA_ROOT_SIGNATURE featureData = {};
+    featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &featureData, sizeof(featureData))))
+    {
+        featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_0;
+    }
+
+    CD3DX12_ROOT_PARAMETER1 rootParameters[1];
+
+    rootParameters->InitAsConstants(ConstantIndex_Count, 0);
+
+    D3D12_ROOT_SIGNATURE_FLAGS rootSignatureFlags =
+        D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
+        D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
+
+    // FIXME: This is going to have to be dynamic...
+    D3D12_STATIC_SAMPLER_DESC sampler = {};
+    sampler.Filter = D3D12_FILTER_ANISOTROPIC;
+    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    sampler.MipLODBias = 0;
+    sampler.MaxAnisotropy = 4;
+    sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+    sampler.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+    sampler.MinLOD = 0.0f;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    sampler.ShaderRegister = 0;
+    sampler.RegisterSpace = 0;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rootSignatureDesc;
+    rootSignatureDesc.Init_1_1(
+        _countof(rootParameters),
+        rootParameters,
+        1,
+        &sampler,
+        rootSignatureFlags
+    );
+
+    ComPtr<ID3DBlob> signature;
+    ComPtr<ID3DBlob> error;
+    if (!SUCCEEDED(
+        D3DX12SerializeVersionedRootSignature(
+            &rootSignatureDesc,
+            featureData.HighestVersion,
+            &signature,
+            &error
+        )
+    )) {
+        std::cout << "Error: root signature compilation failed\n";
+        std::cout << (char*)error->GetBufferPointer();
+        abort();
+    }
+
+    ASSERT_HRESULT(
+        device->CreateRootSignature(
+            0,
+            signature->GetBufferPointer(),
+            signature->GetBufferSize(),
+            IID_PPV_ARGS(&app.rootSignature)
+        )
+    );
+}
+
 void SetupLightBuffer(App& app)
 {
-    auto descriptorHandle = app.lightingPassDescriptorArena.AllocateDescriptors(MaxLightCount + 1);
+    auto descriptorHandle = app.lightingPassDescriptorArena.AllocateDescriptors(MaxLightCount + 1, "light pass and light buffer");
 
     CreateConstantBufferAndViews(
         app,
@@ -742,80 +881,110 @@ void SetupLightBuffer(App& app)
     // Lights are stored immediately after the pass data
     app.LightBuffer.lights = reinterpret_cast<LightConstantData*>(app.LightBuffer.passData + 1);
     app.LightBuffer.cbvHandle = descriptorHandle;
+
+    app.LightBuffer.passData->baseGBufferIndex = app.GBuffer.baseSrvReference.index;
+}
+
+void SetupMaterialBuffer(App& app)
+{
+    auto& materialBuffer = app.MaterialBuffer;
+    materialBuffer.count = 0;
+
+    materialBuffer.descriptorReference = app.GBufferPass.descriptorHeap.AllocateDescriptors(MaxMaterialCount, "MaterialBuffer");
+    CreateConstantBufferAndViews(
+        app,
+        app.MaterialBuffer.constantBuffer,
+        sizeof(MaterialConstantData),
+        MaxMaterialCount,
+        materialBuffer.descriptorReference.CPUHandle()
+    );
+
+    ASSERT_HRESULT(materialBuffer.constantBuffer->Map(0, nullptr, reinterpret_cast<void**>(&app.MaterialBuffer.materials)));
+}
+
+void SetupGBufferPass(App& app)
+{
+    D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+    heapDesc.NumDescriptors = MaxDescriptors;
+    heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    app.GBufferPass.descriptorHeap.Initialize(app.device.Get(), heapDesc, "GBufferPassArena");
+
+    SetupMaterialBuffer(app);
 }
 
 void SetupLightingPass(App& app)
 {
-    {
-        D3D12_FEATURE_DATA_ROOT_SIGNATURE featureData = {};
-        featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_1;
-        if (FAILED(app.device->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &featureData, sizeof(featureData)))) {
-            featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_0;
-        }
+    // {
+    //     D3D12_FEATURE_DATA_ROOT_SIGNATURE featureData = {};
+    //     featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    //     if (FAILED(app.device->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &featureData, sizeof(featureData)))) {
+    //         featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_0;
+    //     }
 
-        CD3DX12_DESCRIPTOR_RANGE1 ranges[3];
-        CD3DX12_ROOT_PARAMETER1 rootParameters[3];
+    //     CD3DX12_DESCRIPTOR_RANGE1 ranges[3];
+    //     CD3DX12_ROOT_PARAMETER1 rootParameters[3];
 
-        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, GBuffer_Count, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE);
-        ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 1, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE);
-        ranges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, -1, 2, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE);
+    //     ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, GBuffer_Count, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE);
+    //     ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 1, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE);
+    //     ranges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, -1, 2, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE);
 
-        // GBuffer
-        rootParameters[0].InitAsDescriptorTable(1, &ranges[0], D3D12_SHADER_VISIBILITY_PIXEL);
-        // Light index
-        rootParameters[1].InitAsConstants(1, 0);
-        // Pass data & lights buffer
-        rootParameters[2].InitAsDescriptorTable(2, &ranges[1], D3D12_SHADER_VISIBILITY_PIXEL);
+    //     // GBuffer
+    //     rootParameters[0].InitAsDescriptorTable(1, &ranges[0], D3D12_SHADER_VISIBILITY_PIXEL);
+    //     // Light index
+    //     rootParameters[1].InitAsConstants(1, 0);
+    //     // Pass data & lights buffer
+    //     rootParameters[2].InitAsDescriptorTable(2, &ranges[1], D3D12_SHADER_VISIBILITY_PIXEL);
 
-        D3D12_ROOT_SIGNATURE_FLAGS rootSignatureFlags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+    //     D3D12_ROOT_SIGNATURE_FLAGS rootSignatureFlags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
 
-        D3D12_STATIC_SAMPLER_DESC sampler = {};
-        sampler.Filter = D3D12_FILTER_ANISOTROPIC;
-        sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
-        sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
-        sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
-        sampler.MipLODBias = 0;
-        sampler.MaxAnisotropy = 0;
-        sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
-        sampler.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
-        sampler.MinLOD = 0.0f;
-        sampler.MaxLOD = D3D12_FLOAT32_MAX;
-        sampler.ShaderRegister = 0;
-        sampler.RegisterSpace = 0;
-        sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    //     D3D12_STATIC_SAMPLER_DESC sampler = {};
+    //     sampler.Filter = D3D12_FILTER_ANISOTROPIC;
+    //     sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    //     sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    //     sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    //     sampler.MipLODBias = 0;
+    //     sampler.MaxAnisotropy = 0;
+    //     sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+    //     sampler.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+    //     sampler.MinLOD = 0.0f;
+    //     sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    //     sampler.ShaderRegister = 0;
+    //     sampler.RegisterSpace = 0;
+    //     sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-        CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rootSignatureDesc;
-        rootSignatureDesc.Init_1_1(
-            _countof(rootParameters),
-            rootParameters,
-            1,
-            &sampler,
-            rootSignatureFlags
-        );
+    //     CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rootSignatureDesc;
+    //     rootSignatureDesc.Init_1_1(
+    //         _countof(rootParameters),
+    //         rootParameters,
+    //         1,
+    //         &sampler,
+    //         rootSignatureFlags
+    //     );
 
-        ComPtr<ID3DBlob> signature;
-        ComPtr<ID3DBlob> error;
-        if (!SUCCEEDED(
-            D3DX12SerializeVersionedRootSignature(
-                &rootSignatureDesc,
-                featureData.HighestVersion,
-                &signature,
-                &error
-            )
-        )) {
-            std::cout << "Error: root signature compilation failed\n";
-            std::cout << (char*)error->GetBufferPointer();
-            abort();
-        }
-        ASSERT_HRESULT(
-            app.device->CreateRootSignature(
-                0,
-                signature->GetBufferPointer(),
-                signature->GetBufferSize(),
-                IID_PPV_ARGS(&app.lightingRootSignature)
-            )
-        );
-    }
+    //     ComPtr<ID3DBlob> signature;
+    //     ComPtr<ID3DBlob> error;
+    //     if (!SUCCEEDED(
+    //         D3DX12SerializeVersionedRootSignature(
+    //             &rootSignatureDesc,
+    //             featureData.HighestVersion,
+    //             &signature,
+    //             &error
+    //         )
+    //     )) {
+    //         std::cout << "Error: root signature compilation failed\n";
+    //         std::cout << (char*)error->GetBufferPointer();
+    //         abort();
+    //     }
+    //     ASSERT_HRESULT(
+    //         app.device->CreateRootSignature(
+    //             0,
+    //             signature->GetBufferPointer(),
+    //             signature->GetBufferSize(),
+    //             IID_PPV_ARGS(&app.LightPass.rootSignature)
+    //         )
+    //     );
+    // }
 
     SetupLightBuffer(app);
 
@@ -823,13 +992,69 @@ void SetupLightingPass(App& app)
     // entirely in the vertex buffer without any input vertices.
     std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout;
 
-    app.lightingPSO = CreateGBufferLightingPSO(
+    app.LightPass.PSO = CreateGBufferLightingPSO(
         app.psoManager,
         app.device.Get(),
         app.dataDir,
-        app.lightingRootSignature.Get(),
+        app.rootSignature.Get(),
         inputLayout
     );
+}
+
+void PrintCapabilities(ID3D12Device* device)
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS featureSupport;
+    ASSERT_HRESULT(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &featureSupport, sizeof(featureSupport)));
+    switch (featureSupport.ResourceBindingTier)
+    {
+    case D3D12_RESOURCE_BINDING_TIER_1:
+        std::cout << "Hardware is tier 1\n";
+        break;
+
+    case D3D12_RESOURCE_BINDING_TIER_2:
+        // Tiers 1 and 2 are supported.
+        std::cout << "Hardware is tier 2\n";
+        break;
+
+    case D3D12_RESOURCE_BINDING_TIER_3:
+        // Tiers 1, 2, and 3 are supported.
+        std::cout << "Hardware is tier 3\n";
+        break;
+    }
+
+    D3D12_FEATURE_DATA_SHADER_MODEL shaderModel{};
+    shaderModel.HighestShaderModel = D3D_SHADER_MODEL_6_7;
+    ASSERT_HRESULT(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &shaderModel, sizeof(shaderModel)));
+
+    switch (shaderModel.HighestShaderModel) {
+    case D3D_SHADER_MODEL_5_1:
+        std::cout << "Shader model 5_1 is supported\n";
+        break;
+    case D3D_SHADER_MODEL_6_0:
+        std::cout << "Shader model 6_0 is supported\n";
+        break;
+    case D3D_SHADER_MODEL_6_1:
+        std::cout << "Shader model 6_1 is supported\n";
+        break;
+    case D3D_SHADER_MODEL_6_2:
+        std::cout << "Shader model 6_2 is supported\n";
+        break;
+    case D3D_SHADER_MODEL_6_3:
+        std::cout << "Shader model 6_3 is supported\n";
+        break;
+    case D3D_SHADER_MODEL_6_4:
+        std::cout << "Shader model 6_4 is supported\n";
+        break;
+    case D3D_SHADER_MODEL_6_5:
+        std::cout << "Shader model 6_5 is supported\n";
+        break;
+    case D3D_SHADER_MODEL_6_6:
+        std::cout << "Shader model 6_6 is supported\n";
+        break;
+    case D3D_SHADER_MODEL_6_7:
+        std::cout << "Shader model 6_7 is supported\n";
+        break;
+    }
 }
 
 void InitD3D(App& app)
@@ -860,6 +1085,8 @@ void InitD3D(App& app)
     );
 
     ID3D12Device* device = app.device.Get();
+
+    PrintCapabilities(device);
 
     // Graphics command queue
     {
@@ -926,6 +1153,9 @@ void InitD3D(App& app)
     SetupDepthStencil(app, false);
     SetupGBuffer(app, false);
 
+    CreateMainRootSignature(app);
+
+    SetupGBufferPass(app);
     SetupLightingPass(app);
 
     ASSERT_HRESULT(
@@ -1045,6 +1275,15 @@ AppAssets LoadAssets(App& app)
     std::vector<double> vectorValues(valuePtr, valuePtr + 16);
     assets.models[2].nodes[2].matrix = vectorValues;
 
+    CHECK(
+        loader.LoadASCIIFromFile(
+            &assets.models[3],
+            &err,
+            &warn,
+            app.dataDir + "/skybox/skybox.gltf"
+        )
+    );
+
     return assets;
 }
 
@@ -1084,7 +1323,7 @@ ComPtr<ID3D12Resource> CreateUploadHeap(App& app, const std::vector<D3D12_RESOUR
     return uploadHeap;
 }
 
-void CreateDescriptorsForModel(
+void CreateModelDescriptors(
     Model& outputModel,
     App& app,
     const tinygltf::Model& inputModel,
@@ -1097,61 +1336,29 @@ void CreateDescriptorsForModel(
         numConstantBuffers += mesh.primitives.size();
     }
     size_t numDescriptors = numConstantBuffers + inputModel.textures.size();
-    outputModel.baseTextureDescriptorIdx = (UINT)numConstantBuffers;
-
-    ComPtr<ID3D12DescriptorHeap> mainDescriptorHeap;
-
-    D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
-    heapDesc.NumDescriptors = (UINT)numDescriptors;
-    heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    ASSERT_HRESULT(
-        app.device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&mainDescriptorHeap))
-    );
 
     UINT incrementSize = app.cbvSrvUavDescriptorSize;
 
     // Create per-primitive constant buffer
     ComPtr<ID3D12Resource> perPrimitiveConstantBuffer;
     {
-        CD3DX12_CPU_DESCRIPTOR_HANDLE cpuHandle(mainDescriptorHeap->GetCPUDescriptorHandleForHeapStart(), 0, incrementSize);
+        auto descriptorRef = app.GBufferPass.descriptorHeap.AllocateDescriptors(numConstantBuffers, "PerPrimitiveConstantBuffer");
+        auto cpuHandle = descriptorRef.CPUHandle();
         CreateConstantBufferAndViews(
             app,
             perPrimitiveConstantBuffer,
             sizeof(PerPrimitiveConstantData),
-            inputModel.meshes.size(),
+            numConstantBuffers,
             cpuHandle
         );
-        // const UINT constantBufferSize = (UINT)sizeof(PerPrimitiveConstantData) * (UINT)inputModel.meshes.size();
-        // CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_UPLOAD);
-        // auto resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(constantBufferSize);
-        // ASSERT_HRESULT(
-        //     app.device->CreateCommittedResource(
-        //         &heapProps,
-        //         D3D12_HEAP_FLAG_NONE,
-        //         &resourceDesc,
-        //         D3D12_RESOURCE_STATE_GENERIC_READ,
-        //         nullptr,
-        //         IID_PPV_ARGS(&perPrimitiveConstantBuffer)
-        //     )
-        // );
-
-        // CD3DX12_CPU_DESCRIPTOR_HANDLE cpuHandle(mainDescriptorHeap->GetCPUDescriptorHandleForHeapStart(), 0, incrementSize);
-        // for (int i = 0; i < inputModel.meshes.size(); i++) {
-        //     D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
-        //     cbvDesc.BufferLocation = perPrimitiveConstantBuffer->GetGPUVirtualAddress() + (i * sizeof(PerPrimitiveConstantData));
-        //     cbvDesc.SizeInBytes = sizeof(PerPrimitiveConstantData);
-        //     app.device->CreateConstantBufferView(
-        //         &cbvDesc,
-        //         cpuHandle
-        //     );
-        //     cpuHandle.Offset(1, incrementSize);
-        // }
+        outputModel.primitiveDataDescriptors = descriptorRef;
     }
 
     // Create SRVs
     {
-        CD3DX12_CPU_DESCRIPTOR_HANDLE cpuHandle(mainDescriptorHeap->GetCPUDescriptorHandleForHeapStart(), (int)inputModel.meshes.size(), incrementSize);
+        auto descriptorRef = app.GBufferPass.descriptorHeap.AllocateDescriptors(textureResources.size(), "MeshTextures");
+        auto cpuHandle = descriptorRef.CPUHandle();
+        //CD3DX12_CPU_DESCRIPTOR_HANDLE cpuHandle(mainDescriptorHeap->GetCPUDescriptorHandleForHeapStart(), (int)inputModel.meshes.size(), incrementSize);
         for (const auto& textureResource : textureResources) {
             auto textureDesc = textureResource->GetDesc();
             D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
@@ -1162,9 +1369,9 @@ void CreateDescriptorsForModel(
             app.device->CreateShaderResourceView(textureResource.Get(), &srvDesc, cpuHandle);
             cpuHandle.Offset(1, incrementSize);
         }
+        outputModel.baseTextureDescriptor = descriptorRef;
     }
 
-    outputModel.mainDescriptorHeap = mainDescriptorHeap;
     outputModel.perPrimitiveConstantBuffer = perPrimitiveConstantBuffer;
     CD3DX12_RANGE readRange(0, 0);
     ASSERT_HRESULT(perPrimitiveConstantBuffer->Map(0, &readRange, reinterpret_cast<void**>(&outputModel.perPrimitiveBufferPtr)));
@@ -1254,7 +1461,7 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
         ComPtr<ID3D12Resource> geometryBuffer;
         CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
         auto resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(gltfBuffer.data.size());
-        auto resourceState = D3D12_RESOURCE_STATE_COPY_DEST;
+        auto resourceState = D3D12_RESOURCE_STATE_COMMON;
         ASSERT_HRESULT(
             app.device->CreateCommittedResource(
                 &heapProps,
@@ -1284,7 +1491,7 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
         ComPtr<ID3D12Resource> buffer;
         CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
         auto resourceDesc = GetImageResourceDesc(gltfImage);
-        auto resourceState = D3D12_RESOURCE_STATE_COPY_DEST;
+        auto resourceState = D3D12_RESOURCE_STATE_COMMON;
         ASSERT_HRESULT(
             app.device->CreateCommittedResource(
                 &heapProps,
@@ -1532,14 +1739,32 @@ void FinalizeModel(
 
             int diffuseIdx = -1;
             int normalIdx = -1;
-            if (primitive.material != -1)
-            {
-                auto material = inputModel.materials[primitive.material];
-                diffuseIdx = material.pbrMetallicRoughness.baseColorTexture.index;
-                normalIdx = material.normalTexture.index;
+            if (primitive.material != -1) {
+                auto& materialBuffer = app.MaterialBuffer;
+                auto materialIndex = materialBuffer.count++;
+                drawCall.materialIndex = materialIndex;
+                auto& material = materialBuffer.materials[materialIndex];
+                const auto& gltfMaterial = inputModel.materials[primitive.material];
+                diffuseIdx = gltfMaterial.pbrMetallicRoughness.baseColorTexture.index;
+                normalIdx = gltfMaterial.normalTexture.index;
+                if (diffuseIdx != -1) {
+                    material.diffuseTextureIdx = outputModel.baseTextureDescriptor.index + diffuseIdx;
+                } else {
+                    material.diffuseTextureIdx = -1;
+                }
+                if (normalIdx != -1) {
+                    material.normalTextureIdx = outputModel.baseTextureDescriptor.index + normalIdx;
+                } else {
+                    material.normalTextureIdx = -1;
+                }
+                if (gltfMaterial.extensions.contains("KHR_materials_unlit")) {
+                    material.materialType = MaterialType_Unlit;
+                } else {
+                    material.materialType = MaterialType_PBR;
+                }
+            } else {
+                drawCall.materialIndex = -1;
             }
-            drawCall.TextureIndices.diffuse = diffuseIdx;
-            drawCall.TextureIndices.normal = normalIdx;
 
             {
                 D3D12_INDEX_BUFFER_VIEW& ibv = drawCall.indexBufferView;
@@ -1574,13 +1799,27 @@ void FinalizeModel(
     // FIXME: So many wasted PSOs.
     for (auto& mesh : outputModel.meshes) {
         for (auto& primitive : mesh.primitives) {
-            primitive.PSO = CreateMeshGBufferPSO(
-                app.psoManager,
-                app.device.Get(),
-                app.dataDir,
-                app.rootSignature.Get(),
-                primitive.inputLayout
-            );
+            MaterialConstantData& material = app.MaterialBuffer.materials[primitive.materialIndex];
+            if (material.materialType == MaterialType_PBR) {
+                primitive.PSO = CreateMeshPBRPSO(
+                    app.psoManager,
+                    app.device.Get(),
+                    app.dataDir,
+                    app.rootSignature.Get(),
+                    primitive.inputLayout
+                );
+            } else if (material.materialType == MaterialType_Unlit) {
+                primitive.PSO = CreateMeshUnlitPSO(
+                    app.psoManager,
+                    app.device.Get(),
+                    app.dataDir,
+                    app.rootSignature.Get(),
+                    primitive.inputLayout
+                );
+            } else {
+                std::cout << "Unimplemented material type";
+                abort();
+            }
         }
     }
 }
@@ -1637,7 +1876,7 @@ void ProcessAssets(App& app, const AppAssets& assets)
             textureBuffers
         );
 
-        CreateDescriptorsForModel(model, app, gltfModel, textureBuffers);
+        CreateModelDescriptors(model, app, gltfModel, textureBuffers);
         FinalizeModel(model, app, gltfModel);
 
         app.models.push_back(model);
@@ -1663,73 +1902,6 @@ void ProcessAssets(App& app, const AppAssets& assets)
 void LoadScene(App& app, const AppAssets& assets)
 {
     ID3D12Device* device = app.device.Get();
-    {
-        D3D12_FEATURE_DATA_ROOT_SIGNATURE featureData = {};
-        featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_1;
-        if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &featureData, sizeof(featureData))))
-        {
-            featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_0;
-        }
-
-        CD3DX12_DESCRIPTOR_RANGE1 ranges[2];
-        CD3DX12_ROOT_PARAMETER1 rootParameters[2];
-
-        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE);
-        ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, -1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE);
-        rootParameters[0].InitAsDescriptorTable(1, &ranges[0], D3D12_SHADER_VISIBILITY_ALL);
-        rootParameters[1].InitAsDescriptorTable(1, &ranges[1], D3D12_SHADER_VISIBILITY_PIXEL);
-
-        D3D12_ROOT_SIGNATURE_FLAGS rootSignatureFlags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
-
-        // FIXME: This is going to have to be dynamic...
-        D3D12_STATIC_SAMPLER_DESC sampler = {};
-        sampler.Filter = D3D12_FILTER_ANISOTROPIC;
-        sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
-        sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
-        sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
-        sampler.MipLODBias = 0;
-        sampler.MaxAnisotropy = 4;
-        sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
-        sampler.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
-        sampler.MinLOD = 0.0f;
-        sampler.MaxLOD = D3D12_FLOAT32_MAX;
-        sampler.ShaderRegister = 0;
-        sampler.RegisterSpace = 0;
-        sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-
-        CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rootSignatureDesc;
-        rootSignatureDesc.Init_1_1(
-            _countof(rootParameters),
-            rootParameters,
-            1,
-            &sampler,
-            rootSignatureFlags
-        );
-
-        ComPtr<ID3DBlob> signature;
-        ComPtr<ID3DBlob> error;
-        if (!SUCCEEDED(
-            D3DX12SerializeVersionedRootSignature(
-                &rootSignatureDesc,
-                featureData.HighestVersion,
-                &signature,
-                &error
-            )
-        )) {
-            std::cout << "Error: root signature compilation failed\n";
-            std::cout << (char*)error->GetBufferPointer();
-            abort();
-        }
-
-        ASSERT_HRESULT(
-            device->CreateRootSignature(
-                0,
-                signature->GetBufferPointer(),
-                signature->GetBufferSize(),
-                IID_PPV_ARGS(&app.rootSignature)
-            )
-        );
-    }
 
     // Create command lists
     {
@@ -1773,7 +1945,7 @@ void InitializeCamera(App& app)
 
 void InitializeLights(App& app)
 {
-    app.LightBuffer.numLights = 1;
+    app.LightBuffer.count = 1;
     for (int i = 0; i < MaxLightCount; i++) {
         float angle = i * glm::two_pi<float>() / 4;
         float x = cos(angle);
@@ -1802,8 +1974,6 @@ void UpdatePerPrimitiveConstantBuffers(Model& model, const glm::mat4& projection
         for (const auto& primitive : mesh.primitives) {
             perPrimitiveBuffer->MVP = mvp;
             perPrimitiveBuffer->MV = mv;
-            perPrimitiveBuffer->diffuseTextureIdx = primitive.TextureIndices.diffuse;
-            perPrimitiveBuffer->normalTextureIdx = primitive.TextureIndices.normal;
             perPrimitiveBuffer++;
         }
     }
@@ -1811,7 +1981,7 @@ void UpdatePerPrimitiveConstantBuffers(Model& model, const glm::mat4& projection
 
 void UpdateLightConstantBuffers(App& app, const glm::mat4& projection, const glm::mat4& view) {
     app.LightBuffer.passData->inverseProjectionMatrix = glm::inverse(projection);
-    for (int i = 0; i < app.LightBuffer.numLights; i++) {
+    for (int i = 0; i < app.LightBuffer.count; i++) {
         auto& lightData = app.LightBuffer.lights[i];
         lightData.positionViewSpace = view * lightData.position;
         lightData.directionViewSpace = view * lightData.direction;
@@ -1889,25 +2059,23 @@ void UpdateScene(App& app)
 
 void DrawModelCommandList(const Model& model, ID3D12GraphicsCommandList* commandList, int cbvOffsetIncrement)
 {
-    ID3D12DescriptorHeap* mainDescriptorHeap = model.mainDescriptorHeap.Get();
-    ID3D12DescriptorHeap* ppHeaps[] = { mainDescriptorHeap };
-    commandList->SetDescriptorHeaps(1, ppHeaps);
     // Set the texture array. Textures are dynamically indexed from the constant buffer.
-    {
-        CD3DX12_GPU_DESCRIPTOR_HANDLE texturesHandle(model.mainDescriptorHeap->GetGPUDescriptorHandleForHeapStart(), model.baseTextureDescriptorIdx, cbvOffsetIncrement);
-        commandList->SetGraphicsRootDescriptorTable(1, texturesHandle);
-    }
-    CD3DX12_GPU_DESCRIPTOR_HANDLE constantBufferHandle(mainDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
+    // {
+    //     CD3DX12_GPU_DESCRIPTOR_HANDLE texturesHandle(model.mainDescriptorHeap->GetGPUDescriptorHandleForHeapStart(), model.baseTextureDescriptorIdx, cbvOffsetIncrement);
+    //     commandList->SetGraphicsRootDescriptorTable(1, texturesHandle);
+    // }
+    int constantBufferIdx = model.primitiveDataDescriptors.index;
     for (const auto& mesh : model.meshes) {
         for (const auto& primitive : mesh.primitives) {
             // Set the per-primitive constant buffer
-            commandList->SetGraphicsRootDescriptorTable(0, constantBufferHandle);
+            UINT constantValues[2] = { constantBufferIdx, primitive.materialIndex };
+            commandList->SetGraphicsRoot32BitConstants(0, 2, constantValues, 0);
             commandList->IASetPrimitiveTopology(primitive.primitiveTopology);
             commandList->SetPipelineState(primitive.PSO->Get());
             commandList->IASetVertexBuffers(0, (UINT)primitive.vertexBufferViews.size(), primitive.vertexBufferViews.data());
             commandList->IASetIndexBuffer(&primitive.indexBufferView);
             commandList->DrawIndexedInstanced(primitive.indexCount, 1, 0, 0, 0);
-            constantBufferHandle.Offset(1, cbvOffsetIncrement);
+            constantBufferIdx++;
         }
     }
 }
@@ -1918,35 +2086,59 @@ void DrawFullscreenQuad(const App& app, ID3D12GraphicsCommandList* commandList)
     commandList->DrawInstanced(4, 1, 0, 0);
 }
 
-void GBufferPass(const App& app, ID3D12GraphicsCommandList* commandList)
+void BindAndClearGBufferRTVs(const App& app, ID3D12GraphicsCommandList* commandList)
 {
-    // Transition our GBuffers into being render targets.
-    std::array<D3D12_RESOURCE_BARRIER, GBuffer_Count> barriers;
+    CD3DX12_CPU_DESCRIPTOR_HANDLE renderTargetHandles[1 + GBuffer_RTVCount] = {};
+    CD3DX12_CPU_DESCRIPTOR_HANDLE backBufferHandle(app.rtvHeap->GetCPUDescriptorHandleForHeapStart(), app.frameIdx, app.rtvDescriptorSize);
+    CD3DX12_CPU_DESCRIPTOR_HANDLE gBufferHandle(app.rtvHeap->GetCPUDescriptorHandleForHeapStart(), FrameBufferCount, app.rtvDescriptorSize);
+    renderTargetHandles[0] = backBufferHandle;
     for (int i = 0; i < GBuffer_RTVCount; i++) {
-        barriers[i] = CD3DX12_RESOURCE_BARRIER::Transition(app.GBuffer.renderTargets[i].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        renderTargetHandles[i + 1] = gBufferHandle;
+        gBufferHandle.Offset(1, app.rtvDescriptorSize);
     }
-    // Depth buffer is special
-    barriers[GBuffer_Depth] = CD3DX12_RESOURCE_BARRIER::Transition(app.depthStencilBuffer.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
-    commandList->ResourceBarrier((UINT)barriers.size(), barriers.data());
 
-    CD3DX12_CPU_DESCRIPTOR_HANDLE baseRtvHandle(app.rtvHeap->GetCPUDescriptorHandleForHeapStart(), FrameBufferCount, app.rtvDescriptorSize);
-    CD3DX12_CPU_DESCRIPTOR_HANDLE endGBufferHandle(app.rtvHeap->GetCPUDescriptorHandleForHeapStart(), FrameBufferCount + GBuffer_RTVCount, app.rtvDescriptorSize);
     CD3DX12_CPU_DESCRIPTOR_HANDLE dsvHandle(app.dsHeap->GetCPUDescriptorHandleForHeapStart());
-    commandList->OMSetRenderTargets(GBuffer_RTVCount, &baseRtvHandle, TRUE, &dsvHandle);
+    commandList->OMSetRenderTargets(_countof(renderTargetHandles), renderTargetHandles, FALSE, &dsvHandle);
 
-    // Record commands.
-    const float clearColor[] = { 0.0f, 0.0f, 0.0f, 1.0f };
     // Clear render targets
-    for (auto handle = baseRtvHandle; handle != endGBufferHandle; handle.Offset(1, app.rtvDescriptorSize)) {
+    const float clearColor[] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    for (const auto& handle : renderTargetHandles) {
         commandList->ClearRenderTargetView(handle, clearColor, 0, nullptr);
     }
     commandList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 
-    for (const auto& model : app.models) {
-        DrawModelCommandList(model, commandList, app.cbvSrvUavDescriptorSize);
-    }
+}
 
+// Draws all unlit meshes directly to the backbuffer.
+// void UnlitPass(const App& app, ID3D12GraphicsCommandList* commandList)
+// {
+//     auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(app.renderTargets[app.frameIdx].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+//     commandList->ResourceBarrier(1, &barrier);
+
+//     for (const auto& model : app.models) {
+//         DrawModelCommandList(model, commandList, app.cbvSrvUavDescriptorSize);
+//     }
+// }
+
+void TransitionRTVsForRendering(const App& app, ID3D12GraphicsCommandList* commandList)
+{
+    // Transition our GBuffers into being render targets.
+    std::array<D3D12_RESOURCE_BARRIER, GBuffer_Count + 1> barriers;
+    // Back buffer
+    barriers[0] = CD3DX12_RESOURCE_BARRIER::Transition(app.renderTargets[app.frameIdx].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    // GBuffer RTVs
+    for (int i = 0; i < GBuffer_RTVCount; i++) {
+        barriers[i + 1] = CD3DX12_RESOURCE_BARRIER::Transition(app.GBuffer.renderTargets[i].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    }
+    // Depth buffer is special
+    barriers[GBuffer_Depth + 1] = CD3DX12_RESOURCE_BARRIER::Transition(app.depthStencilBuffer.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    commandList->ResourceBarrier((UINT)barriers.size(), barriers.data());
+}
+
+void TransitionGBufferForLighting(const App& app, ID3D12GraphicsCommandList* commandList)
+{
     // Transition them back to being shader resource views so that they can be used in the lighting shaders.
+    std::array<D3D12_RESOURCE_BARRIER, GBuffer_Count> barriers;
     for (int i = 0; i < GBuffer_RTVCount; i++) {
         barriers[i] = CD3DX12_RESOURCE_BARRIER::Transition(app.GBuffer.renderTargets[i].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     }
@@ -1955,31 +2147,47 @@ void GBufferPass(const App& app, ID3D12GraphicsCommandList* commandList)
     commandList->ResourceBarrier((UINT)barriers.size(), barriers.data());
 }
 
+void GBufferPass(const App& app, ID3D12GraphicsCommandList* commandList)
+{
+    TransitionRTVsForRendering(app, commandList);
+
+    BindAndClearGBufferRTVs(app, commandList);
+
+    ID3D12DescriptorHeap* mainDescriptorHeap = app.GBufferPass.descriptorHeap.descriptorHeap.Get();
+    ID3D12DescriptorHeap* ppHeaps[] = { mainDescriptorHeap };
+    commandList->SetDescriptorHeaps(1, ppHeaps);
+    commandList->SetGraphicsRootSignature(app.rootSignature.Get());
+
+    for (const auto& model : app.models) {
+        DrawModelCommandList(model, commandList, app.cbvSrvUavDescriptorSize);
+    }
+
+    TransitionGBufferForLighting(app, commandList);
+}
+
 void FinalPass(const App& app, ID3D12GraphicsCommandList* commandList)
 {
-    auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(app.renderTargets[app.frameIdx].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    commandList->ResourceBarrier(1, &barrier);
-
     CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(app.rtvHeap->GetCPUDescriptorHandleForHeapStart(), app.frameIdx, app.rtvDescriptorSize);
 
     commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
-
-    // Record commands.
-    const float clearColor[] = { 0.0f, 0.0f, 0.0f, 1.0f };
-    commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
-
-    commandList->SetGraphicsRootSignature(app.lightingRootSignature.Get());
 
     {
         auto descriptorHeap = app.lightingPassDescriptorArena.descriptorHeap;
         ID3D12DescriptorHeap* ppHeaps[] = { descriptorHeap.Get() };
         commandList->SetDescriptorHeaps(_countof(ppHeaps), ppHeaps);
+        // Root signature must be set AFTER heaps are set when CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED is set.
+        commandList->SetGraphicsRootSignature(app.rootSignature.Get());
+
         commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-        commandList->SetGraphicsRootDescriptorTable(0, app.GBuffer.baseSrvReference.GPUHandle());
-        commandList->SetGraphicsRootDescriptorTable(2, app.LightBuffer.cbvHandle.GPUHandle());
-        commandList->SetPipelineState(app.lightingPSO->Get());
-        for (int i = 0; i < app.LightBuffer.numLights; i++) {
-            commandList->SetGraphicsRoot32BitConstant(1, i, 0);
+        commandList->SetPipelineState(app.LightPass.PSO->Get());
+        for (int i = 0; i < app.LightBuffer.count; i++) {
+            UINT constantValues[2] = {
+                app.LightBuffer.cbvHandle.index + i + 1,
+                app.LightBuffer.cbvHandle.index
+            };
+            commandList->SetGraphicsRoot32BitConstants(0, 2, constantValues, 2);
+            // commandList->SetGraphicsRoot32BitConstant(ConstantIndex_Light, app.LightBuffer.cbvHandle.index + i + 1, 0);
+            // commandList->SetGraphicsRoot32BitConstant(ConstantIndex_LightPassData, app.LightBuffer.cbvHandle.index, 0);
             DrawFullscreenQuad(app, commandList);
         }
     }
@@ -1989,7 +2197,7 @@ void FinalPass(const App& app, ID3D12GraphicsCommandList* commandList)
     ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), commandList);
 
     // Indicate that the back buffer will now be used to present.
-    barrier = CD3DX12_RESOURCE_BARRIER::Transition(app.renderTargets[app.frameIdx].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+    auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(app.renderTargets[app.frameIdx].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
     commandList->ResourceBarrier(1, &barrier);
 }
 
@@ -2020,14 +2228,19 @@ void BuildCommandList(const App& app)
 
 void RenderFrame(App& app)
 {
+    bool tdrOccurred = false;
     BuildCommandList(app);
 
     ID3D12CommandList* ppCommandLists[] = { app.commandList.Get() };
     app.commandQueue->ExecuteCommandLists(_countof(ppCommandLists), ppCommandLists);
 
-    ASSERT_HRESULT(
-        app.swapChain->Present(0, DXGI_PRESENT_ALLOW_TEARING)
-    );
+
+    HRESULT hr = app.swapChain->Present(0, DXGI_PRESENT_ALLOW_TEARING);
+    if (!SUCCEEDED(hr)) {
+        tdrOccurred = true;
+        app.running = false;
+        std::cout << "TDR occurred\n";
+    }
 
     WaitForPreviousFrame(app);
 }
@@ -2125,16 +2338,16 @@ void DrawLightsEditor(App& app)
     if (ImGui::Begin("Lights", &lightsOpen)) {
         ImGui::BeginGroup();
         if (ImGui::Button("New light")) {
-            app.LightBuffer.numLights = glm::min(app.LightBuffer.numLights + 1, MaxLightCount);
+            app.LightBuffer.count = glm::min(app.LightBuffer.count + 1, MaxLightCount);
         }
         if (ImGui::Button("Remove light")) {
-            app.LightBuffer.numLights = glm::max(app.LightBuffer.numLights - 1, 0);
+            app.LightBuffer.count = glm::max(app.LightBuffer.count - 1, 0);
         }
         ImGui::EndGroup();
 
         // const char* const* pLabels = (const char* const*)labels;
         if (ImGui::BeginListBox("Lights")) {
-            for (int i = 0; i < app.LightBuffer.numLights; i++) {
+            for (int i = 0; i < app.LightBuffer.count; i++) {
                 std::string label = "Light #" + std::to_string(i);
                 if (ImGui::Selectable(label.c_str(), i == selectedLightIdx))
                 {
@@ -2148,8 +2361,8 @@ void DrawLightsEditor(App& app)
         ImGui::Separator();
         if (selectedLightIdx != -1) {
             auto& light = app.LightBuffer.lights[selectedLightIdx];
-            ImGui::ColorEdit3("Color", (float*)&light.color);
-            ImGui::DragFloat3("Position", (float*)&light.position);
+            ImGui::ColorEdit3("Color", (float*)&light.color, ImGuiColorEditFlags_PickerHueWheel);
+            ImGui::DragFloat3("Position", (float*)&light.position, 0.1);
             ImGui::DragFloat("Range", &light.range, 0.1f, 0.0f, 1000.0f, nullptr, 1.0f);
             ImGui::DragFloat("Intensity", &light.intensity, 0.05f, 0.0f, 100.0f, nullptr, 1.0f);
         } else {
@@ -2194,8 +2407,8 @@ int RunApp(int argc, char** argv)
     int mouseX, mouseY;
     int buttonState = SDL_GetMouseState(&mouseX, &mouseY);
 
-    bool running = true;
-    while (running) {
+    app.running = true;
+    while (app.running) {
         long long frameTick = high_resolution_clock().now().time_since_epoch().count();
         app.mouseState.xrel = 0;
         app.mouseState.yrel = 0;
@@ -2203,7 +2416,7 @@ int RunApp(int argc, char** argv)
         while (SDL_PollEvent(&e) > 0) {
             ImGui_ImplSDL2_ProcessEvent(&e);
             if (e.type == SDL_QUIT) {
-                running = false;
+                app.running = false;
             } else if (e.type == SDL_WINDOWEVENT) {
                 if (e.window.event == SDL_WINDOWEVENT_RESIZED) {
                     int newWidth = e.window.data1;
