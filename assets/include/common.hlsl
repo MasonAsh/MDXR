@@ -6,7 +6,7 @@ struct PrimitiveData {
 struct MaterialData {
     uint diffuseTextureIdx;
     uint normalTextureIdx;
-    float3 ambientFactor;
+    uint metalRoughnessIdx;
 };
 
 struct LightConstantData {

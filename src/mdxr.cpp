@@ -13,6 +13,7 @@
 #include <chrono>
 #include <algorithm>
 #include <span>
+#include <ranges>
 #include <glm/gtc/type_ptr.hpp>
 #include <glm/gtx/quaternion.hpp>
 #include "imgui.h"
@@ -23,7 +24,7 @@ using namespace std::chrono;
 
 const int FrameBufferCount = 2;
 const int MaxLightCount = 10;
-const int MaxMaterialCount = 64;
+const int MaxMaterialCount = 128;
 const int MaxDescriptors = 2048;
 const DXGI_FORMAT DepthFormat = DXGI_FORMAT_D32_FLOAT;
 
@@ -103,12 +104,11 @@ enum MaterialType {
 struct MaterialConstantData {
     UINT diffuseTextureIdx;
     UINT normalTextureIdx;
-
-    glm::vec3 ambientFactor;
+    UINT metalRoughnessTextureIdx;
 
     UINT materialType;
 
-    float padding[58];
+    float padding[60];
 };
 static_assert((sizeof(MaterialConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
 
@@ -138,6 +138,11 @@ struct DescriptorReference {
     CD3DX12_GPU_DESCRIPTOR_HANDLE GPUHandle() const {
         return CD3DX12_GPU_DESCRIPTOR_HANDLE(heap->GetGPUDescriptorHandleForHeapStart(), index, incrementSize);
     }
+
+    DescriptorReference operator+(int offset) const
+    {
+        return DescriptorReference(heap, index + offset, incrementSize);
+    }
 };
 
 struct Primitive {
@@ -164,6 +169,7 @@ struct Model {
 
     DescriptorReference primitiveDataDescriptors;
     DescriptorReference baseTextureDescriptor;
+    DescriptorReference baseMaterialDescriptor;
 
     // All of the child mesh constant buffers stored in this constant buffer
     ComPtr<ID3D12Resource> perPrimitiveConstantBuffer;
@@ -206,7 +212,7 @@ struct DescriptorArena {
         DescriptorReference reference(descriptorHeap.Get(), size, descriptorIncrementSize);
         size += count;
         if (size > capacity) {
-            std::cout << "Error: descriptor heap is not large enough\n";
+            std::cerr << "Error: descriptor heap is not large enough\n";
             abort();
         }
         return reference;
@@ -314,6 +320,95 @@ struct LightConstantData {
 };
 static_assert((sizeof(LightConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
 
+struct MaterialTextureDescriptors {
+    DescriptorReference diffuse;
+    DescriptorReference normal;
+    DescriptorReference metalRoughness;
+};
+
+// Store descriptor sizes globally for convenience
+struct {
+    int CbvSrvUav;
+    int Rtv;
+} G_IncrementSizes;
+
+struct Material {
+    MaterialConstantData* constantData;
+    MaterialTextureDescriptors textureDescriptors;
+    DescriptorReference cbvDescriptor;
+
+    MaterialType materialType;
+
+    std::string name;
+
+    void UpdateConstantData()
+    {
+        constantData->diffuseTextureIdx = textureDescriptors.diffuse.index;
+        constantData->normalTextureIdx = textureDescriptors.normal.index;
+        constantData->metalRoughnessTextureIdx = textureDescriptors.metalRoughness.index;
+    }
+};
+
+template<class T>
+struct ConstantBufferSlice
+{
+    int index;
+    std::span<T> data;
+};
+
+// Fixed size constant buffer allocator.
+// Crashes if size > capacity
+template<class T>
+struct ConstantBufferArena
+{
+    static_assert((sizeof(T) % 256) == 0, "T must be 256-byte aligned");
+
+    void Initialize(ID3D12Device* device, ComPtr<ID3D12Resource> resource)
+    {
+        this->resource = resource;
+        this->capacity = resource->GetDesc().Width / sizeof(T);
+        this->size = 0;
+        resource->Map(0, nullptr, reinterpret_cast<void**>(&mappedPtr));
+    }
+
+    ConstantBufferSlice<T> Allocate(int count)
+    {
+        int index = size;
+        size += count;
+        if (size > capacity) {
+            std::cerr << "Error: constant buffer is not large enough\n";
+            abort();
+        }
+
+        T* start = mappedPtr + index;
+        ConstantBufferSlice<T> result;
+        result.data = std::span<T>(start, count);
+        result.index = index;
+
+        return result;
+    }
+
+    void CreateViews(ID3D12Device* device, ConstantBufferSlice<T>& slice, CD3DX12_CPU_DESCRIPTOR_HANDLE startDescriptor)
+    {
+        CD3DX12_CPU_DESCRIPTOR_HANDLE descriptorHandle(startDescriptor);
+        for (int i = 0; i < slice.data.size(); i++) {
+            D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
+            cbvDesc.BufferLocation = resource->GetGPUVirtualAddress() + ((slice.index + i) * sizeof(T));
+            cbvDesc.SizeInBytes = sizeof(T);
+            device->CreateConstantBufferView(
+                &cbvDesc,
+                descriptorHandle
+            );
+            descriptorHandle.Offset(1, G_IncrementSizes.CbvSrvUav);
+        }
+    }
+
+    ComPtr<ID3D12Resource> resource;
+    T* mappedPtr;
+    int capacity = 0;
+    int size = 0;
+};
+
 struct App {
     std::string dataDir;
     std::wstring wDataDir;
@@ -361,8 +456,6 @@ struct App {
     std::vector<Model> models;
 
     unsigned int frameIdx;
-    unsigned int rtvDescriptorSize = 0;
-    unsigned int cbvSrvUavDescriptorSize = 0;
 
     Camera camera;
     const UINT8* keyState;
@@ -377,12 +470,14 @@ struct App {
         DescriptorArena descriptorHeap;
     } GBufferPass;
 
-    struct {
-        ComPtr<ID3D12Resource> constantBuffer;
-        MaterialConstantData* materials;
-        int count;
-        DescriptorReference descriptorReference;
-    } MaterialBuffer;
+    // struct {
+    //     ComPtr<ID3D12Resource> constantBuffer;
+    //     MaterialConstantData* materials;
+    //     int count;
+    //     DescriptorReference descriptorReference;
+    // } MaterialBuffer;
+
+    ConstantBufferArena<MaterialConstantData> materialConstantBuffer;
 
     DescriptorArena lightingPassDescriptorArena;
     struct {
@@ -407,6 +502,8 @@ struct App {
 
         int count;
     } LightBuffer;
+
+    std::vector<Material> materials;
 
     PSOManager psoManager;
 };
@@ -461,7 +558,7 @@ void SetupRenderTargets(App& app)
         );
 
         app.device->CreateRenderTargetView(app.renderTargets[i].Get(), nullptr, rtvHandle);
-        rtvHandle.Offset(1, app.rtvDescriptorSize);
+        rtvHandle.Offset(1, G_IncrementSizes.Rtv);
     }
 }
 
@@ -533,26 +630,6 @@ ManagedPSORef CreatePSO(
     manager.PSOs.emplace_back(mPso);
 
     return mPso;
-}
-
-ManagedPSORef CreateUnlitMeshPSO(
-    PSOManager& manager,
-    ID3D12Device* device,
-    const std::string& dataDir,
-    ID3D12RootSignature* rootSignature,
-    const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
-)
-{
-    auto psoDesc = DefaultPSODesc();
-    return CreatePSO(
-        manager,
-        device,
-        dataDir,
-        "unlit_mesh",
-        rootSignature,
-        inputLayout,
-        psoDesc
-    );
 }
 
 ManagedPSORef CreateDiffuseMeshPSO(
@@ -714,7 +791,7 @@ void SetupGBuffer(App& app, bool isResize)
     }
 
 
-    CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(app.rtvHeap->GetCPUDescriptorHandleForHeapStart(), FrameBufferCount, app.rtvDescriptorSize);
+    CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(app.rtvHeap->GetCPUDescriptorHandleForHeapStart(), FrameBufferCount, G_IncrementSizes.Rtv);
     CD3DX12_CPU_DESCRIPTOR_HANDLE srvHandle = app.GBuffer.baseSrvReference.CPUHandle();
     for (int i = 0; i < GBuffer_Depth; i++) {
         CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
@@ -748,8 +825,8 @@ void SetupGBuffer(App& app, bool isResize)
         app.device->CreateShaderResourceView(app.GBuffer.renderTargets[i].Get(), &srvDesc, srvHandle);
         app.device->CreateRenderTargetView(app.GBuffer.renderTargets[i].Get(), nullptr, rtvHandle);
 
-        rtvHandle.Offset(1, app.rtvDescriptorSize);
-        srvHandle.Offset(1, app.cbvSrvUavDescriptorSize);
+        rtvHandle.Offset(1, G_IncrementSizes.Rtv);
+        srvHandle.Offset(1, G_IncrementSizes.CbvSrvUav);
     }
 
     // Depth buffer is special and does not get a render target.
@@ -793,7 +870,7 @@ void CreateConstantBufferAndViews(
             &cbvDesc,
             cpuHandle
         );
-        cpuHandle.Offset(1, app.cbvSrvUavDescriptorSize);
+        cpuHandle.Offset(1, G_IncrementSizes.CbvSrvUav);
     }
 }
 
@@ -887,19 +964,22 @@ void SetupLightBuffer(App& app)
 
 void SetupMaterialBuffer(App& app)
 {
-    auto& materialBuffer = app.MaterialBuffer;
-    materialBuffer.count = 0;
-
-    materialBuffer.descriptorReference = app.GBufferPass.descriptorHeap.AllocateDescriptors(MaxMaterialCount, "MaterialBuffer");
-    CreateConstantBufferAndViews(
-        app,
-        app.MaterialBuffer.constantBuffer,
-        sizeof(MaterialConstantData),
-        MaxMaterialCount,
-        materialBuffer.descriptorReference.CPUHandle()
+    ComPtr<ID3D12Resource> resource;
+    const UINT constantBufferSize = (UINT)sizeof(MaterialConstantData) * MaxMaterialCount;
+    CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_UPLOAD);
+    auto resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(constantBufferSize);
+    ASSERT_HRESULT(
+        app.device->CreateCommittedResource(
+            &heapProps,
+            D3D12_HEAP_FLAG_NONE,
+            &resourceDesc,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            nullptr,
+            IID_PPV_ARGS(&resource)
+        )
     );
 
-    ASSERT_HRESULT(materialBuffer.constantBuffer->Map(0, nullptr, reinterpret_cast<void**>(&app.MaterialBuffer.materials)));
+    app.materialConstantBuffer.Initialize(app.device.Get(), resource);
 }
 
 void SetupGBufferPass(App& app)
@@ -1146,8 +1226,8 @@ void InitD3D(App& app)
         );
     }
 
-    app.rtvDescriptorSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-    app.cbvSrvUavDescriptorSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    G_IncrementSizes.CbvSrvUav = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    G_IncrementSizes.Rtv = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
     SetupRenderTargets(app);
     SetupDepthStencil(app, false);
@@ -1202,7 +1282,6 @@ void InitApp(App& app, int argc, char** argv)
 {
     app.viewport = CD3DX12_VIEWPORT(0.0f, 0.0f, static_cast<float>(app.windowWidth), static_cast<float>(app.windowHeight));
     app.scissorRect = CD3DX12_RECT(0, 0, static_cast<LONG>(app.windowWidth), static_cast<LONG>(app.windowHeight));
-    app.rtvDescriptorSize = 0;
 
     for (int i = 0; i < argc; i++) {
         if (!strcmp(argv[i], "--datadir")) {
@@ -1324,9 +1403,9 @@ ComPtr<ID3D12Resource> CreateUploadHeap(App& app, const std::vector<D3D12_RESOUR
 }
 
 void CreateModelDescriptors(
-    Model& outputModel,
     App& app,
     const tinygltf::Model& inputModel,
+    Model& outputModel,
     const std::span<ComPtr<ID3D12Resource>> textureResources
 )
 {
@@ -1337,7 +1416,7 @@ void CreateModelDescriptors(
     }
     size_t numDescriptors = numConstantBuffers + inputModel.textures.size();
 
-    UINT incrementSize = app.cbvSrvUavDescriptorSize;
+    UINT incrementSize = G_IncrementSizes.CbvSrvUav;
 
     // Create per-primitive constant buffer
     ComPtr<ID3D12Resource> perPrimitiveConstantBuffer;
@@ -1375,6 +1454,59 @@ void CreateModelDescriptors(
     outputModel.perPrimitiveConstantBuffer = perPrimitiveConstantBuffer;
     CD3DX12_RANGE readRange(0, 0);
     ASSERT_HRESULT(perPrimitiveConstantBuffer->Map(0, &readRange, reinterpret_cast<void**>(&outputModel.perPrimitiveBufferPtr)));
+}
+
+void CreateModelMaterials(
+    App& app,
+    const tinygltf::Model& inputModel,
+    Model& outputModel,
+    size_t& startingMaterialIdx
+)
+{
+    // Allocate material constant buffers and create views
+    int materialCount = inputModel.materials.size();
+    auto descriptorReference = app.GBufferPass.descriptorHeap.AllocateDescriptors(materialCount, "model materials");
+    auto constantBufferSlice = app.materialConstantBuffer.Allocate(materialCount);
+    app.materialConstantBuffer.CreateViews(app.device.Get(), constantBufferSlice, descriptorReference.CPUHandle());
+    outputModel.baseMaterialDescriptor = descriptorReference;
+
+    auto baseTextureDescriptor = outputModel.baseTextureDescriptor;
+
+    startingMaterialIdx = app.materials.size();
+
+    for (int i = 0; i < materialCount; i++) {
+        auto& inputMaterial = inputModel.materials[i];
+
+        DescriptorReference baseColorTextureDescriptor;
+        DescriptorReference normalTextureDescriptor;
+        DescriptorReference metalRoughnessTextureDescriptor;
+
+        if (inputMaterial.pbrMetallicRoughness.baseColorTexture.index != -1) {
+            baseColorTextureDescriptor = baseTextureDescriptor + inputMaterial.pbrMetallicRoughness.baseColorTexture.index;
+        }
+        if (inputMaterial.normalTexture.index != -1) {
+            normalTextureDescriptor = baseTextureDescriptor + inputMaterial.normalTexture.index;
+        }
+        if (inputMaterial.pbrMetallicRoughness.metallicRoughnessTexture.index != -1) {
+            metalRoughnessTextureDescriptor = baseTextureDescriptor + inputMaterial.pbrMetallicRoughness.metallicRoughnessTexture.index;
+        }
+
+        MaterialType materialType = MaterialType_PBR;
+        if (inputMaterial.extensions.contains("KHR_materials_unlit")) {
+            materialType = MaterialType_Unlit;
+        }
+
+        Material material;
+        material.constantData = &constantBufferSlice.data[i];
+        material.materialType = materialType;
+        material.textureDescriptors.diffuse = baseColorTextureDescriptor;
+        material.textureDescriptors.normal = normalTextureDescriptor;
+        material.textureDescriptors.metalRoughness = metalRoughnessTextureDescriptor;
+        material.cbvDescriptor = descriptorReference + i;
+        material.name = inputMaterial.name;
+        material.UpdateConstantData();
+        app.materials.push_back(material);
+    }
 }
 
 D3D12_RESOURCE_DESC GetImageResourceDesc(const tinygltf::Image& image)
@@ -1597,7 +1729,8 @@ void ResolveMeshTransforms(
 void FinalizeModel(
     Model& outputModel,
     App& app,
-    const tinygltf::Model& inputModel
+    const tinygltf::Model& inputModel,
+    size_t startingMaterialIndex
 )
 {
     // Just storing these strings so that we don't have to keep the Model object around.
@@ -1632,8 +1765,6 @@ void FinalizeModel(
             Primitive drawCall;
 
             std::vector<D3D12_VERTEX_BUFFER_VIEW>& vertexBufferViews = drawCall.vertexBufferViews;
-
-            std::map<int, int> accessorToD3DBufferMap;
 
             // Track what addresses are mapped to a vertex buffer view.
             // 
@@ -1737,33 +1868,36 @@ void FinalizeModel(
                 }
             }
 
-            int diffuseIdx = -1;
-            int normalIdx = -1;
             if (primitive.material != -1) {
-                auto& materialBuffer = app.MaterialBuffer;
-                auto materialIndex = materialBuffer.count++;
-                drawCall.materialIndex = materialIndex;
-                auto& material = materialBuffer.materials[materialIndex];
-                const auto& gltfMaterial = inputModel.materials[primitive.material];
-                diffuseIdx = gltfMaterial.pbrMetallicRoughness.baseColorTexture.index;
-                normalIdx = gltfMaterial.normalTexture.index;
-                if (diffuseIdx != -1) {
-                    material.diffuseTextureIdx = outputModel.baseTextureDescriptor.index + diffuseIdx;
-                } else {
-                    material.diffuseTextureIdx = -1;
-                }
-                if (normalIdx != -1) {
-                    material.normalTextureIdx = outputModel.baseTextureDescriptor.index + normalIdx;
-                } else {
-                    material.normalTextureIdx = -1;
-                }
-                if (gltfMaterial.extensions.contains("KHR_materials_unlit")) {
-                    material.materialType = MaterialType_Unlit;
-                } else {
-                    material.materialType = MaterialType_PBR;
+                drawCall.materialIndex = startingMaterialIndex + primitive.material;
+
+                if (app.materials[drawCall.materialIndex].materialType == MaterialType_PBR) {
+                    drawCall.PSO = CreateMeshPBRPSO(
+                        app.psoManager,
+                        app.device.Get(),
+                        app.dataDir,
+                        app.rootSignature.Get(),
+                        drawCall.inputLayout
+                    );
+                } else if (app.materials[drawCall.materialIndex].materialType == MaterialType_Unlit) {
+                    drawCall.PSO = CreateMeshUnlitPSO(
+                        app.psoManager,
+                        app.device.Get(),
+                        app.dataDir,
+                        app.rootSignature.Get(),
+                        drawCall.inputLayout
+                    );
                 }
             } else {
+                // Just pray this will work
                 drawCall.materialIndex = -1;
+                drawCall.PSO = CreateMeshUnlitPSO(
+                    app.psoManager,
+                    app.device.Get(),
+                    app.dataDir,
+                    app.rootSignature.Get(),
+                    drawCall.inputLayout
+                );
             }
 
             {
@@ -1795,33 +1929,6 @@ void FinalizeModel(
     }
 
     ResolveMeshTransforms(inputModel, outputModel.meshes);
-
-    // FIXME: So many wasted PSOs.
-    for (auto& mesh : outputModel.meshes) {
-        for (auto& primitive : mesh.primitives) {
-            MaterialConstantData& material = app.MaterialBuffer.materials[primitive.materialIndex];
-            if (material.materialType == MaterialType_PBR) {
-                primitive.PSO = CreateMeshPBRPSO(
-                    app.psoManager,
-                    app.device.Get(),
-                    app.dataDir,
-                    app.rootSignature.Get(),
-                    primitive.inputLayout
-                );
-            } else if (material.materialType == MaterialType_Unlit) {
-                primitive.PSO = CreateMeshUnlitPSO(
-                    app.psoManager,
-                    app.device.Get(),
-                    app.dataDir,
-                    app.rootSignature.Get(),
-                    primitive.inputLayout
-                );
-            } else {
-                std::cout << "Unimplemented material type";
-                abort();
-            }
-        }
-    }
 }
 
 // For the time being we cannot handle GLTF meshes without normals, tangents and UVs.
@@ -1876,8 +1983,11 @@ void ProcessAssets(App& app, const AppAssets& assets)
             textureBuffers
         );
 
-        CreateModelDescriptors(model, app, gltfModel, textureBuffers);
-        FinalizeModel(model, app, gltfModel);
+        size_t startingMaterialIndex;
+
+        CreateModelDescriptors(app, gltfModel, model, textureBuffers);
+        CreateModelMaterials(app, gltfModel, model, startingMaterialIndex);
+        FinalizeModel(model, app, gltfModel, startingMaterialIndex);
 
         app.models.push_back(model);
 
@@ -2057,13 +2167,20 @@ void UpdateScene(App& app)
     }
 }
 
-void DrawModelCommandList(const Model& model, ID3D12GraphicsCommandList* commandList, int cbvOffsetIncrement)
+DescriptorReference GetMaterialDescriptor(const App& app, const Model& model, int materialIndex)
+{
+    return app.materials[materialIndex].cbvDescriptor;
+}
+
+void DrawModelCommandList(const App& app, const Model& model, ID3D12GraphicsCommandList* commandList)
 {
     int constantBufferIdx = model.primitiveDataDescriptors.index;
     for (const auto& mesh : model.meshes) {
         for (const auto& primitive : mesh.primitives) {
+            auto materialDescriptor = GetMaterialDescriptor(app, model, primitive.materialIndex);
+
             // Set the per-primitive constant buffer
-            UINT constantValues[2] = { constantBufferIdx, primitive.materialIndex };
+            UINT constantValues[2] = { constantBufferIdx, materialDescriptor.index };
             commandList->SetGraphicsRoot32BitConstants(0, 2, constantValues, 0);
             commandList->IASetPrimitiveTopology(primitive.primitiveTopology);
             commandList->SetPipelineState(primitive.PSO->Get());
@@ -2084,12 +2201,12 @@ void DrawFullscreenQuad(const App& app, ID3D12GraphicsCommandList* commandList)
 void BindAndClearGBufferRTVs(const App& app, ID3D12GraphicsCommandList* commandList)
 {
     CD3DX12_CPU_DESCRIPTOR_HANDLE renderTargetHandles[1 + GBuffer_RTVCount] = {};
-    CD3DX12_CPU_DESCRIPTOR_HANDLE backBufferHandle(app.rtvHeap->GetCPUDescriptorHandleForHeapStart(), app.frameIdx, app.rtvDescriptorSize);
-    CD3DX12_CPU_DESCRIPTOR_HANDLE gBufferHandle(app.rtvHeap->GetCPUDescriptorHandleForHeapStart(), FrameBufferCount, app.rtvDescriptorSize);
+    CD3DX12_CPU_DESCRIPTOR_HANDLE backBufferHandle(app.rtvHeap->GetCPUDescriptorHandleForHeapStart(), app.frameIdx, G_IncrementSizes.Rtv);
+    CD3DX12_CPU_DESCRIPTOR_HANDLE gBufferHandle(app.rtvHeap->GetCPUDescriptorHandleForHeapStart(), FrameBufferCount, G_IncrementSizes.Rtv);
     renderTargetHandles[0] = backBufferHandle;
     for (int i = 0; i < GBuffer_RTVCount; i++) {
         renderTargetHandles[i + 1] = gBufferHandle;
-        gBufferHandle.Offset(1, app.rtvDescriptorSize);
+        gBufferHandle.Offset(1, G_IncrementSizes.Rtv);
     }
 
     CD3DX12_CPU_DESCRIPTOR_HANDLE dsvHandle(app.dsHeap->GetCPUDescriptorHandleForHeapStart());
@@ -2143,7 +2260,7 @@ void GBufferPass(const App& app, ID3D12GraphicsCommandList* commandList)
     commandList->SetGraphicsRootSignature(app.rootSignature.Get());
 
     for (const auto& model : app.models) {
-        DrawModelCommandList(model, commandList, app.cbvSrvUavDescriptorSize);
+        DrawModelCommandList(app, model, commandList);
     }
 }
 
@@ -2151,7 +2268,7 @@ void FinalPass(const App& app, ID3D12GraphicsCommandList* commandList)
 {
     TransitionGBufferForLighting(app, commandList);
 
-    CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(app.rtvHeap->GetCPUDescriptorHandleForHeapStart(), app.frameIdx, app.rtvDescriptorSize);
+    CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(app.rtvHeap->GetCPUDescriptorHandleForHeapStart(), app.frameIdx, G_IncrementSizes.Rtv);
     commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
 
     {
@@ -2297,7 +2414,11 @@ void DrawLightsEditor(App& app)
         strcpy_s(labels[i], label.c_str());
     }
 
-    if (app.ImGui.lightsOpen && ImGui::Begin("Lights", &app.ImGui.lightsOpen, 0)) {
+    if (!app.ImGui.lightsOpen) {
+        return;
+    }
+
+    if (ImGui::Begin("Lights", &app.ImGui.lightsOpen, 0)) {
         if (ImGui::Button("New light")) {
             app.LightBuffer.count = glm::min(app.LightBuffer.count + 1, MaxLightCount);
         }
@@ -2329,9 +2450,9 @@ void DrawLightsEditor(App& app)
         } else {
             ImGui::Text("No light selected");
         }
-
-        ImGui::End();
     }
+
+    ImGui::End();
 }
 
 void DrawMenuBar(App& app)
@@ -2466,4 +2587,4 @@ int RunMDXR(int argc, char** argv)
 #endif
 
     return status;
-    }
+}
