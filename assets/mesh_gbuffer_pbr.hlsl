@@ -16,6 +16,7 @@ struct PSInput {
 };
 
 struct PSOutput {
+    float4 backBuffer : SV_TARGET0;
     float4 diffuse : SV_TARGET1;
     float4 normal : SV_TARGET2;
     float4 metalRoughness : SV_TARGET3;
@@ -60,6 +61,10 @@ PSOutput PSMain(PSInput input)
     PSOutput result;
 
     ConstantBuffer<MaterialData> mat = GetMaterial();
+
+    // We can write ambient light straight to the backbuffer.
+    float4 ambient = { 0.05, 0.05, 0.05, 1.0 };
+    result.backBuffer = ambient;
 
     // TODO: these checks be done through preprocessor and shader permutations instead
     if (mat.diffuseTextureIdx != -1) {

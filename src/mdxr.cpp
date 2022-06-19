@@ -411,7 +411,7 @@ struct ConstantBufferArena
 
 enum LightType {
     LightType_Point,
-    LightType_Spotlight,
+    LightType_Directional,
 };
 
 struct Light {
@@ -428,9 +428,9 @@ struct Light {
     void UpdateConstantData(glm::mat4 viewMatrix)
     {
         constantData->position = glm::vec4(position, 1.0f);
-        constantData->direction = glm::vec4(direction, 1.0f);
+        constantData->direction = glm::vec4(direction, 0.0f);
         constantData->positionViewSpace = viewMatrix * constantData->position;
-        constantData->directionViewSpace = viewMatrix * constantData->direction;
+        constantData->directionViewSpace = viewMatrix * glm::normalize(constantData->direction);
         constantData->colorIntensity = glm::vec4(color * intensity, 1.0f);
         constantData->range = range;
     }
@@ -516,8 +516,8 @@ struct App {
     } GBuffer;
 
     struct {
-        ManagedPSORef PSO;
-        ComPtr<ID3D12RootSignature> rootSignature;
+        ManagedPSORef pointLightPSO;
+        ManagedPSORef directionalLightPso;
     } LightPass;
 
     struct {
@@ -732,7 +732,7 @@ ManagedPSORef CreateMeshUnlitPSO(
     );
 }
 
-ManagedPSORef CreateGBufferLightingPSO(
+ManagedPSORef CreateDirectionalLightPSO(
     PSOManager& manager,
     ID3D12Device* device,
     const std::string& dataDir,
@@ -766,7 +766,48 @@ ManagedPSORef CreateGBufferLightingPSO(
         manager,
         device,
         dataDir,
-        "gbuffer_lighting",
+        "lighting_directional",
+        rootSignature,
+        inputLayout,
+        psoDesc
+    );
+}
+
+ManagedPSORef CreatePointLightPSO(
+    PSOManager& manager,
+    ID3D12Device* device,
+    const std::string& dataDir,
+    ID3D12RootSignature* rootSignature,
+    const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
+)
+{
+    // Unlike other PSOs, we go clockwise here.
+    CD3DX12_RASTERIZER_DESC rasterizerState(D3D12_DEFAULT);
+    auto psoDesc = DefaultPSODesc();
+    psoDesc.DepthStencilState.DepthEnable = FALSE;
+    psoDesc.DepthStencilState.StencilEnable = FALSE;
+    psoDesc.RasterizerState = rasterizerState;
+
+    // Blend settings for accumulation buffer
+    D3D12_RENDER_TARGET_BLEND_DESC blendDesc;
+    blendDesc.BlendEnable = TRUE;
+    blendDesc.LogicOpEnable = FALSE;
+    blendDesc.SrcBlend = D3D12_BLEND_ONE;
+    blendDesc.DestBlend = D3D12_BLEND_ONE;
+    blendDesc.BlendOp = D3D12_BLEND_OP_ADD;
+    blendDesc.SrcBlendAlpha = D3D12_BLEND_ONE;
+    blendDesc.DestBlendAlpha = D3D12_BLEND_ZERO;
+    blendDesc.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    blendDesc.LogicOp = D3D12_LOGIC_OP_NOOP;
+    blendDesc.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+    psoDesc.BlendState.RenderTarget[0] = blendDesc;
+
+    return CreatePSO(
+        manager,
+        device,
+        dataDir,
+        "lighting_point",
         rootSignature,
         inputLayout,
         psoDesc
@@ -1031,84 +1072,21 @@ void SetupGBufferPass(App& app)
 
 void SetupLightingPass(App& app)
 {
-    // {
-    //     D3D12_FEATURE_DATA_ROOT_SIGNATURE featureData = {};
-    //     featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_1;
-    //     if (FAILED(app.device->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &featureData, sizeof(featureData)))) {
-    //         featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_0;
-    //     }
-
-    //     CD3DX12_DESCRIPTOR_RANGE1 ranges[3];
-    //     CD3DX12_ROOT_PARAMETER1 rootParameters[3];
-
-    //     ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, GBuffer_Count, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE);
-    //     ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 1, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE);
-    //     ranges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, -1, 2, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE);
-
-    //     // GBuffer
-    //     rootParameters[0].InitAsDescriptorTable(1, &ranges[0], D3D12_SHADER_VISIBILITY_PIXEL);
-    //     // Light index
-    //     rootParameters[1].InitAsConstants(1, 0);
-    //     // Pass data & lights buffer
-    //     rootParameters[2].InitAsDescriptorTable(2, &ranges[1], D3D12_SHADER_VISIBILITY_PIXEL);
-
-    //     D3D12_ROOT_SIGNATURE_FLAGS rootSignatureFlags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
-
-    //     D3D12_STATIC_SAMPLER_DESC sampler = {};
-    //     sampler.Filter = D3D12_FILTER_ANISOTROPIC;
-    //     sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
-    //     sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
-    //     sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
-    //     sampler.MipLODBias = 0;
-    //     sampler.MaxAnisotropy = 0;
-    //     sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
-    //     sampler.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
-    //     sampler.MinLOD = 0.0f;
-    //     sampler.MaxLOD = D3D12_FLOAT32_MAX;
-    //     sampler.ShaderRegister = 0;
-    //     sampler.RegisterSpace = 0;
-    //     sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-
-    //     CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rootSignatureDesc;
-    //     rootSignatureDesc.Init_1_1(
-    //         _countof(rootParameters),
-    //         rootParameters,
-    //         1,
-    //         &sampler,
-    //         rootSignatureFlags
-    //     );
-
-    //     ComPtr<ID3DBlob> signature;
-    //     ComPtr<ID3DBlob> error;
-    //     if (!SUCCEEDED(
-    //         D3DX12SerializeVersionedRootSignature(
-    //             &rootSignatureDesc,
-    //             featureData.HighestVersion,
-    //             &signature,
-    //             &error
-    //         )
-    //     )) {
-    //         std::cout << "Error: root signature compilation failed\n";
-    //         std::cout << (char*)error->GetBufferPointer();
-    //         abort();
-    //     }
-    //     ASSERT_HRESULT(
-    //         app.device->CreateRootSignature(
-    //             0,
-    //             signature->GetBufferPointer(),
-    //             signature->GetBufferSize(),
-    //             IID_PPV_ARGS(&app.LightPass.rootSignature)
-    //         )
-    //     );
-    // }
-
     SetupLightBuffer(app);
 
     // GBuffer lighting does not need an input layout, as the vertices are created
     // entirely in the vertex buffer without any input vertices.
     std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout;
 
-    app.LightPass.PSO = CreateGBufferLightingPSO(
+    app.LightPass.pointLightPSO = CreatePointLightPSO(
+        app.psoManager,
+        app.device.Get(),
+        app.dataDir,
+        app.rootSignature.Get(),
+        inputLayout
+    );
+
+    app.LightPass.directionalLightPso = CreateDirectionalLightPSO(
         app.psoManager,
         app.device.Get(),
         app.dataDir,
@@ -1382,7 +1360,7 @@ AppAssets LoadAssets(App& app)
     LoadModelAsset(app, assets, loader, "/floor/floor.gltf");
     LoadModelAsset(app, assets, loader, "/FlightHelmet/FlightHelmet.gltf");
     // LoadModelAsset(app, assets, loader, "/Suzanne.gltf");
-    LoadModelAsset(app, assets, loader, "/skybox/skybox.gltf");
+    // LoadModelAsset(app, assets, loader, "/skybox/skybox.gltf");
 
     return assets;
 }
@@ -2289,7 +2267,7 @@ void GBufferPass(const App& app, ID3D12GraphicsCommandList* commandList)
     }
 }
 
-void FinalPass(const App& app, ID3D12GraphicsCommandList* commandList)
+void LightPass(const App& app, ID3D12GraphicsCommandList* commandList)
 {
     TransitionGBufferForLighting(app, commandList);
 
@@ -2304,16 +2282,35 @@ void FinalPass(const App& app, ID3D12GraphicsCommandList* commandList)
         commandList->SetGraphicsRootSignature(app.rootSignature.Get());
 
         commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-        commandList->SetPipelineState(app.LightPass.PSO->Get());
+
+        // Point lights
+        commandList->SetPipelineState(app.LightPass.pointLightPSO->Get());
         for (int i = 0; i < app.LightBuffer.count; i++) {
-            UINT constantValues[2] = {
-                app.LightBuffer.cbvHandle.index + i + 1,
-                app.LightBuffer.cbvHandle.index
-            };
-            commandList->SetGraphicsRoot32BitConstants(0, 2, constantValues, 2);
-            // commandList->SetGraphicsRoot32BitConstant(ConstantIndex_Light, app.LightBuffer.cbvHandle.index + i + 1, 0);
-            // commandList->SetGraphicsRoot32BitConstant(ConstantIndex_LightPassData, app.LightBuffer.cbvHandle.index, 0);
-            DrawFullscreenQuad(app, commandList);
+            if (app.lights[i].lightType == LightType_Point) {
+                UINT constantValues[2] = {
+                    app.LightBuffer.cbvHandle.index + i + 1,
+                    app.LightBuffer.cbvHandle.index
+                };
+                commandList->SetGraphicsRoot32BitConstants(0, 2, constantValues, 2);
+                // commandList->SetGraphicsRoot32BitConstant(ConstantIndex_Light, app.LightBuffer.cbvHandle.index + i + 1, 0);
+                // commandList->SetGraphicsRoot32BitConstant(ConstantIndex_LightPassData, app.LightBuffer.cbvHandle.index, 0);
+                DrawFullscreenQuad(app, commandList);
+            }
+        }
+
+        // Directional lights
+        commandList->SetPipelineState(app.LightPass.directionalLightPso->Get());
+        for (int i = 0; i < app.LightBuffer.count; i++) {
+            if (app.lights[i].lightType == LightType_Directional) {
+                UINT constantValues[2] = {
+                    app.LightBuffer.cbvHandle.index + i + 1,
+                    app.LightBuffer.cbvHandle.index
+                };
+                commandList->SetGraphicsRoot32BitConstants(0, 2, constantValues, 2);
+                // commandList->SetGraphicsRoot32BitConstant(ConstantIndex_Light, app.LightBuffer.cbvHandle.index + i + 1, 0);
+                // commandList->SetGraphicsRoot32BitConstant(ConstantIndex_LightPassData, app.LightBuffer.cbvHandle.index, 0);
+                DrawFullscreenQuad(app, commandList);
+            }
         }
     }
 
@@ -2344,7 +2341,7 @@ void BuildCommandList(const App& app)
     commandList->RSSetScissorRects(1, &app.scissorRect);
 
     GBufferPass(app, commandList);
-    FinalPass(app, commandList);
+    LightPass(app, commandList);
 
     ASSERT_HRESULT(
         commandList->Close()
@@ -2468,8 +2465,28 @@ void DrawLightsEditor(App& app)
         ImGui::Separator();
         if (selectedLightIdx != -1) {
             auto& light = app.lights[selectedLightIdx];
+
+            static const char* LightTypeLabels[] = {
+                "Point",
+                "Directional"
+            };
+
+            if (ImGui::BeginCombo("Light Type", LightTypeLabels[light.lightType])) {
+                for (int i = 0; i < _countof(LightTypeLabels); i++) {
+                    if (ImGui::Selectable(LightTypeLabels[i], i == light.lightType)) {
+                        light.lightType = (LightType)i;
+                    }
+                }
+                ImGui::EndCombo();
+            }
+
             ImGui::ColorEdit3("Color", (float*)&light.color, ImGuiColorEditFlags_PickerHueWheel);
-            ImGui::DragFloat3("Position", (float*)&light.position, 0.1);
+            if (light.lightType == LightType_Point) {
+                ImGui::DragFloat3("Position", (float*)&light.position, 0.1);
+            }
+            if (light.lightType == LightType_Directional) {
+                ImGui::DragFloat3("Direction", (float*)&light.direction, 0.1);
+            }
             ImGui::DragFloat("Range", &light.range, 0.1f, 0.0f, 1000.0f, nullptr, 1.0f);
             ImGui::DragFloat("Intensity", &light.intensity, 0.05f, 0.0f, 100.0f, nullptr, 1.0f);
         } else {

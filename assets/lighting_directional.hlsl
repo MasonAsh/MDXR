@@ -1,4 +1,5 @@
 #include "include/common.hlsl"
+#include "include/pbr.hlsl"
 
 struct PSInput {
     float4 pos : SV_POSITION;
@@ -24,37 +25,6 @@ float4 ScreenToView(float4 screen)
     float2 texcoord = screen.xy;
     float4 clip = float4(float2(texcoord.x, 1.0f - texcoord.y) * 2.0f - 1.0f, screen.z, screen.w);
     return ClipToView(clip);
-}
-
-float DistributionGGX(float NdotH, float roughness)
-{
-    float a = roughness * roughness;
-    float a2 = a * a;
-    float NdotH2 = NdotH * NdotH;
-    float numerator = a2;
-    float denom = (NdotH2 * (a2 - 1.0f) + 1.0f);
-    denom = PI * denom * denom;
-
-    return numerator / denom;
-}
-
-float GSchlickGGX(float cosTheta, float k)
-{
-    float denom = cosTheta * (1.0f - k) + k;
-    
-    return cosTheta / denom;
-}
-
-float GeometrySmith(float cosWi, float cosWo, float roughness)
-{
-    float r = roughness + 1.0f;
-    float k = (r * r) / 8.0f;
-    return GSchlickGGX(cosWi, k) * GSchlickGGX(cosWo, k);
-}
-
-float3 FSchlick(float cosTheta, float3 F0)
-{
-    return F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
 }
 
 PSInput VSMain(uint id : SV_VertexID)
@@ -89,57 +59,25 @@ float4 PSMain(PSInput input) : SV_TARGET
     float4 viewPos = ScreenToView(float4(input.uv, depth, 1.0f));
 
     float3 lightToFragment = (-viewPos.xyz) -  (-light.positionViewSpace.xyz);
-    float distance = length(lightToFragment);
-
-    // Light direction to fragment
-    float3 Wi = lightToFragment / distance;
-    // Direction from fragment to eye
-    float3 Wo = normalize(-viewPos.xyz);
-    // halfway vector
-    float3 H = normalize(Wi + Wo);
+    float attenuation = 1.0f;
 
     float3 N = normal.xyz;
 
-    float attenuation = 1.0f / (distance * distance);
+    // Light direction to fragment
+    float3 Wi = normalize(light.directionViewSpace.xyz);
+    // Direction from fragment to eye
+    float3 Wo = normalize(-viewPos.xyz);
 
-    float3 radiance = light.colorIntensity.xyz * attenuation;
+    if (passData.debug) return float4(Wi, 1);
 
-    float3 F0 = 0.04;
-    F0 = lerp(F0, baseColor, metallic);
-
-    float cosWi = max(0.0, dot(N, Wi));
-    float cosWh = max(0.0, dot(N, H));
-    float cosWo = max(0.0, dot(N, Wo));
-
-    float3 F = FSchlick(max(0.0, dot(H, Wo)), F0);
-    float G = DistributionGGX(cosWh, roughness);
-    float D = GeometrySmith(cosWi, cosWo, roughness);
-
-    float3 kS = F;
-    float3 kD = lerp(float3(1,1,1) - F, float3(0, 0, 0), metallic);
-    // float3 kD = 1.0f - kS;
-    // kD *= 1.0f - metallic;
-
-    float3 numerator = F * D * G;
-    //float denominator = 4.0f * max(dot(N, Wo), 0.0) * max(dot(N, Wi), 0.0) + 0.0001;
-    float denominator = max(Epsilon, 4.0 * cosWi * cosWo);
-    float3 specular = numerator / denominator;
-
-    float3 diffuseBRDF = kD * baseColor;
-
-    float3 Lo = (diffuseBRDF + specular) * radiance * cosWi;
-
-    float4 color = float4(Lo, 1.0f);
-
-    color = color / (color + 1.0f);
-    color = pow(color, 1.0/2.2);
-
-    if (passData.debug) {
-        float4 debug;
-        debug.a = 1.0f;
-        debug.rgb = specular * radiance * cosWi;
-        return debug;
-    }
-
-    return color;
+    return ShadePBR(
+        light.colorIntensity.xyz,
+        baseColor,
+        N,
+        roughness,
+        metallic,
+        Wi,
+        Wo,
+        attenuation
+    );
 }
