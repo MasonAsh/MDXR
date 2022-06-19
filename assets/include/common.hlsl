@@ -16,10 +16,9 @@ struct LightConstantData {
     float4 positionViewSpace;
     float4 directionViewSpace;
 
-    float4 color;
+    float4 colorIntensity;
 
     float range;
-    float intensity;
 };
 
 struct LightPassConstantData {
@@ -34,6 +33,9 @@ cbuffer Indices : register(b0) {
     const uint g_LightIndex;
     const uint g_LightPassDataIndex;
 };
+
+static const float PI = 3.14159265f;
+static const float Epsilon = 0.00001;
 
 SamplerState g_sampler : register(s0);
 
@@ -63,4 +65,18 @@ Texture2D GetDiffuseTexture(MaterialData material) {
 
 Texture2D GetNormalTexture(MaterialData material) {
     return ResourceDescriptorHeap[material.normalTextureIdx];
+}
+
+Texture2D GetMetalRoughnessTexture(MaterialData material) {
+    return ResourceDescriptorHeap[material.metalRoughnessIdx];
+}
+
+float3 make_float3(float value)
+{
+    return float3(value, value, value);
+}
+
+float4 make_float4(float value)
+{
+    return float4(value, value, value, value);
 }

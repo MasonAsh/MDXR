@@ -177,7 +177,7 @@ struct Model {
 };
 
 struct AppAssets {
-    tinygltf::Model models[4];
+    std::vector<tinygltf::Model> models;
 };
 
 // Fixed capacity descriptor heap. Aborts when the size outgrows initial capacity.
@@ -290,6 +290,7 @@ struct MouseState {
 enum GBufferTarget {
     GBuffer_Diffuse,
     GBuffer_Normal,
+    GBuffer_MetalRoughness,
     GBuffer_Depth,
     GBuffer_Count,
 };
@@ -311,12 +312,11 @@ struct LightConstantData {
     glm::vec4 positionViewSpace;
     glm::vec4 directionViewSpace;
 
-    glm::vec4 color;
+    glm::vec4 colorIntensity;
 
     float range;
-    float intensity;
 
-    float pad[42];
+    float pad[43];
 };
 static_assert((sizeof(LightConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
 
@@ -363,7 +363,7 @@ struct ConstantBufferArena
 {
     static_assert((sizeof(T) % 256) == 0, "T must be 256-byte aligned");
 
-    void Initialize(ID3D12Device* device, ComPtr<ID3D12Resource> resource)
+    void Initialize(ID3D12Device* device, ComPtr<ID3D12Resource> resource, UINT64 offsetInBuffer)
     {
         this->resource = resource;
         this->capacity = resource->GetDesc().Width / sizeof(T);
@@ -409,12 +409,41 @@ struct ConstantBufferArena
     int size = 0;
 };
 
+enum LightType {
+    LightType_Point,
+    LightType_Spotlight,
+};
+
+struct Light {
+    LightConstantData* constantData;
+    glm::vec3 position;
+    glm::vec3 direction;
+
+    glm::vec3 color;
+    float intensity;
+    float range;
+
+    LightType lightType;
+
+    void UpdateConstantData(glm::mat4 viewMatrix)
+    {
+        constantData->position = glm::vec4(position, 1.0f);
+        constantData->direction = glm::vec4(direction, 1.0f);
+        constantData->positionViewSpace = viewMatrix * constantData->position;
+        constantData->directionViewSpace = viewMatrix * constantData->direction;
+        constantData->colorIntensity = glm::vec4(color * intensity, 1.0f);
+        constantData->range = range;
+    }
+};
+
 struct App {
     std::string dataDir;
     std::wstring wDataDir;
 
     SDL_Window* window;
     HWND hwnd;
+
+    HANDLE shaderWatchHandle;
 
     bool running;
     long long startTick;
@@ -478,6 +507,7 @@ struct App {
     // } MaterialBuffer;
 
     ConstantBufferArena<MaterialConstantData> materialConstantBuffer;
+    std::vector<Material> materials;
 
     DescriptorArena lightingPassDescriptorArena;
     struct {
@@ -496,14 +526,14 @@ struct App {
         // These two are stored in the same constant buffer.
         // The lights are stored at offset (LightPassConstantData)
         LightPassConstantData* passData;
-        LightConstantData* lights;
+        LightConstantData* lightConstantData;
 
         DescriptorReference cbvHandle;
 
         int count;
     } LightBuffer;
 
-    std::vector<Material> materials;
+    std::array<Light, MaxLightCount> lights;
 
     PSOManager psoManager;
 };
@@ -665,7 +695,7 @@ ManagedPSORef CreateMeshPBRPSO(
     auto psoDesc = DefaultPSODesc();
     psoDesc.NumRenderTargets = GBuffer_RTVCount + 1;
     for (int i = 1; i < psoDesc.NumRenderTargets; i++) {
-        psoDesc.RTVFormats[i] = GBufferResourceDesc((GBufferTarget)i, 0, 0).Format;
+        psoDesc.RTVFormats[i] = GBufferResourceDesc((GBufferTarget)(i - 1), 0, 0).Format;
     }
     return CreatePSO(
         manager,
@@ -689,7 +719,7 @@ ManagedPSORef CreateMeshUnlitPSO(
     auto psoDesc = DefaultPSODesc();
     psoDesc.NumRenderTargets = GBuffer_RTVCount + 1;
     for (int i = 1; i < psoDesc.NumRenderTargets; i++) {
-        psoDesc.RTVFormats[i] = GBufferResourceDesc((GBufferTarget)i, 0, 0).Format;
+        psoDesc.RTVFormats[i] = GBufferResourceDesc((GBufferTarget)(i - 1), 0, 0).Format;
     }
     return CreatePSO(
         manager,
@@ -759,6 +789,7 @@ D3D12_RESOURCE_DESC GBufferResourceDesc(GBufferTarget target, int windowWidth, i
     switch (target)
     {
     case GBuffer_Diffuse:
+    case GBuffer_MetalRoughness:
         desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         break;
     case GBuffer_Normal:
@@ -956,10 +987,15 @@ void SetupLightBuffer(App& app)
 
     app.LightBuffer.constantBuffer->Map(0, nullptr, (void**)&app.LightBuffer.passData);
     // Lights are stored immediately after the pass data
-    app.LightBuffer.lights = reinterpret_cast<LightConstantData*>(app.LightBuffer.passData + 1);
+    app.LightBuffer.lightConstantData = reinterpret_cast<LightConstantData*>(app.LightBuffer.passData + 1);
     app.LightBuffer.cbvHandle = descriptorHandle;
 
     app.LightBuffer.passData->baseGBufferIndex = app.GBuffer.baseSrvReference.index;
+
+    for (int i = 0; i < MaxLightCount; i++) {
+        // Link convenient light structures back to the constant buffer
+        app.lights[i].constantData = &app.LightBuffer.lightConstantData[i];
+    }
 }
 
 void SetupMaterialBuffer(App& app)
@@ -979,7 +1015,7 @@ void SetupMaterialBuffer(App& app)
         )
     );
 
-    app.materialConstantBuffer.Initialize(app.device.Get(), resource);
+    app.materialConstantBuffer.Initialize(app.device.Get(), resource, 0);
 }
 
 void SetupGBufferPass(App& app)
@@ -1278,6 +1314,12 @@ void InitWindow(App& app)
     app.keyState = SDL_GetKeyboardState(nullptr);
 }
 
+void CreateDataDirWatchHandle(App& app)
+{
+    app.shaderWatchHandle = FindFirstChangeNotificationW(app.wDataDir.c_str(), FALSE, FILE_NOTIFY_CHANGE_LAST_WRITE);
+    assert(app.shaderWatchHandle != INVALID_HANDLE_VALUE);
+}
+
 void InitApp(App& app, int argc, char** argv)
 {
     app.viewport = CD3DX12_VIEWPORT(0.0f, 0.0f, static_cast<float>(app.windowWidth), static_cast<float>(app.windowHeight));
@@ -1298,6 +1340,7 @@ void InitApp(App& app, int argc, char** argv)
     }
 
     app.wDataDir = convert_to_wstring(app.dataDir);
+    CreateDataDirWatchHandle(app);
 }
 
 
@@ -1312,6 +1355,22 @@ void WaitForPreviousFrame(App& app)
     app.frameIdx = app.swapChain->GetCurrentBackBufferIndex();
 }
 
+void LoadModelAsset(const App& app, AppAssets& assets, tinygltf::TinyGLTF& loader, const std::string& dataPath)
+{
+    tinygltf::Model model;
+    assets.models.push_back(model);
+    std::string err;
+    std::string warn;
+    CHECK(
+        loader.LoadASCIIFromFile(
+            &assets.models.back(),
+            &err,
+            &warn,
+            app.dataDir + dataPath
+        )
+    );
+}
+
 AppAssets LoadAssets(App& app)
 {
     AppAssets assets;
@@ -1320,48 +1379,10 @@ AppAssets LoadAssets(App& app)
     std::string err;
     std::string warn;
 
-    CHECK(
-        loader.LoadASCIIFromFile(
-            &assets.models[0],
-            &err,
-            &warn,
-            app.dataDir + "/floor/floor.gltf"
-        )
-    );
-
-    CHECK(
-        loader.LoadASCIIFromFile(
-            &assets.models[1],
-            &err,
-            &warn,
-            app.dataDir + "/FlightHelmet/FlightHelmet.gltf"
-        )
-    );
-
-    CHECK(
-        loader.LoadASCIIFromFile(
-            &assets.models[2],
-            &err,
-            &warn,
-            app.dataDir + "/Duck.gltf"
-        )
-    );
-    glm::dmat4 boxTransform(1.0);
-    boxTransform = glm::scale(boxTransform, glm::dvec3(0.08));
-    boxTransform = glm::translate(boxTransform, glm::dvec3(-120.0, 120.0, 160.0));
-    boxTransform = glm::rotate(boxTransform, glm::radians(290.0), glm::dvec3(0.0, 1.0, 0.0));
-    auto valuePtr = glm::value_ptr(boxTransform);
-    std::vector<double> vectorValues(valuePtr, valuePtr + 16);
-    assets.models[2].nodes[2].matrix = vectorValues;
-
-    CHECK(
-        loader.LoadASCIIFromFile(
-            &assets.models[3],
-            &err,
-            &warn,
-            app.dataDir + "/skybox/skybox.gltf"
-        )
-    );
+    LoadModelAsset(app, assets, loader, "/floor/floor.gltf");
+    LoadModelAsset(app, assets, loader, "/FlightHelmet/FlightHelmet.gltf");
+    // LoadModelAsset(app, assets, loader, "/Suzanne.gltf");
+    LoadModelAsset(app, assets, loader, "/skybox/skybox.gltf");
 
     return assets;
 }
@@ -1693,9 +1714,10 @@ glm::mat4 GetNodeTransfomMatrix(const tinygltf::Node& node) {
             scale = glm::make_vec3(scaleData);
         }
 
+        glm::mat4 modelMatrix(1.0f);
         glm::mat4 T = glm::translate(glm::mat4(1.0f), translate);
-        glm::mat4 R = glm::toMat4(rotation);
         glm::mat4 S = glm::scale(glm::mat4(1.0f), scale);
+        glm::mat4 R = glm::toMat4(rotation);
         return S * R * T;
     }
 }
@@ -2060,10 +2082,11 @@ void InitializeLights(App& app)
         float angle = i * glm::two_pi<float>() / 4;
         float x = cos(angle);
         float z = sin(angle);
-        app.LightBuffer.lights[i].color = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f);
-        app.LightBuffer.lights[i].intensity = 1.5f;
-        app.LightBuffer.lights[i].position = glm::vec4(x, 2.0f, z, 1.0f);
-        app.LightBuffer.lights[i].range = 5.0f;
+        app.lights[i].color = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f);
+        app.lights[i].intensity = 1.5f;
+        app.lights[i].position = glm::vec3(x, 2.0f, z);
+        app.lights[i].direction = glm::vec3(0.0f, 0.0f, 0.0f);
+        app.lights[i].range = 5.0f;
     }
 }
 
@@ -2091,10 +2114,9 @@ void UpdatePerPrimitiveConstantBuffers(Model& model, const glm::mat4& projection
 
 void UpdateLightConstantBuffers(App& app, const glm::mat4& projection, const glm::mat4& view) {
     app.LightBuffer.passData->inverseProjectionMatrix = glm::inverse(projection);
+
     for (int i = 0; i < app.LightBuffer.count; i++) {
-        auto& lightData = app.LightBuffer.lights[i];
-        lightData.positionViewSpace = view * lightData.position;
-        lightData.directionViewSpace = view * lightData.direction;
+        app.lights[i].UpdateConstantData(view);
     }
 }
 
@@ -2200,6 +2222,9 @@ void DrawFullscreenQuad(const App& app, ID3D12GraphicsCommandList* commandList)
 
 void BindAndClearGBufferRTVs(const App& app, ID3D12GraphicsCommandList* commandList)
 {
+    // For GBuffer pass, we bind the back buffer handle, followed by all the gbuffer handles.
+    // Unlit/ambient data will be written directly to backbuffer, while all the PBR stuff will
+    // be written to the GBuffer as normal.
     CD3DX12_CPU_DESCRIPTOR_HANDLE renderTargetHandles[1 + GBuffer_RTVCount] = {};
     CD3DX12_CPU_DESCRIPTOR_HANDLE backBufferHandle(app.rtvHeap->GetCPUDescriptorHandleForHeapStart(), app.frameIdx, G_IncrementSizes.Rtv);
     CD3DX12_CPU_DESCRIPTOR_HANDLE gBufferHandle(app.rtvHeap->GetCPUDescriptorHandleForHeapStart(), FrameBufferCount, G_IncrementSizes.Rtv);
@@ -2442,7 +2467,7 @@ void DrawLightsEditor(App& app)
 
         ImGui::Separator();
         if (selectedLightIdx != -1) {
-            auto& light = app.LightBuffer.lights[selectedLightIdx];
+            auto& light = app.lights[selectedLightIdx];
             ImGui::ColorEdit3("Color", (float*)&light.color, ImGuiColorEditFlags_PickerHueWheel);
             ImGui::DragFloat3("Position", (float*)&light.position, 0.1);
             ImGui::DragFloat("Range", &light.range, 0.1f, 0.0f, 1000.0f, nullptr, 1.0f);
@@ -2486,6 +2511,16 @@ void BeginGUI(App& app)
 
     DrawLightsEditor(app);
     DrawMenuBar(app);
+}
+
+void ReloadIfShaderChanged(App& app)
+{
+    auto status = WaitForSingleObject(app.shaderWatchHandle, 0);
+    if (status == WAIT_OBJECT_0) {
+        std::cout << "Data directory changed. Reloading shaders.\n";
+        app.psoManager.reload(app.device.Get());
+        CreateDataDirWatchHandle(app);
+    }
 }
 
 int RunApp(int argc, char** argv)
@@ -2539,6 +2574,8 @@ int RunApp(int argc, char** argv)
                 }
             }
         }
+
+        ReloadIfShaderChanged(app);
 
         buttonState = SDL_GetMouseState(&mouseX, &mouseY);
 

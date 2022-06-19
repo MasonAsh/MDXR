@@ -12,11 +12,14 @@
 #include "glm/glm.hpp"
 
 #define ASSERT_HRESULT(hr) \
-    if (!SUCCEEDED((hr))) { \
-        _com_error err(hr); \
+    { \
+    HRESULT val = (hr); \
+    if (!SUCCEEDED(val)) { \
+        _com_error err(val); \
         LPCTSTR errMsg = err.ErrorMessage(); \
-        std::cout << "Failed HRESULT(" << hr << "): " << errMsg << "\n"; \
+        std::cout << "Failed HRESULT(" << val << "): " << errMsg << "\n"; \
         abort(); \
+    }\
     }
 
 inline std::wstring convert_to_wstring(std::string input)

@@ -18,6 +18,7 @@ struct PSInput {
 struct PSOutput {
     float4 diffuse : SV_TARGET1;
     float4 normal : SV_TARGET2;
+    float4 metalRoughness : SV_TARGET3;
 };
 
 float3 ExpandNormal(float3 n)
@@ -69,15 +70,23 @@ PSOutput PSMain(PSInput input)
     }
 
     if (mat.normalTextureIdx != -1) {
-        Texture2D normalMap = GetNormalTexture(mat);
         float3x3 TBN = float3x3(
             normalize(input.tangentVS),
             normalize(input.binormalVS),
             normalize(input.normalVS)
         );
+        Texture2D normalMap = GetNormalTexture(mat);
         result.normal = DoNormalMap(normalMap, TBN, input.uv);
     } else {
-        result.normal = float4(input.normalVS, 1.0f);
+        result.normal = float4(normalize(input.normalVS), 0.0f);
+    }
+
+    if (mat.metalRoughnessIdx != -1) {
+        Texture2D metalRoughness = GetMetalRoughnessTexture(mat);
+        result.metalRoughness = metalRoughness.Sample(g_sampler, input.uv);
+    } else {
+        // Default to non-metal with 0.5 roughness
+        result.metalRoughness = float4(0.0f, 1.0f, 0.0f, 1.0f);
     }
 
     return result;
