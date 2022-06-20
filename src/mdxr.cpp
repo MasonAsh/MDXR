@@ -16,9 +16,11 @@
 #include <ranges>
 #include <glm/gtc/type_ptr.hpp>
 #include <glm/gtx/quaternion.hpp>
+#include <glm/gtx/euler_angles.hpp>
 #include "imgui.h"
 #include "imgui_impl_dx12.h"
 #include "imgui_impl_sdl.h"
+#include "tinyfiledialogs.h"
 
 using namespace std::chrono;
 
@@ -62,12 +64,15 @@ struct ManagedPSO {
     {
         ComPtr<ID3DBlob> vertexShader;
         ComPtr<ID3DBlob> pixelShader;
-        ASSERT_HRESULT(
-            D3DReadFileToBlob(vertexShaderPath.c_str(), &vertexShader)
-        );
-        ASSERT_HRESULT(
-            D3DReadFileToBlob(pixelShaderPath.c_str(), &pixelShader)
-        );
+        if (!SUCCEEDED(D3DReadFileToBlob(vertexShaderPath.c_str(), &vertexShader))) {
+            std::wcout << "Failed to read vertex shader " << vertexShader << "\n";
+            return;
+        }
+        if (!SUCCEEDED(D3DReadFileToBlob(pixelShaderPath.c_str(), &pixelShader))) {
+            std::wcout << "Failed to read pixel shader " << pixelShaderPath << "\n";
+            return;
+        }
+
         desc.VS = { reinterpret_cast<UINT8*>(vertexShader->GetBufferPointer()), vertexShader->GetBufferSize() };
         desc.PS = { reinterpret_cast<UINT8*>(pixelShader->GetBufferPointer()), pixelShader->GetBufferSize() };
         ID3D12PipelineState* NewPSO;
@@ -99,10 +104,11 @@ struct PSOManager {
 enum MaterialType {
     MaterialType_Unlit,
     MaterialType_PBR,
+    MaterialType_AlphaBlendPBR,
 };
 
 struct MaterialConstantData {
-    UINT diffuseTextureIdx;
+    UINT baseColorTextureIdx;
     UINT normalTextureIdx;
     UINT metalRoughnessTextureIdx;
 
@@ -160,7 +166,15 @@ struct Primitive {
 struct Mesh {
     std::vector<Primitive> primitives;
 
-    glm::mat4 modelMatrix;
+    // This is the base transform as defined in the GLTF model
+    glm::mat4 baseModelTransform;
+
+    // These are offsets of baseModelTransform that can be applied live.
+    glm::vec3 translation;
+    glm::vec3 euler;
+    glm::vec3 scale = glm::vec3(1.0f);
+
+    std::string name;
 };
 
 struct Model {
@@ -288,7 +302,7 @@ struct MouseState {
 
 
 enum GBufferTarget {
-    GBuffer_Diffuse,
+    GBuffer_BaseColor,
     GBuffer_Normal,
     GBuffer_MetalRoughness,
     GBuffer_Depth,
@@ -316,12 +330,14 @@ struct LightConstantData {
 
     float range;
 
-    float pad[43];
+    UINT lightType;
+
+    float pad[42];
 };
 static_assert((sizeof(LightConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
 
 struct MaterialTextureDescriptors {
-    DescriptorReference diffuse;
+    DescriptorReference baseColor;
     DescriptorReference normal;
     DescriptorReference metalRoughness;
 };
@@ -343,7 +359,7 @@ struct Material {
 
     void UpdateConstantData()
     {
-        constantData->diffuseTextureIdx = textureDescriptors.diffuse.index;
+        constantData->baseColorTextureIdx = textureDescriptors.baseColor.index;
         constantData->normalTextureIdx = textureDescriptors.normal.index;
         constantData->metalRoughnessTextureIdx = textureDescriptors.metalRoughness.index;
     }
@@ -433,6 +449,7 @@ struct Light {
         constantData->directionViewSpace = viewMatrix * glm::normalize(constantData->direction);
         constantData->colorIntensity = glm::vec4(color * intensity, 1.0f);
         constantData->range = range;
+        constantData->lightType = (UINT)lightType;
     }
 };
 
@@ -476,8 +493,6 @@ struct App {
     ComPtr<ID3D12GraphicsCommandList> copyCommandList;
     IncrementalFence copyFence;
 
-    ComPtr<ID3D12DescriptorHeap> srvHeap;
-
     // FIXME: Models should only exist as a concept in the scene graph.
     // there is no reason the renderer itself has to group it like this.
     // All the model data should be handled by special allocators and grouped into
@@ -493,6 +508,7 @@ struct App {
     struct {
         ComPtr<ID3D12DescriptorHeap> srvHeap;
         bool lightsOpen = true;
+        bool meshesOpen = true;
     } ImGui;
 
     struct {
@@ -509,7 +525,7 @@ struct App {
     ConstantBufferArena<MaterialConstantData> materialConstantBuffer;
     std::vector<Material> materials;
 
-    DescriptorArena lightingPassDescriptorArena;
+    // DescriptorArena lightingPassDescriptorArena;
     struct {
         std::array<ComPtr<ID3D12Resource>, GBuffer_Count - 1> renderTargets;
         DescriptorReference baseSrvReference;
@@ -566,7 +582,7 @@ void SetupDepthStencil(App& app, bool isResize)
         &heapProps,
         D3D12_HEAP_FLAG_NONE,
         &resourceDesc,
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_DEPTH_WRITE,
         &depthOptimizedClearValue,
         IID_PPV_ARGS(&depthStencilBuffer)
     ));
@@ -662,26 +678,6 @@ ManagedPSORef CreatePSO(
     return mPso;
 }
 
-ManagedPSORef CreateDiffuseMeshPSO(
-    PSOManager& manager,
-    ID3D12Device* device,
-    const std::string& dataDir,
-    ID3D12RootSignature* rootSignature,
-    const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
-)
-{
-    auto psoDesc = DefaultPSODesc();
-    return CreatePSO(
-        manager,
-        device,
-        dataDir,
-        "diffuse_mesh",
-        rootSignature,
-        inputLayout,
-        psoDesc
-    );
-}
-
 D3D12_RESOURCE_DESC GBufferResourceDesc(GBufferTarget target, int windowWidth, int windowHeight);
 
 ManagedPSORef CreateMeshPBRPSO(
@@ -702,6 +698,45 @@ ManagedPSORef CreateMeshPBRPSO(
         device,
         dataDir,
         "mesh_gbuffer_pbr",
+        rootSignature,
+        inputLayout,
+        psoDesc
+    );
+}
+
+ManagedPSORef CreateMeshAlphaBlendedPBRPSO(
+    PSOManager& manager,
+    ID3D12Device* device,
+    const std::string& dataDir,
+    ID3D12RootSignature* rootSignature,
+    const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
+)
+{
+    auto psoDesc = DefaultPSODesc();
+    psoDesc.NumRenderTargets = GBuffer_RTVCount + 1;
+    for (int i = 1; i < psoDesc.NumRenderTargets; i++) {
+        psoDesc.RTVFormats[i] = GBufferResourceDesc((GBufferTarget)(i - 1), 0, 0).Format;
+    }
+
+    D3D12_RENDER_TARGET_BLEND_DESC blendDesc;
+    blendDesc.BlendEnable = TRUE;
+    blendDesc.LogicOpEnable = FALSE;
+    blendDesc.SrcBlend = D3D12_BLEND_ONE;
+    blendDesc.DestBlend = D3D12_BLEND_ONE;
+    blendDesc.BlendOp = D3D12_BLEND_OP_ADD;
+    blendDesc.SrcBlendAlpha = D3D12_BLEND_ONE;
+    blendDesc.DestBlendAlpha = D3D12_BLEND_ZERO;
+    blendDesc.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    blendDesc.LogicOp = D3D12_LOGIC_OP_NOOP;
+    blendDesc.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+    psoDesc.BlendState.RenderTarget[0] = blendDesc;
+
+    return CreatePSO(
+        manager,
+        device,
+        dataDir,
+        "mesh_alpha_blended_pbr",
         rootSignature,
         inputLayout,
         psoDesc
@@ -747,7 +782,7 @@ ManagedPSORef CreateDirectionalLightPSO(
     psoDesc.DepthStencilState.StencilEnable = FALSE;
     psoDesc.RasterizerState = rasterizerState;
 
-    // Blend settings for accumulation buffer
+    // Blending enabled for the accumulation (back) buffer
     D3D12_RENDER_TARGET_BLEND_DESC blendDesc;
     blendDesc.BlendEnable = TRUE;
     blendDesc.LogicOpEnable = FALSE;
@@ -829,7 +864,7 @@ D3D12_RESOURCE_DESC GBufferResourceDesc(GBufferTarget target, int windowWidth, i
     // https://www.3dgep.com/forward-plus/#:~:text=G%2Dbuffer%20pass.-,Layout%20Summary,G%2Dbuffer%20layout%20looks%20similar%20to%20the%20table%20shown%20below.,-R
     switch (target)
     {
-    case GBuffer_Diffuse:
+    case GBuffer_BaseColor:
     case GBuffer_MetalRoughness:
         desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         break;
@@ -853,8 +888,8 @@ void SetupGBuffer(App& app, bool isResize)
         heapDesc.NumDescriptors = (UINT)GBuffer_Count + MaxLightCount + 1;
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        app.lightingPassDescriptorArena.Initialize(app.device.Get(), heapDesc, "LightPassArena");
-        app.GBuffer.baseSrvReference = app.lightingPassDescriptorArena.AllocateDescriptors(GBuffer_Count, "GBuffer SRVs");
+        //app.lightingPassDescriptorArena.Initialize(app.device.Get(), heapDesc, "LightPassArena");
+        app.GBuffer.baseSrvReference = app.GBufferPass.descriptorHeap.AllocateDescriptors(GBuffer_Count, "GBuffer SRVs");
     } else {
         // If we're resizing then we need to release existing gbuffer
         for (auto& renderTarget : app.GBuffer.renderTargets) {
@@ -1016,7 +1051,7 @@ void CreateMainRootSignature(App& app)
 
 void SetupLightBuffer(App& app)
 {
-    auto descriptorHandle = app.lightingPassDescriptorArena.AllocateDescriptors(MaxLightCount + 1, "light pass and light buffer");
+    auto descriptorHandle = app.GBufferPass.descriptorHeap.AllocateDescriptors(MaxLightCount + 1, "light pass and light buffer");
 
     CreateConstantBufferAndViews(
         app,
@@ -1245,11 +1280,12 @@ void InitD3D(App& app)
 
     SetupRenderTargets(app);
     SetupDepthStencil(app, false);
+
+    SetupGBufferPass(app);
     SetupGBuffer(app, false);
 
     CreateMainRootSignature(app);
 
-    SetupGBufferPass(app);
     SetupLightingPass(app);
 
     ASSERT_HRESULT(
@@ -1265,6 +1301,34 @@ void InitD3D(App& app)
             IID_PPV_ARGS(&app.commandAllocator)
         )
     );
+
+    // Create command lists
+    {
+        ASSERT_HRESULT(
+            device->CreateCommandList(
+                0,
+                D3D12_COMMAND_LIST_TYPE_COPY,
+                app.copyCommandAllocator.Get(),
+                nullptr,
+                IID_PPV_ARGS(&app.copyCommandList)
+            )
+        );
+
+        ASSERT_HRESULT(
+            device->CreateCommandList(
+                0,
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                app.commandAllocator.Get(),
+                nullptr,
+                IID_PPV_ARGS(&app.commandList)
+            )
+        );
+    }
+
+    {
+        app.fence.Initialize(app.device.Get());
+        app.copyFence.Initialize(app.device.Get());
+    }
 }
 
 void InitWindow(App& app)
@@ -1333,7 +1397,7 @@ void WaitForPreviousFrame(App& app)
     app.frameIdx = app.swapChain->GetCurrentBackBufferIndex();
 }
 
-void LoadModelAsset(const App& app, AppAssets& assets, tinygltf::TinyGLTF& loader, const std::string& dataPath)
+void LoadModelAsset(const App& app, AppAssets& assets, tinygltf::TinyGLTF& loader, const std::string& filePath)
 {
     tinygltf::Model model;
     assets.models.push_back(model);
@@ -1344,7 +1408,7 @@ void LoadModelAsset(const App& app, AppAssets& assets, tinygltf::TinyGLTF& loade
             &assets.models.back(),
             &err,
             &warn,
-            app.dataDir + dataPath
+            filePath
         )
     );
 }
@@ -1357,10 +1421,10 @@ AppAssets LoadAssets(App& app)
     std::string err;
     std::string warn;
 
-    LoadModelAsset(app, assets, loader, "/floor/floor.gltf");
-    LoadModelAsset(app, assets, loader, "/FlightHelmet/FlightHelmet.gltf");
-    // LoadModelAsset(app, assets, loader, "/Suzanne.gltf");
-    // LoadModelAsset(app, assets, loader, "/skybox/skybox.gltf");
+    LoadModelAsset(app, assets, loader, app.dataDir + "/floor/floor.gltf");
+    LoadModelAsset(app, assets, loader, app.dataDir + "/FlightHelmet/FlightHelmet.gltf");
+    // LoadModelAsset(app, assets, loader, app.dataDir + "/Suzanne.gltf");
+    // LoadModelAsset(app, assets, loader, app.dataDir + "/skybox/skybox.gltf");
 
     return assets;
 }
@@ -1493,12 +1557,19 @@ void CreateModelMaterials(
         MaterialType materialType = MaterialType_PBR;
         if (inputMaterial.extensions.contains("KHR_materials_unlit")) {
             materialType = MaterialType_Unlit;
+        } else if (inputMaterial.alphaMode.size() > 0 && inputMaterial.alphaMode != "OPAQUE") {
+            if (inputMaterial.alphaMode == "BLEND") {
+                materialType = MaterialType_AlphaBlendPBR;
+            } else {
+                std::cout << "GLTF material " << inputMaterial.name << " has unsupported alpha mode and will be treated as opaque\n";
+                materialType = MaterialType_PBR;
+            }
         }
 
         Material material;
         material.constantData = &constantBufferSlice.data[i];
         material.materialType = materialType;
-        material.textureDescriptors.diffuse = baseColorTextureDescriptor;
+        material.textureDescriptors.baseColor = baseColorTextureDescriptor;
         material.textureDescriptors.normal = normalTextureDescriptor;
         material.textureDescriptors.metalRoughness = metalRoughnessTextureDescriptor;
         material.cbvDescriptor = descriptorReference + i;
@@ -1703,7 +1774,7 @@ glm::mat4 GetNodeTransfomMatrix(const tinygltf::Node& node) {
 void TraverseNode(const tinygltf::Model& model, const tinygltf::Node& node, std::vector<Mesh>& meshes, const glm::mat4& accumulator) {
     glm::mat4 transform = accumulator * GetNodeTransfomMatrix(node);
     if (node.mesh != -1) {
-        meshes[node.mesh].modelMatrix = transform;
+        meshes[node.mesh].baseModelTransform = transform;
     }
     for (const auto& child : node.children) {
         TraverseNode(model, model.nodes[child], meshes, transform);
@@ -1870,9 +1941,16 @@ void FinalizeModel(
 
             if (primitive.material != -1) {
                 drawCall.materialIndex = startingMaterialIndex + primitive.material;
-
                 if (app.materials[drawCall.materialIndex].materialType == MaterialType_PBR) {
                     drawCall.PSO = CreateMeshPBRPSO(
+                        app.psoManager,
+                        app.device.Get(),
+                        app.dataDir,
+                        app.rootSignature.Get(),
+                        drawCall.inputLayout
+                    );
+                } else if (app.materials[drawCall.materialIndex].materialType == MaterialType_AlphaBlendPBR) {
+                    drawCall.PSO = CreateMeshAlphaBlendedPBRPSO(
                         app.psoManager,
                         app.device.Get(),
                         app.dataDir,
@@ -1925,7 +2003,10 @@ void FinalizeModel(
             primitives.push_back(drawCall);
         }
 
-        outputModel.meshes.push_back(Mesh{ primitives });
+        Mesh newMesh{};
+        newMesh.primitives = primitives;
+        newMesh.name = mesh.name;
+        outputModel.meshes.push_back(newMesh);
     }
 
     ResolveMeshTransforms(inputModel, outputModel.meshes);
@@ -1954,6 +2035,16 @@ bool ValidateGLTFModel(const tinygltf::Model& model)
 
 void ProcessAssets(App& app, const AppAssets& assets)
 {
+    app.commandList->Close();
+
+    ASSERT_HRESULT(
+        app.commandAllocator->Reset()
+    );
+
+    ASSERT_HRESULT(
+        app.commandList->Reset(app.commandAllocator.Get(), app.pipelineState.Get())
+    );
+
     // TODO: easy candidate for multithreading
     for (const auto& gltfModel : assets.models) {
         if (!ValidateGLTFModel(gltfModel)) {
@@ -2009,43 +2100,6 @@ void ProcessAssets(App& app, const AppAssets& assets)
     app.commandList->Close();
 }
 
-void LoadScene(App& app, const AppAssets& assets)
-{
-    ID3D12Device* device = app.device.Get();
-
-    // Create command lists
-    {
-        ASSERT_HRESULT(
-            device->CreateCommandList(
-                0,
-                D3D12_COMMAND_LIST_TYPE_COPY,
-                app.copyCommandAllocator.Get(),
-                nullptr,
-                IID_PPV_ARGS(&app.copyCommandList)
-            )
-        );
-
-        ASSERT_HRESULT(
-            device->CreateCommandList(
-                0,
-                D3D12_COMMAND_LIST_TYPE_DIRECT,
-                app.commandAllocator.Get(),
-                nullptr,
-                IID_PPV_ARGS(&app.commandList)
-            )
-        );
-    }
-
-    ID3D12GraphicsCommandList* commandList = app.commandList.Get();
-
-    {
-        app.fence.Initialize(app.device.Get());
-        app.copyFence.Initialize(app.device.Get());
-    }
-
-    ProcessAssets(app, assets);
-}
-
 void InitializeCamera(App& app)
 {
     app.camera.translation = glm::vec3(0.0f, 0.5f, 3.0f);
@@ -2056,15 +2110,24 @@ void InitializeCamera(App& app)
 void InitializeLights(App& app)
 {
     app.LightBuffer.count = 1;
-    for (int i = 0; i < MaxLightCount; i++) {
+
+    app.lights[0].lightType = LightType_Directional;
+    app.lights[0].color = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f);
+    app.lights[0].intensity = 1.5f;
+    app.lights[0].position = glm::vec3(0.0f);
+    app.lights[0].direction = glm::normalize(glm::vec3(0.0f, 1.0f, 1.0f));
+    app.lights[0].range = 5.0f;
+
+    for (int i = 1; i < MaxLightCount; i++) {
         float angle = i * glm::two_pi<float>() / 4;
         float x = cos(angle);
         float z = sin(angle);
         app.lights[i].color = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f);
-        app.lights[i].intensity = 1.5f;
+        app.lights[i].intensity = 8.0f;
         app.lights[i].position = glm::vec3(x, 2.0f, z);
         app.lights[i].direction = glm::vec3(0.0f, 0.0f, 0.0f);
         app.lights[i].range = 5.0f;
+        app.lights[i].lightType = LightType_Point;
     }
 }
 
@@ -2073,13 +2136,30 @@ void InitializeScene(App& app) {
     InitializeLights(app);
 }
 
+glm::mat4 ApplyStandardTransforms(const glm::mat4& base, glm::vec3 translation, glm::vec3 euler, glm::vec3 scale)
+{
+    glm::mat4 transform = base;
+    transform = glm::translate(transform, translation);
+    transform = glm::scale(transform, scale);
+    transform = transform * glm::eulerAngleXYZ(euler.x, euler.y, euler.z);
+
+    return transform;
+}
+
 void UpdatePerPrimitiveConstantBuffers(Model& model, const glm::mat4& projection, const glm::mat4& view)
 {
     glm::mat4 viewProjection = projection * view;
     PerPrimitiveConstantData* perPrimitiveBuffer = reinterpret_cast<PerPrimitiveConstantData*>(model.perPrimitiveBufferPtr);
     for (int i = 0; i < model.meshes.size(); i++) {
         auto& mesh = model.meshes[i];
-        auto modelMatrix = mesh.modelMatrix;
+
+        auto modelMatrix = ApplyStandardTransforms(
+            mesh.baseModelTransform,
+            mesh.translation,
+            mesh.euler,
+            mesh.scale
+        );
+
         auto mvp = viewProjection * modelMatrix;
         auto mv = view * modelMatrix;
         for (const auto& primitive : mesh.primitives) {
@@ -2172,11 +2252,18 @@ DescriptorReference GetMaterialDescriptor(const App& app, const Model& model, in
     return app.materials[materialIndex].cbvDescriptor;
 }
 
-void DrawModelCommandList(const App& app, const Model& model, ID3D12GraphicsCommandList* commandList)
+void DrawModelGBuffer(const App& app, const Model& model, ID3D12GraphicsCommandList* commandList)
 {
     int constantBufferIdx = model.primitiveDataDescriptors.index;
     for (const auto& mesh : model.meshes) {
         for (const auto& primitive : mesh.primitives) {
+            const auto& material = app.materials[primitive.materialIndex];
+            // FIXME: if I am not lazy I will SORT by material type
+            // Transparent materials drawn in different pass
+            if (material.materialType == MaterialType_AlphaBlendPBR) {
+                constantBufferIdx++;
+                continue;
+            }
             auto materialDescriptor = GetMaterialDescriptor(app, model, primitive.materialIndex);
 
             // Set the per-primitive constant buffer
@@ -2187,6 +2274,38 @@ void DrawModelCommandList(const App& app, const Model& model, ID3D12GraphicsComm
             commandList->IASetVertexBuffers(0, (UINT)primitive.vertexBufferViews.size(), primitive.vertexBufferViews.data());
             commandList->IASetIndexBuffer(&primitive.indexBufferView);
             commandList->DrawIndexedInstanced(primitive.indexCount, 1, 0, 0, 0);
+            constantBufferIdx++;
+        }
+    }
+}
+
+void DrawModelAlphaBlendedMeshes(const App& app, const Model& model, ID3D12GraphicsCommandList* commandList)
+{
+    // FIXME: This seems like a bad looping order..
+    int constantBufferIdx = model.primitiveDataDescriptors.index;
+    for (const auto& mesh : model.meshes) {
+        for (const auto& primitive : mesh.primitives) {
+            const auto& material = app.materials[primitive.materialIndex];
+            // FIXME: if I am not lazy I will SORT by material type
+            // Only draw alpha blended materials in this pass.
+            if (material.materialType != MaterialType_AlphaBlendPBR) {
+                constantBufferIdx++;
+                continue;
+            }
+            auto materialDescriptor = GetMaterialDescriptor(app, model, primitive.materialIndex);
+
+            for (int lightIdx = 0; lightIdx < app.LightBuffer.count; lightIdx++) {
+                int lightDescriptorIndex = app.LightBuffer.cbvHandle.index + lightIdx + 1;
+                // Set the per-primitive constant buffer
+                std::array<UINT, 3> constantValues = { constantBufferIdx, materialDescriptor.index, lightDescriptorIndex };
+                commandList->SetGraphicsRoot32BitConstants(0, constantValues.size(), constantValues.data(), 0);
+                commandList->IASetPrimitiveTopology(primitive.primitiveTopology);
+                commandList->SetPipelineState(primitive.PSO->Get());
+                commandList->IASetVertexBuffers(0, (UINT)primitive.vertexBufferViews.size(), primitive.vertexBufferViews.data());
+                commandList->IASetIndexBuffer(&primitive.indexBufferView);
+                commandList->DrawIndexedInstanced(primitive.indexCount, 1, 0, 0, 0);
+            }
+
             constantBufferIdx++;
         }
     }
@@ -2221,13 +2340,12 @@ void BindAndClearGBufferRTVs(const App& app, ID3D12GraphicsCommandList* commandL
         commandList->ClearRenderTargetView(handle, clearColor, 0, nullptr);
     }
     commandList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
-
 }
 
 void TransitionRTVsForRendering(const App& app, ID3D12GraphicsCommandList* commandList)
 {
     // Transition our GBuffers into being render targets.
-    std::array<D3D12_RESOURCE_BARRIER, GBuffer_Count + 1> barriers;
+    std::array<D3D12_RESOURCE_BARRIER, GBuffer_Count> barriers;
     // Back buffer
     barriers[0] = CD3DX12_RESOURCE_BARRIER::Transition(app.renderTargets[app.frameIdx].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
     // GBuffer RTVs
@@ -2235,7 +2353,7 @@ void TransitionRTVsForRendering(const App& app, ID3D12GraphicsCommandList* comma
         barriers[i + 1] = CD3DX12_RESOURCE_BARRIER::Transition(app.GBuffer.renderTargets[i].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
     }
     // Depth buffer is special
-    barriers[GBuffer_Depth + 1] = CD3DX12_RESOURCE_BARRIER::Transition(app.depthStencilBuffer.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    // barriers[GBuffer_Depth + 1] = CD3DX12_RESOURCE_BARRIER::Transition(app.depthStencilBuffer.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     commandList->ResourceBarrier((UINT)barriers.size(), barriers.data());
 }
 
@@ -2263,7 +2381,7 @@ void GBufferPass(const App& app, ID3D12GraphicsCommandList* commandList)
     commandList->SetGraphicsRootSignature(app.rootSignature.Get());
 
     for (const auto& model : app.models) {
-        DrawModelCommandList(app, model, commandList);
+        DrawModelGBuffer(app, model, commandList);
     }
 }
 
@@ -2275,7 +2393,7 @@ void LightPass(const App& app, ID3D12GraphicsCommandList* commandList)
     commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
 
     {
-        auto descriptorHeap = app.lightingPassDescriptorArena.descriptorHeap;
+        auto descriptorHeap = app.GBufferPass.descriptorHeap.descriptorHeap;
         ID3D12DescriptorHeap* ppHeaps[] = { descriptorHeap.Get() };
         commandList->SetDescriptorHeaps(_countof(ppHeaps), ppHeaps);
         // Root signature must be set AFTER heaps are set when CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED is set.
@@ -2313,14 +2431,27 @@ void LightPass(const App& app, ID3D12GraphicsCommandList* commandList)
             }
         }
     }
+}
 
-    ID3D12DescriptorHeap* ppHeaps[] = { app.ImGui.srvHeap.Get() };
-    commandList->SetDescriptorHeaps(1, ppHeaps);
-    ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), commandList);
-
-    // Indicate that the back buffer will now be used to present.
-    auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(app.renderTargets[app.frameIdx].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+// Forward pass for meshes with transparency
+void AlphaBlendPass(const App& app, ID3D12GraphicsCommandList* commandList)
+{
+    // Transition depth buffer back to depth write for alpha blend
+    auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(app.depthStencilBuffer.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     commandList->ResourceBarrier(1, &barrier);
+
+    CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(app.rtvHeap->GetCPUDescriptorHandleForHeapStart(), app.frameIdx, G_IncrementSizes.Rtv);
+    CD3DX12_CPU_DESCRIPTOR_HANDLE dsvHandle(app.dsHeap->GetCPUDescriptorHandleForHeapStart());
+    commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, &dsvHandle);
+
+    ID3D12DescriptorHeap* mainDescriptorHeap = app.GBufferPass.descriptorHeap.descriptorHeap.Get();
+    ID3D12DescriptorHeap* ppHeaps[] = { mainDescriptorHeap };
+    commandList->SetDescriptorHeaps(1, ppHeaps);
+    commandList->SetGraphicsRootSignature(app.rootSignature.Get());
+
+    for (const auto& model : app.models) {
+        DrawModelAlphaBlendedMeshes(app, model, commandList);
+    }
 }
 
 void BuildCommandList(const App& app)
@@ -2342,6 +2473,15 @@ void BuildCommandList(const App& app)
 
     GBufferPass(app, commandList);
     LightPass(app, commandList);
+    AlphaBlendPass(app, commandList);
+
+    ID3D12DescriptorHeap* ppHeaps[] = { app.ImGui.srvHeap.Get() };
+    commandList->SetDescriptorHeaps(1, ppHeaps);
+    ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), commandList);
+
+    // Indicate that the back buffer will now be used to present.
+    auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(app.renderTargets[app.frameIdx].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+    commandList->ResourceBarrier(1, &barrier);
 
     ASSERT_HRESULT(
         commandList->Close()
@@ -2426,15 +2566,51 @@ void CleanImGui()
     ImGui::DestroyContext();
 }
 
-void DrawLightsEditor(App& app)
+void DrawMeshEditor(App& app)
+{
+    static int selectedMeshIdx = -1;
+    if (!app.ImGui.meshesOpen) {
+        return;
+    }
+    if (ImGui::Begin("Meshes", &app.ImGui.meshesOpen, 0)) {
+        Mesh* selectedMesh = nullptr;
+
+        if (ImGui::BeginListBox("Models")) {
+            int meshIdx = 0;
+            for (auto& model : app.models) {
+                for (auto& mesh : model.meshes) {
+                    std::string label = mesh.name;
+                    bool isSelected = meshIdx == selectedMeshIdx;
+
+                    if (isSelected) {
+                        selectedMesh = &mesh;
+                    }
+
+                    if (ImGui::Selectable(label.c_str(), isSelected)) {
+                        selectedMeshIdx = meshIdx;
+                        break;
+                    }
+
+                    meshIdx++;
+                }
+            }
+            ImGui::EndListBox();
+        }
+
+        ImGui::Separator();
+
+        if (selectedMesh != nullptr) {
+            ImGui::DragFloat3("Position", (float*)&selectedMesh->translation, 0.1);
+            ImGui::DragFloat3("Euler", (float*)&selectedMesh->euler, 0.1);
+            ImGui::DragFloat3("Scale", (float*)&selectedMesh->scale, 0.1);
+        }
+    }
+    ImGui::End();
+}
+
+void DrawLightEditor(App& app)
 {
     static int selectedLightIdx = 0;
-
-    char labels[MaxLightCount][20];
-    for (int i = 0; i < MaxLightCount; i++) {
-        std::string label = "Light #" + std::to_string(i);
-        strcpy_s(labels[i], label.c_str());
-    }
 
     if (!app.ImGui.lightsOpen) {
         return;
@@ -2501,6 +2677,27 @@ void DrawMenuBar(App& app)
 {
     if (ImGui::BeginMainMenuBar())
     {
+        if (ImGui::BeginMenu("File")) {
+            if (ImGui::MenuItem("Add GLTF")) {
+                const char* filters[] = { "*.gltf" };
+                char* gltfFile = tinyfd_openFileDialog(
+                    "Choose GLTF File",
+                    app.dataDir.c_str(),
+                    _countof(filters),
+                    filters,
+                    NULL,
+                    0
+                );
+
+                if (gltfFile != nullptr) {
+                    AppAssets assets;
+                    tinygltf::TinyGLTF loader;
+                    LoadModelAsset(app, assets, loader, gltfFile);
+                    ProcessAssets(app, assets);
+                }
+            }
+            ImGui::EndMenu();
+        }
         if (ImGui::BeginMenu("Tools")) {
             if (ImGui::MenuItem("Reload Shaders")) {
                 app.psoManager.reload(app.device.Get());
@@ -2511,9 +2708,9 @@ void DrawMenuBar(App& app)
             if (ImGui::Checkbox("Shader Debug Flag", (bool*)&app.LightBuffer.passData->debug)) {}
             ImGui::EndMenu();
         }
-        if (ImGui::BeginMenu("Windows"))
-        {
+        if (ImGui::BeginMenu("Windows")) {
             ImGui::Checkbox("Lights", &app.ImGui.lightsOpen);
+            ImGui::Checkbox("Meshes", &app.ImGui.meshesOpen);
             ImGui::EndMenu();
         }
         ImGui::EndMainMenuBar();
@@ -2526,7 +2723,8 @@ void BeginGUI(App& app)
     ImGui_ImplSDL2_NewFrame();
     ImGui::NewFrame();
 
-    DrawLightsEditor(app);
+    DrawLightEditor(app);
+    DrawMeshEditor(app);
     DrawMenuBar(app);
 }
 
@@ -2551,7 +2749,7 @@ int RunApp(int argc, char** argv)
 
     {
         AppAssets assets = LoadAssets(app);
-        LoadScene(app, assets);
+        ProcessAssets(app, assets);
     }
 
     InitializeScene(app);

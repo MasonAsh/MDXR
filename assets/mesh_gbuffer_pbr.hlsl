@@ -17,23 +17,10 @@ struct PSInput {
 
 struct PSOutput {
     float4 backBuffer : SV_TARGET0;
-    float4 diffuse : SV_TARGET1;
+    float4 baseColor : SV_TARGET1;
     float4 normal : SV_TARGET2;
     float4 metalRoughness : SV_TARGET3;
 };
-
-float3 ExpandNormal(float3 n)
-{
-    return n * 2.0f - 1.0f;
-}
-
-float4 DoNormalMap(Texture2D normalMap, float3x3 TBN, float2 uv)
-{
-    float3 normal = normalMap.Sample(g_sampler, uv).xyz;
-    normal = ExpandNormal(normal);
-    normal = mul(normal, TBN);
-    return normalize(float4(normal, 0.0f));
-}
 
 PSInput VSMain(VSInput input)
 {
@@ -67,11 +54,11 @@ PSOutput PSMain(PSInput input)
     result.backBuffer = ambient;
 
     // TODO: these checks be done through preprocessor and shader permutations instead
-    if (mat.diffuseTextureIdx != -1) {
-        Texture2D diffuseTexture = GetDiffuseTexture(mat);
-        result.diffuse = diffuseTexture.Sample(g_sampler, input.uv);
+    if (mat.baseColorTextureIdx != -1) {
+        Texture2D baseColorTexture = GetBaseColorTexture(mat);
+        result.baseColor = baseColorTexture.Sample(g_sampler, input.uv);
     } else {
-        result.diffuse = float4(1.0f, 0.07, 0.57, 1.0);
+        result.baseColor = float4(1.0f, 0.07, 0.57, 1.0);
     }
 
     if (mat.normalTextureIdx != -1) {

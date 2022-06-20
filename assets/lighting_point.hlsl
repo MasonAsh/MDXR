@@ -71,7 +71,7 @@ float4 PSMain(PSInput input) : SV_TARGET
 
     return ShadePBR(
         light.colorIntensity.xyz,
-        baseColor,
+        float4(baseColor, 1.0f),
         N,
         roughness,
         metallic,

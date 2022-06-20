@@ -4,7 +4,7 @@ struct PrimitiveData {
 };
 
 struct MaterialData {
-    uint diffuseTextureIdx;
+    uint baseColorTextureIdx;
     uint normalTextureIdx;
     uint metalRoughnessIdx;
 };
@@ -19,7 +19,12 @@ struct LightConstantData {
     float4 colorIntensity;
 
     float range;
+
+    uint type;
 };
+
+#define LIGHT_POINT 0
+#define LIGHT_DIRECTIONAL 1
 
 struct LightPassConstantData {
     float4x4 inverseProjection;
@@ -59,8 +64,8 @@ ConstantBuffer<LightPassConstantData> GetLightPassData() {
     return data;
 }
 
-Texture2D GetDiffuseTexture(MaterialData material) {
-    return ResourceDescriptorHeap[material.diffuseTextureIdx];
+Texture2D GetBaseColorTexture(MaterialData material) {
+    return ResourceDescriptorHeap[material.baseColorTextureIdx];
 }
 
 Texture2D GetNormalTexture(MaterialData material) {
@@ -79,4 +84,17 @@ float3 make_float3(float value)
 float4 make_float4(float value)
 {
     return float4(value, value, value, value);
+}
+
+float3 ExpandNormal(float3 n)
+{
+    return n * 2.0f - 1.0f;
+}
+
+float4 DoNormalMap(Texture2D normalMap, float3x3 TBN, float2 uv)
+{
+    float3 normal = normalMap.Sample(g_sampler, uv).xyz;
+    normal = ExpandNormal(normal);
+    normal = mul(normal, TBN);
+    return normalize(float4(normal, 0.0f));
 }

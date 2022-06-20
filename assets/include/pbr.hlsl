@@ -31,7 +31,7 @@ float3 FSchlick(float cosTheta, float3 F0)
 
 float4 ShadePBR(
     float3 colorIntensity,
-    float3 baseColor,
+    float4 baseColor,
     float3 N,
     float roughness,
     float metallic,
@@ -46,7 +46,7 @@ float4 ShadePBR(
     float3 radiance = colorIntensity.xyz * attenuation;
 
     float3 F0 = 0.04;
-    F0 = lerp(F0, baseColor, metallic);
+    F0 = lerp(F0, baseColor.rgb, metallic);
 
     float cosWi = max(0.0, dot(N, Wi));
     float cosWh = max(0.0, dot(N, H));
@@ -66,11 +66,11 @@ float4 ShadePBR(
     float denominator = max(Epsilon, 4.0 * cosWi * cosWo);
     float3 specular = numerator / denominator;
 
-    float3 diffuseBRDF = kD * baseColor;
+    float4 diffuseBRDF = float4(kD, 1.0f) * baseColor * baseColor.a;
 
-    float3 Lo = (diffuseBRDF + specular) * radiance * cosWi;
+    float4 Lo = (diffuseBRDF + float4(specular, 1.0f)) * float4(radiance, 1) * cosWi;
 
-    float4 color = float4(Lo, 1.0f);
+    float4 color = float4(Lo);
 
     color = color / (color + 1.0f);
     color = pow(color, 1.0/2.2);

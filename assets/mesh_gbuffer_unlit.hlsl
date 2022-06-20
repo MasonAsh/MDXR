@@ -35,9 +35,9 @@ PSOutput PSMain(PSInput input)
     MaterialData mat = GetMaterial();
 
     // TODO: these checks be done through preprocessor and shader permutations instead
-    if (mat.diffuseTextureIdx != -1) {
-        Texture2D diffuseTexture = GetDiffuseTexture(mat);
-        result.backBuffer = diffuseTexture.Sample(g_sampler, input.uv);
+    if (mat.baseColorTextureIdx != -1) {
+        Texture2D baseColorTexture = GetBaseColorTexture(mat);
+        result.backBuffer = baseColorTexture.Sample(g_sampler, input.uv);
     } else {
         result.backBuffer = float4(1.0f, 0.07, 0.57, 1.0);
     }

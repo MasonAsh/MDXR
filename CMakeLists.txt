@@ -35,6 +35,7 @@ add_executable(mdxr
     src/stb_image_write.h
     src/json.hpp
     src/tiny_gltf.h
+    thirdparty/tinyfiledialogs.c
 
     ${IMGUI_SOURCES}
 )
