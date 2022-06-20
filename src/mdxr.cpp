@@ -474,6 +474,7 @@ struct App {
 
     int windowWidth = 1280;
     int windowHeight = 720;
+    bool borderlessFullscreen = false;
 
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12CommandQueue> commandQueue;
@@ -1270,6 +1271,10 @@ void InitD3D(App& app)
         ASSERT_HRESULT(swapChain.As(&app.swapChain));
     }
 
+    ASSERT_HRESULT(
+        dxgiFactory->MakeWindowAssociation(app.hwnd, DXGI_MWA_NO_ALT_ENTER)
+    );
+
     app.frameIdx = app.swapChain->GetCurrentBackBufferIndex();
 
     {
@@ -1340,11 +1345,16 @@ void InitD3D(App& app)
 
 void InitWindow(App& app)
 {
+    Uint32 windowFlags = SDL_WINDOW_RESIZABLE;
+    if (app.borderlessFullscreen) {
+        windowFlags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+    }
+
     SDL_Window* window = SDL_CreateWindow("MDXR",
         SDL_WINDOWPOS_CENTERED,
         SDL_WINDOWPOS_CENTERED,
         app.windowWidth, app.windowHeight,
-        SDL_WINDOW_RESIZABLE
+        windowFlags
     );
 
     assert(window);
@@ -1379,6 +1389,8 @@ void InitApp(App& app, int argc, char** argv)
             if (i + 1 < argc) {
                 app.dataDir = argv[i + 1];
             }
+        } else if (!strcmp(argv[i], "--borderless")) {
+            app.borderlessFullscreen = true;
         }
     }
 
@@ -2366,8 +2378,7 @@ void TransitionRTVsForRendering(const App& app, ID3D12GraphicsCommandList* comma
     for (int i = 0; i < GBuffer_RTVCount; i++) {
         barriers[i + 1] = CD3DX12_RESOURCE_BARRIER::Transition(app.GBuffer.renderTargets[i].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
     }
-    // Depth buffer is special
-    // barriers[GBuffer_Depth + 1] = CD3DX12_RESOURCE_BARRIER::Transition(app.depthStencilBuffer.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    // Depth buffer is already in the correct state from AlphaBlendPass
     commandList->ResourceBarrier((UINT)barriers.size(), barriers.data());
 }
 
@@ -2424,8 +2435,6 @@ void LightPass(App& app, ID3D12GraphicsCommandList* commandList)
                     app.LightBuffer.cbvHandle.index
                 };
                 commandList->SetGraphicsRoot32BitConstants(0, 2, constantValues, 2);
-                // commandList->SetGraphicsRoot32BitConstant(ConstantIndex_Light, app.LightBuffer.cbvHandle.index + i + 1, 0);
-                // commandList->SetGraphicsRoot32BitConstant(ConstantIndex_LightPassData, app.LightBuffer.cbvHandle.index, 0);
                 DrawFullscreenQuad(app, commandList);
             }
         }
@@ -2439,8 +2448,6 @@ void LightPass(App& app, ID3D12GraphicsCommandList* commandList)
                     app.LightBuffer.cbvHandle.index
                 };
                 commandList->SetGraphicsRoot32BitConstants(0, 2, constantValues, 2);
-                // commandList->SetGraphicsRoot32BitConstant(ConstantIndex_Light, app.LightBuffer.cbvHandle.index + i + 1, 0);
-                // commandList->SetGraphicsRoot32BitConstant(ConstantIndex_LightPassData, app.LightBuffer.cbvHandle.index, 0);
                 DrawFullscreenQuad(app, commandList);
             }
         }
@@ -2783,6 +2790,19 @@ void ReloadIfShaderChanged(App& app)
     }
 }
 
+void ToggleBorderlessWindow(App& app)
+{
+    int flags = !app.borderlessFullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0;
+    SDL_SetWindowFullscreen(app.window, flags);
+
+    int width, height;
+    SDL_GetWindowSize(app.window, &width, &height);
+    HandleResize(app, width, height);
+
+
+    app.borderlessFullscreen = !app.borderlessFullscreen;
+}
+
 int RunApp(int argc, char** argv)
 {
     App app;
@@ -2831,6 +2851,8 @@ int RunApp(int argc, char** argv)
             } else if (e.type == SDL_KEYUP) {
                 if (e.key.keysym.sym == SDLK_F5) {
                     app.psoManager.reload(app.device.Get());
+                } else if (e.key.keysym.sym == SDLK_RETURN && e.key.keysym.mod & KMOD_ALT) {
+                    ToggleBorderlessWindow(app);
                 }
             }
         }
@@ -2883,7 +2905,7 @@ int RunMDXR(int argc, char** argv)
         {
             dxgiDebug->ReportLiveObjects(DXGI_DEBUG_ALL, DXGI_DEBUG_RLO_FLAGS(DXGI_DEBUG_RLO_SUMMARY | DXGI_DEBUG_RLO_IGNORE_INTERNAL));
         }
-}
+    }
 #endif
 
     return status;
