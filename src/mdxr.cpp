@@ -466,6 +466,12 @@ struct App {
     long long startTick;
     long long lastFrameTick;
 
+    struct {
+        long long lastFrameTimeNS = 0;
+        long triangleCount = 0;
+        long drawCalls = 0;
+    } Stats;
+
     int windowWidth = 1280;
     int windowHeight = 720;
 
@@ -509,6 +515,7 @@ struct App {
         ComPtr<ID3D12DescriptorHeap> srvHeap;
         bool lightsOpen = true;
         bool meshesOpen = true;
+        bool showStats = true;
     } ImGui;
 
     struct {
@@ -1998,6 +2005,7 @@ void FinalizeModel(
                     break;
                 };
                 drawCall.indexCount = (UINT)accessor.count;
+                app.Stats.triangleCount += drawCall.indexCount;
             }
 
             primitives.push_back(drawCall);
@@ -2231,7 +2239,7 @@ glm::mat4 UpdateFlyCamera(App& app, float deltaSeconds)
 
 void UpdateScene(App& app)
 {
-    long long currentTick = high_resolution_clock::now().time_since_epoch().count();
+    long long currentTick = steady_clock::now().time_since_epoch().count();
     long long ticksSinceStart = currentTick - app.startTick;
     float timeSeconds = (float)ticksSinceStart / (float)1e9;
     long long deltaTicks = currentTick - app.lastFrameTick;
@@ -2252,7 +2260,7 @@ DescriptorReference GetMaterialDescriptor(const App& app, const Model& model, in
     return app.materials[materialIndex].cbvDescriptor;
 }
 
-void DrawModelGBuffer(const App& app, const Model& model, ID3D12GraphicsCommandList* commandList)
+void DrawModelGBuffer(App& app, const Model& model, ID3D12GraphicsCommandList* commandList)
 {
     int constantBufferIdx = model.primitiveDataDescriptors.index;
     for (const auto& mesh : model.meshes) {
@@ -2275,11 +2283,13 @@ void DrawModelGBuffer(const App& app, const Model& model, ID3D12GraphicsCommandL
             commandList->IASetIndexBuffer(&primitive.indexBufferView);
             commandList->DrawIndexedInstanced(primitive.indexCount, 1, 0, 0, 0);
             constantBufferIdx++;
+
+            app.Stats.drawCalls++;
         }
     }
 }
 
-void DrawModelAlphaBlendedMeshes(const App& app, const Model& model, ID3D12GraphicsCommandList* commandList)
+void DrawModelAlphaBlendedMeshes(App& app, const Model& model, ID3D12GraphicsCommandList* commandList)
 {
     // FIXME: This seems like a bad looping order..
     int constantBufferIdx = model.primitiveDataDescriptors.index;
@@ -2304,6 +2314,8 @@ void DrawModelAlphaBlendedMeshes(const App& app, const Model& model, ID3D12Graph
                 commandList->IASetVertexBuffers(0, (UINT)primitive.vertexBufferViews.size(), primitive.vertexBufferViews.data());
                 commandList->IASetIndexBuffer(&primitive.indexBufferView);
                 commandList->DrawIndexedInstanced(primitive.indexCount, 1, 0, 0, 0);
+
+                app.Stats.drawCalls++;
             }
 
             constantBufferIdx++;
@@ -2311,10 +2323,12 @@ void DrawModelAlphaBlendedMeshes(const App& app, const Model& model, ID3D12Graph
     }
 }
 
-void DrawFullscreenQuad(const App& app, ID3D12GraphicsCommandList* commandList)
+void DrawFullscreenQuad(App& app, ID3D12GraphicsCommandList* commandList)
 {
     commandList->IASetVertexBuffers(0, 0, nullptr);
     commandList->DrawInstanced(4, 1, 0, 0);
+
+    app.Stats.drawCalls++;
 }
 
 void BindAndClearGBufferRTVs(const App& app, ID3D12GraphicsCommandList* commandList)
@@ -2369,7 +2383,7 @@ void TransitionGBufferForLighting(const App& app, ID3D12GraphicsCommandList* com
     commandList->ResourceBarrier((UINT)barriers.size(), barriers.data());
 }
 
-void GBufferPass(const App& app, ID3D12GraphicsCommandList* commandList)
+void GBufferPass(App& app, ID3D12GraphicsCommandList* commandList)
 {
     TransitionRTVsForRendering(app, commandList);
 
@@ -2385,7 +2399,7 @@ void GBufferPass(const App& app, ID3D12GraphicsCommandList* commandList)
     }
 }
 
-void LightPass(const App& app, ID3D12GraphicsCommandList* commandList)
+void LightPass(App& app, ID3D12GraphicsCommandList* commandList)
 {
     TransitionGBufferForLighting(app, commandList);
 
@@ -2434,7 +2448,7 @@ void LightPass(const App& app, ID3D12GraphicsCommandList* commandList)
 }
 
 // Forward pass for meshes with transparency
-void AlphaBlendPass(const App& app, ID3D12GraphicsCommandList* commandList)
+void AlphaBlendPass(App& app, ID3D12GraphicsCommandList* commandList)
 {
     // Transition depth buffer back to depth write for alpha blend
     auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(app.depthStencilBuffer.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
@@ -2454,7 +2468,7 @@ void AlphaBlendPass(const App& app, ID3D12GraphicsCommandList* commandList)
     }
 }
 
-void BuildCommandList(const App& app)
+void BuildCommandList(App& app)
 {
     ID3D12GraphicsCommandList* commandList = app.commandList.Get();
 
@@ -2490,6 +2504,8 @@ void BuildCommandList(const App& app)
 
 void RenderFrame(App& app)
 {
+    app.Stats.drawCalls = 0;
+
     bool tdrOccurred = false;
     BuildCommandList(app);
 
@@ -2673,6 +2689,29 @@ void DrawLightEditor(App& app)
     ImGui::End();
 }
 
+void DrawStats(App& app)
+{
+    ImGuiWindowFlags windowFlags =
+        ImGuiWindowFlags_NoBackground |
+        ImGuiWindowFlags_NoTitleBar |
+        ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoInputs |
+        ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoMove;
+
+    if (app.ImGui.showStats) {
+        float frameTimeMS = (float)app.Stats.lastFrameTimeNS / (float)1E6;
+        if (ImGui::Begin("Stats", &app.ImGui.showStats, windowFlags)) {
+            ImGui::SetWindowPos({ 0.0f, 20.0f });
+            ImGui::Text("Frame time: %.2fms", frameTimeMS);
+            ImGui::Text("FPS: %.0f", 1000.0f / frameTimeMS);
+            ImGui::Text("Triangles: %d", app.Stats.triangleCount);
+            ImGui::Text("Draw calls: %d", app.Stats.drawCalls);
+        }
+        ImGui::End();
+    }
+}
+
 void DrawMenuBar(App& app)
 {
     if (ImGui::BeginMainMenuBar())
@@ -2711,6 +2750,7 @@ void DrawMenuBar(App& app)
         if (ImGui::BeginMenu("Windows")) {
             ImGui::Checkbox("Lights", &app.ImGui.lightsOpen);
             ImGui::Checkbox("Meshes", &app.ImGui.meshesOpen);
+            ImGui::Checkbox("Show stats", &app.ImGui.showStats);
             ImGui::EndMenu();
         }
         ImGui::EndMainMenuBar();
@@ -2725,6 +2765,7 @@ void BeginGUI(App& app)
 
     DrawLightEditor(app);
     DrawMeshEditor(app);
+    DrawStats(app);
     DrawMenuBar(app);
 }
 
@@ -2756,7 +2797,7 @@ int RunApp(int argc, char** argv)
 
     SDL_Event e;
 
-    app.startTick = high_resolution_clock().now().time_since_epoch().count();
+    app.startTick = steady_clock::now().time_since_epoch().count();
     app.lastFrameTick = app.startTick;
 
     int mouseX, mouseY;
@@ -2764,7 +2805,7 @@ int RunApp(int argc, char** argv)
 
     app.running = true;
     while (app.running) {
-        long long frameTick = high_resolution_clock().now().time_since_epoch().count();
+        long long frameTick = steady_clock::now().time_since_epoch().count();
         app.mouseState.xrel = 0;
         app.mouseState.yrel = 0;
         app.mouseState.scrollDelta = 0;
@@ -2812,6 +2853,9 @@ int RunApp(int argc, char** argv)
         ImGui::Render();
 
         RenderFrame(app);
+
+        long long endTick = steady_clock::now().time_since_epoch().count();
+        app.Stats.lastFrameTimeNS = endTick - frameTick;
 
         app.lastFrameTick = frameTick;
     }
