@@ -2616,9 +2616,13 @@ void DrawMeshEditor(App& app)
         ImGui::Separator();
 
         if (selectedMesh != nullptr) {
+            glm::vec3 eulerDegrees = glm::degrees(selectedMesh->euler);
+
             ImGui::DragFloat3("Position", (float*)&selectedMesh->translation, 0.1);
-            ImGui::DragFloat3("Euler", (float*)&selectedMesh->euler, 0.1);
+            ImGui::DragFloat3("Euler", (float*)&eulerDegrees, 0.1);
             ImGui::DragFloat3("Scale", (float*)&selectedMesh->scale, 0.1);
+
+            selectedMesh->euler = glm::radians(eulerDegrees);
         }
     }
     ImGui::End();
@@ -2879,7 +2883,7 @@ int RunMDXR(int argc, char** argv)
         {
             dxgiDebug->ReportLiveObjects(DXGI_DEBUG_ALL, DXGI_DEBUG_RLO_FLAGS(DXGI_DEBUG_RLO_SUMMARY | DXGI_DEBUG_RLO_IGNORE_INTERNAL));
         }
-    }
+}
 #endif
 
     return status;
