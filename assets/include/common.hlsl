@@ -37,6 +37,7 @@ cbuffer Indices : register(b0) {
     const uint g_MaterialDataIndex;
     const uint g_LightIndex;
     const uint g_LightPassDataIndex;
+    const uint g_MiscDescriptorIndex;
 };
 
 static const float PI = 3.14159265f;

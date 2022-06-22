@@ -1,5 +1,6 @@
 #include "mdxr.h"
 #include "util.h"
+#include "pool.h"
 #include <iostream>
 #include <assert.h>
 #include <d3dcompiler.h>
@@ -14,6 +15,7 @@
 #include <algorithm>
 #include <span>
 #include <ranges>
+#include <fstream>
 #include <glm/gtc/type_ptr.hpp>
 #include <glm/gtx/quaternion.hpp>
 #include <glm/gtx/euler_angles.hpp>
@@ -21,11 +23,12 @@
 #include "imgui_impl_dx12.h"
 #include "imgui_impl_sdl.h"
 #include "tinyfiledialogs.h"
+#include "D3D12MemAlloc.h"
 
 using namespace std::chrono;
 
 const int FrameBufferCount = 2;
-const int MaxLightCount = 10;
+const int MaxLightCount = 64;
 const int MaxMaterialCount = 128;
 const int MaxDescriptors = 2048;
 const DXGI_FORMAT DepthFormat = DXGI_FORMAT_D32_FLOAT;
@@ -35,7 +38,7 @@ enum ConstantIndex {
     ConstantIndex_MaterialData,
     ConstantIndex_Light,
     ConstantIndex_LightPassData,
-
+    ConstantIndex_MiscParameter,
     ConstantIndex_Count
 };
 
@@ -121,7 +124,7 @@ static_assert((sizeof(MaterialConstantData) % 256) == 0, "Constant buffer must b
 struct DescriptorReference {
     ID3D12DescriptorHeap* heap;
     int incrementSize;
-    int index;
+    UINT index;
 
     DescriptorReference()
         : heap(nullptr)
@@ -130,7 +133,7 @@ struct DescriptorReference {
     {
     }
 
-    DescriptorReference(ID3D12DescriptorHeap* heap, int index, int incrementSize)
+    DescriptorReference(ID3D12DescriptorHeap* heap, UINT index, int incrementSize)
         : heap(heap)
         , index(index)
         , incrementSize(incrementSize)
@@ -158,13 +161,21 @@ struct Primitive {
     D3D12_PRIMITIVE_TOPOLOGY primitiveTopology;
     ManagedPSORef PSO;
     UINT indexCount;
-    PerPrimitiveConstantData constantData;
-
     UINT materialIndex;
+    DescriptorReference perPrimitiveDescriptor;
+    PerPrimitiveConstantData* constantData;
+
+    // Optional custom descriptor for special primitive shaders. Can be anything.
+    // For example, the skybox uses this for the texcube shader parameter.
+    DescriptorReference miscDescriptorParameter;
 };
 
 struct Mesh {
-    std::vector<Primitive> primitives;
+    Mesh() = default;
+    Mesh(Mesh&& mesh) = default;
+    Mesh(const Mesh& mesh) = delete;
+
+    std::vector<PoolItem<Primitive>> primitives;
 
     // This is the base transform as defined in the GLTF model
     glm::mat4 baseModelTransform;
@@ -178,8 +189,12 @@ struct Mesh {
 };
 
 struct Model {
+    Model() = default;
+    Model(Model&& mesh) = default;
+    Model(const Model& mesh) = delete;
+
     std::vector<ComPtr<ID3D12Resource>> buffers;
-    std::vector<Mesh> meshes;
+    std::vector<PoolItem<Mesh>> meshes;
 
     DescriptorReference primitiveDataDescriptors;
     DescriptorReference baseTextureDescriptor;
@@ -187,11 +202,26 @@ struct Model {
 
     // All of the child mesh constant buffers stored in this constant buffer
     ComPtr<ID3D12Resource> perPrimitiveConstantBuffer;
-    UINT8* perPrimitiveBufferPtr;
+    PerPrimitiveConstantData* perPrimitiveBufferPtr;
 };
 
-struct AppAssets {
+enum SkyboxImageIndex {
+    SkyboxImage_Right,
+    SkyboxImage_Left,
+    SkyboxImage_Top,
+    SkyboxImage_Bottom,
+    SkyboxImage_Front,
+    SkyboxImage_Back,
+    SkyboxImage_Count, // The amount of faces in a cube may fluctuate in the future
+};
+
+struct SkyboxAssets {
+    std::array<tinygltf::Image, SkyboxImage_Count> images;
+};
+
+struct AssetBundle {
     std::vector<tinygltf::Model> models;
+    std::optional<SkyboxAssets> skybox;
 };
 
 // Fixed capacity descriptor heap. Aborts when the size outgrows initial capacity.
@@ -475,6 +505,12 @@ struct App {
     int windowWidth = 1280;
     int windowHeight = 720;
     bool borderlessFullscreen = false;
+    bool gpuDebug = false;
+
+    PSOManager psoManager;
+
+    Pool<Primitive, 1> primitivePool;
+    Pool<Mesh, 1> meshPool;
 
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12CommandQueue> commandQueue;
@@ -523,12 +559,7 @@ struct App {
         DescriptorArena descriptorHeap;
     } GBufferPass;
 
-    // struct {
-    //     ComPtr<ID3D12Resource> constantBuffer;
-    //     MaterialConstantData* materials;
-    //     int count;
-    //     DescriptorReference descriptorReference;
-    // } MaterialBuffer;
+    ComPtr<D3D12MA::Allocator> mainAllocator;
 
     ConstantBufferArena<MaterialConstantData> materialConstantBuffer;
     std::vector<Material> materials;
@@ -559,7 +590,14 @@ struct App {
 
     std::array<Light, MaxLightCount> lights;
 
-    PSOManager psoManager;
+    struct {
+        ComPtr<D3D12MA::Allocation> cubemap;
+        ComPtr<D3D12MA::Allocation> vertexBuffer;
+        ComPtr<D3D12MA::Allocation> indexBuffer;
+        ComPtr<D3D12MA::Allocation> perPrimitiveConstantBuffer;
+        DescriptorReference texcubeSRV;
+        PoolItem<Mesh> mesh;
+    } Skybox;
 };
 
 void SetupDepthStencil(App& app, bool isResize)
@@ -851,6 +889,35 @@ ManagedPSORef CreatePointLightPSO(
         device,
         dataDir,
         "lighting_point",
+        rootSignature,
+        inputLayout,
+        psoDesc
+    );
+}
+
+ManagedPSORef CreateSkyboxPSO(
+    PSOManager& manager,
+    ID3D12Device* device,
+    const std::string& dataDir,
+    ID3D12RootSignature* rootSignature,
+    const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
+)
+{
+    auto psoDesc = DefaultPSODesc();
+    psoDesc.NumRenderTargets = GBuffer_RTVCount + 1;
+    for (int i = 1; i < psoDesc.NumRenderTargets; i++) {
+        psoDesc.RTVFormats[i] = GBufferResourceDesc((GBufferTarget)(i - 1), 0, 0).Format;
+    }
+
+    CD3DX12_RASTERIZER_DESC rasterizerState(D3D12_DEFAULT);
+    rasterizerState.FrontCounterClockwise = FALSE;
+    psoDesc.RasterizerState = rasterizerState;
+
+    return CreatePSO(
+        manager,
+        device,
+        dataDir,
+        "skybox",
         rootSignature,
         inputLayout,
         psoDesc
@@ -1196,18 +1263,18 @@ void PrintCapabilities(ID3D12Device* device)
 
 void InitD3D(App& app)
 {
-    // #ifdef _DEBUG
-    ComPtr<ID3D12Debug> debugController;
-    if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debugController)))) {
-        debugController->EnableDebugLayer();
-    } else {
-        std::cout << "Failed to enable D3D12 debug layer\n";
-    }
+    if (app.gpuDebug) {
+        ComPtr<ID3D12Debug> debugController;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debugController)))) {
+            debugController->EnableDebugLayer();
+        } else {
+            std::cout << "Failed to enable D3D12 debug layer\n";
+        }
 
-    ComPtr<ID3D12Debug1> debugController1;
-    ASSERT_HRESULT(debugController->QueryInterface(IID_PPV_ARGS(&debugController1)));
-    debugController1->SetEnableGPUBasedValidation(true);
-    // #endif
+        ComPtr<ID3D12Debug1> debugController1;
+        ASSERT_HRESULT(debugController->QueryInterface(IID_PPV_ARGS(&debugController1)));
+        debugController1->SetEnableGPUBasedValidation(true);
+    }
 
     ComPtr<IDXGIFactory4> dxgiFactory;
     ASSERT_HRESULT(CreateDXGIFactory2(DXGI_CREATE_FACTORY_DEBUG, IID_PPV_ARGS(&dxgiFactory)));
@@ -1222,6 +1289,13 @@ void InitD3D(App& app)
     );
 
     ID3D12Device* device = app.device.Get();
+
+    D3D12MA::ALLOCATOR_DESC allocatorDesc = {};
+    allocatorDesc.pDevice = device;
+    allocatorDesc.pAdapter = adapter.Get();
+    ASSERT_HRESULT(
+        D3D12MA::CreateAllocator(&allocatorDesc, &app.mainAllocator)
+    );
 
     PrintCapabilities(device);
 
@@ -1391,6 +1465,8 @@ void InitApp(App& app, int argc, char** argv)
             }
         } else if (!strcmp(argv[i], "--borderless")) {
             app.borderlessFullscreen = true;
+        } else if (!strcmp(argv[i], "--gpudebug")) {
+            app.gpuDebug = true;
         }
     }
 
@@ -1416,7 +1492,7 @@ void WaitForPreviousFrame(App& app)
     app.frameIdx = app.swapChain->GetCurrentBackBufferIndex();
 }
 
-void LoadModelAsset(const App& app, AppAssets& assets, tinygltf::TinyGLTF& loader, const std::string& filePath)
+void LoadModelAsset(const App& app, AssetBundle& assets, tinygltf::TinyGLTF& loader, const std::string& filePath)
 {
     tinygltf::Model model;
     assets.models.push_back(model);
@@ -1432,9 +1508,48 @@ void LoadModelAsset(const App& app, AppAssets& assets, tinygltf::TinyGLTF& loade
     );
 }
 
-AppAssets LoadAssets(App& app)
+std::vector<unsigned char> LoadBinaryFile(const std::string& filePath)
 {
-    AppAssets assets;
+    std::ifstream file(filePath, std::ios::binary);
+
+    file.unsetf(std::ios::skipws);
+
+    std::streampos fileSize;
+    file.seekg(0, std::ios::end);
+    fileSize = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    std::vector<unsigned char> data;
+    data.reserve(fileSize);
+
+    data.insert(data.begin(), std::istream_iterator<unsigned char>(file), std::istream_iterator<unsigned char>());
+
+    return data;
+}
+
+tinygltf::Image LoadImageFile(const std::string& imagePath)
+{
+    tinygltf::Image image;
+
+    auto fileData = LoadBinaryFile(imagePath);
+    unsigned char* imageData = stbi_load_from_memory(fileData.data(), fileData.size(), &image.width, &image.height, &image.component, STBI_rgb_alpha);
+    if (!imageData) {
+        std::cout << "Failed to load " << imagePath << ": " << stbi_failure_reason() << "\n";
+        assert(false);
+    }
+    image.pixel_type = TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE;
+
+    // Copy image data over
+    image.image.assign(imageData, imageData + (image.width * image.height * STBI_rgb_alpha));
+
+    stbi_image_free(imageData);
+
+    return image;
+}
+
+AssetBundle LoadAssets(App& app)
+{
+    AssetBundle assets;
 
     tinygltf::TinyGLTF loader;
     std::string err;
@@ -1442,8 +1557,15 @@ AppAssets LoadAssets(App& app)
 
     LoadModelAsset(app, assets, loader, app.dataDir + "/floor/floor.gltf");
     LoadModelAsset(app, assets, loader, app.dataDir + "/FlightHelmet/FlightHelmet.gltf");
-    // LoadModelAsset(app, assets, loader, app.dataDir + "/Suzanne.gltf");
-    // LoadModelAsset(app, assets, loader, app.dataDir + "/skybox/skybox.gltf");
+
+    SkyboxAssets skybox;
+    skybox.images[SkyboxImage_Front] = LoadImageFile(app.dataDir + "/skybox/front.png");
+    skybox.images[SkyboxImage_Back] = LoadImageFile(app.dataDir + "/skybox/back.png");
+    skybox.images[SkyboxImage_Left] = LoadImageFile(app.dataDir + "/skybox/left.png");
+    skybox.images[SkyboxImage_Right] = LoadImageFile(app.dataDir + "/skybox/right.png");
+    skybox.images[SkyboxImage_Top] = LoadImageFile(app.dataDir + "/skybox/top.png");
+    skybox.images[SkyboxImage_Bottom] = LoadImageFile(app.dataDir + "/skybox/bottom.png");
+    assets.skybox = skybox;
 
     return assets;
 }
@@ -1790,10 +1912,10 @@ glm::mat4 GetNodeTransfomMatrix(const tinygltf::Node& node) {
     }
 }
 
-void TraverseNode(const tinygltf::Model& model, const tinygltf::Node& node, std::vector<Mesh>& meshes, const glm::mat4& accumulator) {
+void TraverseNode(const tinygltf::Model& model, const tinygltf::Node& node, std::vector<PoolItem<Mesh>>& meshes, const glm::mat4& accumulator) {
     glm::mat4 transform = accumulator * GetNodeTransfomMatrix(node);
     if (node.mesh != -1) {
-        meshes[node.mesh].baseModelTransform = transform;
+        meshes[node.mesh]->baseModelTransform = transform;
     }
     for (const auto& child : node.children) {
         TraverseNode(model, model.nodes[child], meshes, transform);
@@ -1803,7 +1925,7 @@ void TraverseNode(const tinygltf::Model& model, const tinygltf::Node& node, std:
 // Traverse the GLTF scene to get the correct model matrix for each mesh.
 void ResolveMeshTransforms(
     const tinygltf::Model& model,
-    std::vector<Mesh>& meshes
+    std::vector<PoolItem<Mesh>>& meshes
 )
 {
     if (model.scenes.size() == 0) {
@@ -1849,12 +1971,22 @@ void FinalizeModel(
 
     const std::vector<ComPtr<ID3D12Resource>>& resourceBuffers = outputModel.buffers;
 
-    for (const auto& mesh : inputModel.meshes) {
-        std::vector<Primitive> primitives;
-        for (const auto& primitive : mesh.primitives) {
-            Primitive drawCall;
+    int perPrimitiveDescriptorIdx = 0;
 
-            std::vector<D3D12_VERTEX_BUFFER_VIEW>& vertexBufferViews = drawCall.vertexBufferViews;
+    for (const auto& mesh : inputModel.meshes) {
+        outputModel.meshes.emplace_back(std::move(app.meshPool.AllocateUnique()));
+        PoolItem<Mesh>& newMesh = outputModel.meshes.back();
+        newMesh->name = mesh.name;
+        std::vector<PoolItem<Primitive>>& primitives = newMesh->primitives;
+        for (const auto& primitive : mesh.primitives) {
+            primitives.emplace_back(app.primitivePool.AllocateUnique());
+            Primitive* drawCall = primitives.back().get();
+
+            drawCall->perPrimitiveDescriptor = outputModel.primitiveDataDescriptors + perPrimitiveDescriptorIdx;
+            drawCall->constantData = &outputModel.perPrimitiveBufferPtr[perPrimitiveDescriptorIdx];
+            perPrimitiveDescriptorIdx++;
+
+            std::vector<D3D12_VERTEX_BUFFER_VIEW>& vertexBufferViews = drawCall->vertexBufferViews;
 
             // Track what addresses are mapped to a vertex buffer view.
             // 
@@ -1868,7 +2000,7 @@ void FinalizeModel(
 
             // Build per drawcall data 
             // input layout and vertex buffer views
-            std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout = drawCall.inputLayout;
+            std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout = drawCall->inputLayout;
             inputLayout.reserve(primitive.attributes.size());
             int InputSlotCount = 0;
             std::map<int, int> bufferViewToInputSlotMap;
@@ -1925,7 +2057,7 @@ void FinalizeModel(
 
                     inputLayout.push_back(desc);
 
-                    D3D12_PRIMITIVE_TOPOLOGY& topology = drawCall.primitiveTopology;
+                    D3D12_PRIMITIVE_TOPOLOGY& topology = drawCall->primitiveTopology;
                     switch (primitive.mode)
                     {
                     case TINYGLTF_MODE_POINTS:
@@ -1959,46 +2091,46 @@ void FinalizeModel(
             }
 
             if (primitive.material != -1) {
-                drawCall.materialIndex = startingMaterialIndex + primitive.material;
-                if (app.materials[drawCall.materialIndex].materialType == MaterialType_PBR) {
-                    drawCall.PSO = CreateMeshPBRPSO(
+                drawCall->materialIndex = startingMaterialIndex + primitive.material;
+                if (app.materials[drawCall->materialIndex].materialType == MaterialType_PBR) {
+                    drawCall->PSO = CreateMeshPBRPSO(
                         app.psoManager,
                         app.device.Get(),
                         app.dataDir,
                         app.rootSignature.Get(),
-                        drawCall.inputLayout
+                        drawCall->inputLayout
                     );
-                } else if (app.materials[drawCall.materialIndex].materialType == MaterialType_AlphaBlendPBR) {
-                    drawCall.PSO = CreateMeshAlphaBlendedPBRPSO(
+                } else if (app.materials[drawCall->materialIndex].materialType == MaterialType_AlphaBlendPBR) {
+                    drawCall->PSO = CreateMeshAlphaBlendedPBRPSO(
                         app.psoManager,
                         app.device.Get(),
                         app.dataDir,
                         app.rootSignature.Get(),
-                        drawCall.inputLayout
+                        drawCall->inputLayout
                     );
-                } else if (app.materials[drawCall.materialIndex].materialType == MaterialType_Unlit) {
-                    drawCall.PSO = CreateMeshUnlitPSO(
+                } else if (app.materials[drawCall->materialIndex].materialType == MaterialType_Unlit) {
+                    drawCall->PSO = CreateMeshUnlitPSO(
                         app.psoManager,
                         app.device.Get(),
                         app.dataDir,
                         app.rootSignature.Get(),
-                        drawCall.inputLayout
+                        drawCall->inputLayout
                     );
                 }
             } else {
                 // Just pray this will work
-                drawCall.materialIndex = -1;
-                drawCall.PSO = CreateMeshUnlitPSO(
+                drawCall->materialIndex = -1;
+                drawCall->PSO = CreateMeshUnlitPSO(
                     app.psoManager,
                     app.device.Get(),
                     app.dataDir,
                     app.rootSignature.Get(),
-                    drawCall.inputLayout
+                    drawCall->inputLayout
                 );
             }
 
             {
-                D3D12_INDEX_BUFFER_VIEW& ibv = drawCall.indexBufferView;
+                D3D12_INDEX_BUFFER_VIEW& ibv = drawCall->indexBufferView;
                 int accessorIdx = primitive.indices;
                 auto& accessor = inputModel.accessors[accessorIdx];
                 int indexBufferViewIdx = accessor.bufferView;
@@ -2008,6 +2140,8 @@ void FinalizeModel(
                 switch (accessor.componentType) {
                 case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
                     ibv.Format = DXGI_FORMAT_R8_UINT;
+                    std::cout << "GLTF mesh uses byte indices which aren't supported " << mesh.name;
+                    abort();
                     break;
                 case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT:
                     ibv.Format = DXGI_FORMAT_R16_UINT;
@@ -2016,17 +2150,10 @@ void FinalizeModel(
                     ibv.Format = DXGI_FORMAT_R32_UINT;
                     break;
                 };
-                drawCall.indexCount = (UINT)accessor.count;
-                app.Stats.triangleCount += drawCall.indexCount;
+                drawCall->indexCount = (UINT)accessor.count;
+                app.Stats.triangleCount += drawCall->indexCount;
             }
-
-            primitives.push_back(drawCall);
         }
-
-        Mesh newMesh{};
-        newMesh.primitives = primitives;
-        newMesh.name = mesh.name;
-        outputModel.meshes.push_back(newMesh);
     }
 
     ResolveMeshTransforms(inputModel, outputModel.meshes);
@@ -2053,7 +2180,366 @@ bool ValidateGLTFModel(const tinygltf::Model& model)
     return true;
 }
 
-void ProcessAssets(App& app, const AppAssets& assets)
+bool ValidateSkyboxAssets(const SkyboxAssets& assets)
+{
+    auto resourceDesc = GetImageResourceDesc(assets.images[0]);
+    for (int i = 1; i < assets.images.size(); i++) {
+        if (GetImageResourceDesc(assets.images[i]) != resourceDesc) {
+            std::cout << "Error: all skybox images must have the same image format and dimensions\n";
+            return false;
+        }
+    }
+
+    return true;
+}
+
+template<class T>
+Primitive CreatePrimitiveFromGeometryData(
+    ID3D12Device* device,
+    ID3D12GraphicsCommandList* commandList,
+    ComPtr<ID3D12Resource>& outGeometryBuffer,
+    ComPtr<ID3D12Resource>& uploadHeap,
+    const std::vector<T>& vertexData,
+    const std::vector<unsigned int> indices,
+    const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout,
+    ManagedPSORef PSO
+)
+{
+    UINT64 requiredBufferSize = sizeof(T) * vertexData.size() + sizeof(unsigned int) * indices.size();
+    CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
+    auto resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(requiredBufferSize);
+    auto resourceState = D3D12_RESOURCE_STATE_COMMON;
+    ASSERT_HRESULT(
+        device->CreateCommittedResource(
+            &heapProps,
+            D3D12_HEAP_FLAG_NONE,
+            &resourceDesc,
+            resourceState,
+            nullptr,
+            IID_PPV_ARGS(&outGeometryBuffer)
+        )
+    );
+
+    void* uploadHeapPtr;
+    uploadHeap->Map(0, nullptr, uploadHeapPtr);
+    auto vertexBlockSize = vertexData.size() * sizeof(T);
+    auto indexBlockSize = sizeof(unsigned int) * indices.size();
+    memcpy(uploadHeapPtr, (void*)vertexData.data(), vertexBlockSize);
+    memcpy(uploadHeapPtr + vertexBlockSize, (void*)indices.data(), indexBlockSize);
+    uploadHeap->Unmap(0, nullptr);
+
+    commandList->CopyBufferRegion(outGeometryBuffer, 0, uploadHeap, 0, requiredBufferSize);
+
+    D3D12_VERTEX_BUFFER_VIEW vertexView{};
+    vertexView.BufferLocation = outGeometryBuffer->GetGPUVirtualAddress();
+    vertexView.SizeInBytes = (UINT)vertexBlockSize;
+    vertexView.StrideInBytes = sizeof(T);
+
+    D3D12_INDEX_BUFFER_VIEW indexView{};
+    indexView.BufferLocation = outGeometryBuffer->GetGPUVirtualAddress() + vertexBlockSize;
+    indexView.Format = DXGI_FORMAT_R32_UINT;
+    indexView.SizeInBytes = indexBlockSize;
+
+    Primitive primitive;
+}
+
+class UploadBatch
+{
+public:
+    void AddResource(ID3D12Resource* resource, D3D12_SUBRESOURCE_DATA* subresourceData, UINT64 srcOffset, int subresource, int numSubresources)
+    {
+        UploadEntry uploadEntry;
+        uploadEntry.destBuffer = resource;
+        uploadEntry.destOffset = 0;
+        uploadEntry.numSubresources = numSubresources;
+        uploadEntry.subresource = subresource;
+        uploadEntry.srcData = subresourceData;
+        uploadEntries.push_back(uploadEntry);
+
+        requiredUploadSize += GetRequiredIntermediateSize(resource, subresource, numSubresources);
+    }
+
+    void Execute(D3D12MA::Allocator* allocator, ID3D12GraphicsCommandList* commandList)
+    {
+        auto uploadBufferDesc = CD3DX12_RESOURCE_DESC::Buffer(requiredUploadSize);
+        D3D12MA::ALLOCATION_DESC allocDesc{};
+        allocDesc.HeapType = D3D12_HEAP_TYPE_UPLOAD;
+        ASSERT_HRESULT(
+            allocator->CreateResource(
+                &allocDesc,
+                &uploadBufferDesc,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                nullptr,
+                uploadBuffer.GetAddressOf(),
+                IID_NULL,
+                nullptr
+            )
+        );
+
+        UINT64 intermediateOffset = 0;
+        for (const auto& entry : uploadEntries) {
+            intermediateOffset += UpdateSubresources(
+                commandList,
+                entry.destBuffer,
+                uploadBuffer->GetResource(),
+                intermediateOffset,
+                entry.subresource,
+                entry.numSubresources,
+                entry.srcData
+            );
+        }
+    }
+
+    struct UploadEntry {
+        ID3D12Resource* destBuffer;
+        UINT64 destOffset;
+        int subresource;
+        int numSubresources;
+        D3D12_SUBRESOURCE_DATA* srcData;
+        UINT64 srcOffset;
+    };
+
+private:
+    std::vector<UploadEntry> uploadEntries;
+    UINT64 requiredUploadSize = 0;
+    ComPtr<D3D12MA::Allocation> uploadBuffer;
+};
+
+void CreateSkybox(App& app, const SkyboxAssets& asset, ID3D12GraphicsCommandList* commandList)
+{
+    if (!ValidateSkyboxAssets(asset)) {
+        return;
+    }
+
+    ComPtr<D3D12MA::Allocation> cubemap;
+    ComPtr<D3D12MA::Allocation> vertexBuffer;
+    ComPtr<D3D12MA::Allocation> indexBuffer;
+    ComPtr<D3D12MA::Allocation> perPrimitiveBuffer;
+
+    auto cubemapDesc = GetImageResourceDesc(asset.images[0]);
+    cubemapDesc.DepthOrArraySize = SkyboxImage_Count;
+    {
+        D3D12MA::ALLOCATION_DESC allocDesc{};
+        allocDesc.HeapType = D3D12_HEAP_TYPE_DEFAULT;
+        ASSERT_HRESULT(
+            app.mainAllocator->CreateResource(
+                &allocDesc,
+                &cubemapDesc,
+                D3D12_RESOURCE_STATE_COMMON,
+                nullptr,
+                &cubemap,
+                IID_NULL, nullptr
+            )
+        );
+    }
+
+    {
+        auto resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(sizeof(PerPrimitiveConstantData));
+
+        D3D12MA::ALLOCATION_DESC allocDesc{};
+        allocDesc.HeapType = D3D12_HEAP_TYPE_UPLOAD;
+        ASSERT_HRESULT(
+            app.mainAllocator->CreateResource(
+                &allocDesc,
+                &resourceDesc,
+                D3D12_RESOURCE_STATE_COMMON,
+                nullptr,
+                &perPrimitiveBuffer,
+                IID_NULL, nullptr
+            )
+        );
+    }
+
+    DescriptorReference perPrimitiveCbv = app.GBufferPass.descriptorHeap.AllocateDescriptors(1, "Skybox PerPrimitive CBV");
+    D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
+    cbvDesc.BufferLocation = perPrimitiveBuffer->GetResource()->GetGPUVirtualAddress();
+    cbvDesc.SizeInBytes = sizeof(PerPrimitiveConstantData);
+    app.device->CreateConstantBufferView(&cbvDesc, perPrimitiveCbv.CPUHandle());
+
+    D3D12_SUBRESOURCE_DATA cubemapSubresourceData[SkyboxImage_Count] = {};
+    for (int i = 0; i < SkyboxImage_Count; i++) {
+        cubemapSubresourceData[i].pData = asset.images[i].image.data();
+        cubemapSubresourceData[i].RowPitch = asset.images[i].width * asset.images[i].component;
+        cubemapSubresourceData[i].SlicePitch = asset.images[i].height * cubemapSubresourceData[i].RowPitch;
+    }
+
+    UploadBatch uploadBatch;
+    uploadBatch.AddResource(cubemap->GetResource(), cubemapSubresourceData, 0, 0, SkyboxImage_Count);
+
+    DescriptorReference texcubeSRV = app.GBufferPass.descriptorHeap.AllocateDescriptors(1, "Skybox SRV");
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDesc.Format = cubemapDesc.Format;
+    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+    srvDesc.TextureCube.MipLevels = 1;
+    app.device->CreateShaderResourceView(
+        cubemap->GetResource(),
+        &srvDesc,
+        texcubeSRV.CPUHandle()
+    );
+
+    app.Skybox.cubemap = cubemap;
+    app.Skybox.texcubeSRV = texcubeSRV;
+
+    std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout = {
+        {
+            "POSITION",                                 // SemanticName
+            0,                                          // SemanticIndex
+            DXGI_FORMAT_R32G32B32_FLOAT,                // Format
+            0,                                          // InputSlot
+            D3D12_APPEND_ALIGNED_ELEMENT,               // AlignedByteOffset
+            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, // InputSlotClass
+            0                                           // InstanceDataStepRate
+        },
+        // {
+        //     "TEXCOORD",                                 // SemanticName
+        //     0,                                          // SemanticIndex
+        //     DXGI_FORMAT_R32G32B32_FLOAT,                // Format
+        //     0,                                          // InputSlot
+        //     D3D12_APPEND_ALIGNED_ELEMENT,               // AlignedByteOffset
+        //     D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, // InputSlotClass
+        //     0                                           // InstanceDataStepRate
+        // },
+    };
+
+    float vertexData[] = {
+        // front
+        -1.0, -1.0,  1.0,
+         1.0, -1.0,  1.0,
+         1.0,  1.0,  1.0,
+        -1.0,  1.0,  1.0,
+        // back
+        -1.0, -1.0, -1.0,
+         1.0, -1.0, -1.0,
+         1.0,  1.0, -1.0,
+        -1.0,  1.0, -1.0
+    };
+
+    unsigned short indices[] =
+    {
+        // front
+        0, 1, 2,
+        2, 3, 0,
+        // right
+        1, 5, 6,
+        6, 2, 1,
+        // back
+        7, 6, 5,
+        5, 4, 7,
+        // left
+        4, 0, 3,
+        3, 7, 4,
+        // bottom
+        4, 5, 1,
+        1, 0, 4,
+        // top
+        3, 2, 6,
+        6, 7, 3
+    };
+
+    {
+        auto resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(sizeof(vertexData));
+        D3D12MA::ALLOCATION_DESC allocDesc{};
+        allocDesc.HeapType = D3D12_HEAP_TYPE_DEFAULT;
+        ASSERT_HRESULT(
+            app.mainAllocator->CreateResource(
+                &allocDesc,
+                &resourceDesc,
+                D3D12_RESOURCE_STATE_COMMON,
+                nullptr,
+                &vertexBuffer,
+                IID_NULL, nullptr
+            )
+        );
+    }
+
+    {
+        auto resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(sizeof(indices));
+        D3D12MA::ALLOCATION_DESC allocDesc{};
+        allocDesc.HeapType = D3D12_HEAP_TYPE_DEFAULT;
+        ASSERT_HRESULT(
+            app.mainAllocator->CreateResource(
+                &allocDesc,
+                &resourceDesc,
+                D3D12_RESOURCE_STATE_COMMON,
+                nullptr,
+                &indexBuffer,
+                IID_NULL, nullptr
+            )
+        );
+    }
+
+    D3D12_SUBRESOURCE_DATA vertexSubresourceData;
+    vertexSubresourceData.pData = vertexData;
+    vertexSubresourceData.RowPitch = sizeof(vertexData);
+    vertexSubresourceData.SlicePitch = sizeof(vertexData);
+    uploadBatch.AddResource(vertexBuffer->GetResource(), &vertexSubresourceData, 0, 0, 1);
+
+    D3D12_SUBRESOURCE_DATA indicesSubresourceData;
+    indicesSubresourceData.pData = indices;
+    indicesSubresourceData.RowPitch = sizeof(indices);
+    indicesSubresourceData.SlicePitch = sizeof(indices);
+    uploadBatch.AddResource(indexBuffer->GetResource(), &indicesSubresourceData, 0, 0, 1);
+
+    uploadBatch.Execute(app.mainAllocator.Get(), commandList);
+
+    PoolItem<Primitive> primitive = app.primitivePool.AllocateUnique();
+    primitive->indexBufferView.BufferLocation = indexBuffer->GetResource()->GetGPUVirtualAddress();
+    primitive->indexBufferView.Format = DXGI_FORMAT_R16_UINT;
+    primitive->indexBufferView.SizeInBytes = sizeof(indices);
+
+    D3D12_VERTEX_BUFFER_VIEW vertexView;
+    vertexView.BufferLocation = vertexBuffer->GetResource()->GetGPUVirtualAddress();
+    vertexView.SizeInBytes = sizeof(vertexData);
+    vertexView.StrideInBytes = sizeof(glm::vec3);
+    primitive->vertexBufferViews.push_back(vertexView);
+
+    primitive->PSO = CreateSkyboxPSO(
+        app.psoManager,
+        app.device.Get(),
+        app.dataDir,
+        app.rootSignature.Get(),
+        inputLayout
+    );
+
+    primitive->perPrimitiveDescriptor = perPrimitiveCbv;
+
+    primitive->primitiveTopology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    primitive->indexCount = _countof(indices);
+
+    primitive->miscDescriptorParameter = texcubeSRV;
+
+    perPrimitiveBuffer->GetResource()->Map(0, nullptr, reinterpret_cast<void**>(&primitive->constantData));
+
+    app.Skybox.mesh = app.meshPool.AllocateUnique();
+    app.Skybox.mesh->primitives.emplace_back(std::move(primitive));
+    app.Skybox.mesh->baseModelTransform = glm::scale(glm::mat4(1.0f), glm::vec3(50.0f));
+    app.Skybox.mesh->name = "Skybox";
+
+    app.Skybox.cubemap = cubemap;
+    app.Skybox.indexBuffer = indexBuffer;
+    app.Skybox.vertexBuffer = vertexBuffer;
+    app.Skybox.perPrimitiveConstantBuffer = perPrimitiveBuffer;
+
+    commandList->Close();
+
+    ID3D12CommandList* ppCommandLists[] = { commandList };
+    app.commandQueue->ExecuteCommandLists(1, ppCommandLists);
+    WaitForPreviousFrame(app);
+
+    // Primitive primitive;
+    // primitive.PSO = CreateSkyboxPSO(
+    //     app.psoManager,
+    //     app.device.Get(),
+    //     app.dataDir,
+    //     app.rootSignature.Get(),
+    //     inputLayout
+    // );
+    // primitive.inputLayout = inputLayout;
+}
+
+void ProcessAssets(App& app, const AssetBundle& assets)
 {
     app.commandList->Close();
 
@@ -2100,7 +2586,7 @@ void ProcessAssets(App& app, const AppAssets& assets)
         CreateModelMaterials(app, gltfModel, model, startingMaterialIndex);
         FinalizeModel(model, app, gltfModel, startingMaterialIndex);
 
-        app.models.push_back(model);
+        app.models.push_back(std::move(model));
 
         app.commandList->Close();
 
@@ -2117,7 +2603,9 @@ void ProcessAssets(App& app, const AppAssets& assets)
         );
     }
 
-    app.commandList->Close();
+    if (assets.skybox.has_value()) {
+        CreateSkybox(app, assets.skybox.value(), app.commandList.Get());
+    }
 }
 
 void InitializeCamera(App& app)
@@ -2166,31 +2654,53 @@ glm::mat4 ApplyStandardTransforms(const glm::mat4& base, glm::vec3 translation, 
     return transform;
 }
 
-void UpdatePerPrimitiveConstantBuffers(Model& model, const glm::mat4& projection, const glm::mat4& view)
+void UpdatePerPrimitiveConstantBuffers(App& app, const glm::mat4& projection, const glm::mat4& view)
 {
     glm::mat4 viewProjection = projection * view;
-    PerPrimitiveConstantData* perPrimitiveBuffer = reinterpret_cast<PerPrimitiveConstantData*>(model.perPrimitiveBufferPtr);
-    for (int i = 0; i < model.meshes.size(); i++) {
-        auto& mesh = model.meshes[i];
+    // PerPrimitiveConstantData* perPrimitiveBuffer = reinterpret_cast<PerPrimitiveConstantData*>(model.perPrimitiveBufferPtr);
+    // for (int i = 0; i < model.meshes.size(); i++) {
+    //     auto& mesh = model.meshes[i];
+
+    //     auto modelMatrix = ApplyStandardTransforms(
+    //         mesh->baseModelTransform,
+    //         mesh->translation,
+    //         mesh->euler,
+    //         mesh->scale
+    //     );
+
+    //     auto mvp = viewProjection * modelMatrix;
+    //     auto mv = view * modelMatrix;
+    //     for (const auto& primitive : mesh->primitives) {
+    //         perPrimitiveBuffer->MVP = mvp;
+    //         perPrimitiveBuffer->MV = mv;
+    //         perPrimitiveBuffer++;
+    //     }
+    // }
+
+    auto meshIter = app.meshPool.Begin();
+
+    while (meshIter) {
+        auto& mesh = meshIter.item;
 
         auto modelMatrix = ApplyStandardTransforms(
-            mesh.baseModelTransform,
-            mesh.translation,
-            mesh.euler,
-            mesh.scale
+            mesh->baseModelTransform,
+            mesh->translation,
+            mesh->euler,
+            mesh->scale
         );
 
         auto mvp = viewProjection * modelMatrix;
         auto mv = view * modelMatrix;
-        for (const auto& primitive : mesh.primitives) {
-            perPrimitiveBuffer->MVP = mvp;
-            perPrimitiveBuffer->MV = mv;
-            perPrimitiveBuffer++;
+        for (const auto& primitive : mesh->primitives) {
+            primitive->constantData->MVP = mvp;
+            primitive->constantData->MV = mv;
         }
+        meshIter = app.meshPool.Next(meshIter);
     }
 }
 
-void UpdateLightConstantBuffers(App& app, const glm::mat4& projection, const glm::mat4& view) {
+void UpdateLightConstantBuffers(App& app, const glm::mat4& projection, const glm::mat4& view)
+{
     app.LightBuffer.passData->inverseProjectionMatrix = glm::inverse(projection);
 
     for (int i = 0; i < app.LightBuffer.count; i++) {
@@ -2260,44 +2770,66 @@ void UpdateScene(App& app)
     glm::mat4 projection = glm::perspective(glm::pi<float>() * 0.2f, (float)app.windowWidth / (float)app.windowHeight, 0.1f, 4000.0f);
     glm::mat4 view = UpdateFlyCamera(app, deltaSeconds);
 
-    UpdateLightConstantBuffers(app, projection, view);
+    app.Skybox.mesh->translation = app.camera.translation;
 
-    for (auto& model : app.models) {
-        UpdatePerPrimitiveConstantBuffers(model, projection, view);
-    }
+    UpdateLightConstantBuffers(app, projection, view);
+    UpdatePerPrimitiveConstantBuffers(app, projection, view);
 }
 
-DescriptorReference GetMaterialDescriptor(const App& app, const Model& model, int materialIndex)
+DescriptorReference GetMaterialDescriptor(const App& app, int materialIndex)
 {
     return app.materials[materialIndex].cbvDescriptor;
 }
 
-void DrawModelGBuffer(App& app, const Model& model, ID3D12GraphicsCommandList* commandList)
+void DrawMeshesGBuffer(App& app, ID3D12GraphicsCommandList* commandList)
 {
-    int constantBufferIdx = model.primitiveDataDescriptors.index;
-    for (const auto& mesh : model.meshes) {
-        for (const auto& primitive : mesh.primitives) {
-            const auto& material = app.materials[primitive.materialIndex];
+    // for (const auto& mesh : model.meshes) {
+    //     for (const auto& primitive : mesh->primitives) {
+    //         const auto& material = app.materials[primitive->materialIndex];
+    //         // FIXME: if I am not lazy I will SORT by material type
+    //         // Transparent materials drawn in different pass
+    //         if (material.materialType == MaterialType_AlphaBlendPBR) {
+    //             continue;
+    //         }
+    //         auto materialDescriptor = GetMaterialDescriptor(app, model, primitive->materialIndex);
+
+    //         // Set the per-primitive constant buffer
+    //         UINT constantValues[2] = { primitive->perPrimitiveDescriptor.index, materialDescriptor.index };
+    //         commandList->SetGraphicsRoot32BitConstants(0, 2, constantValues, 0);
+    //         commandList->IASetPrimitiveTopology(primitive->primitiveTopology);
+    //         commandList->SetPipelineState(primitive->PSO->Get());
+    //         commandList->IASetVertexBuffers(0, (UINT)primitive->vertexBufferViews.size(), primitive->vertexBufferViews.data());
+    //         commandList->IASetIndexBuffer(&primitive->indexBufferView);
+    //         commandList->DrawIndexedInstanced(primitive->indexCount, 1, 0, 0, 0);
+
+    //         app.Stats.drawCalls++;
+    //     }
+    // }
+
+    auto meshIter = app.meshPool.Begin();
+
+    while (meshIter) {
+        for (const auto& primitive : meshIter->primitives) {
+            const auto& material = app.materials[primitive->materialIndex];
             // FIXME: if I am not lazy I will SORT by material type
             // Transparent materials drawn in different pass
             if (material.materialType == MaterialType_AlphaBlendPBR) {
-                constantBufferIdx++;
                 continue;
             }
-            auto materialDescriptor = GetMaterialDescriptor(app, model, primitive.materialIndex);
+            auto materialDescriptor = GetMaterialDescriptor(app, primitive->materialIndex);
 
             // Set the per-primitive constant buffer
-            UINT constantValues[2] = { constantBufferIdx, materialDescriptor.index };
-            commandList->SetGraphicsRoot32BitConstants(0, 2, constantValues, 0);
-            commandList->IASetPrimitiveTopology(primitive.primitiveTopology);
-            commandList->SetPipelineState(primitive.PSO->Get());
-            commandList->IASetVertexBuffers(0, (UINT)primitive.vertexBufferViews.size(), primitive.vertexBufferViews.data());
-            commandList->IASetIndexBuffer(&primitive.indexBufferView);
-            commandList->DrawIndexedInstanced(primitive.indexCount, 1, 0, 0, 0);
-            constantBufferIdx++;
+            UINT constantValues[5] = { primitive->perPrimitiveDescriptor.index, materialDescriptor.index, 0, 0, primitive->miscDescriptorParameter.index };
+            commandList->SetGraphicsRoot32BitConstants(0, _countof(constantValues), constantValues, 0);
+            commandList->IASetPrimitiveTopology(primitive->primitiveTopology);
+            commandList->SetPipelineState(primitive->PSO->Get());
+            commandList->IASetVertexBuffers(0, (UINT)primitive->vertexBufferViews.size(), primitive->vertexBufferViews.data());
+            commandList->IASetIndexBuffer(&primitive->indexBufferView);
+            commandList->DrawIndexedInstanced(primitive->indexCount, 1, 0, 0, 0);
 
             app.Stats.drawCalls++;
         }
+        meshIter = app.meshPool.Next(meshIter);
     }
 }
 
@@ -2306,31 +2838,29 @@ void DrawModelAlphaBlendedMeshes(App& app, const Model& model, ID3D12GraphicsCom
     // FIXME: This seems like a bad looping order..
     int constantBufferIdx = model.primitiveDataDescriptors.index;
     for (const auto& mesh : model.meshes) {
-        for (const auto& primitive : mesh.primitives) {
-            const auto& material = app.materials[primitive.materialIndex];
+        for (const auto& primitive : mesh->primitives) {
+            const auto& material = app.materials[primitive->materialIndex];
             // FIXME: if I am not lazy I will SORT by material type
             // Only draw alpha blended materials in this pass.
             if (material.materialType != MaterialType_AlphaBlendPBR) {
-                constantBufferIdx++;
+                //constantBufferIdx++;
                 continue;
             }
-            auto materialDescriptor = GetMaterialDescriptor(app, model, primitive.materialIndex);
+            auto materialDescriptor = GetMaterialDescriptor(app, primitive->materialIndex);
 
             for (int lightIdx = 0; lightIdx < app.LightBuffer.count; lightIdx++) {
                 int lightDescriptorIndex = app.LightBuffer.cbvHandle.index + lightIdx + 1;
                 // Set the per-primitive constant buffer
-                std::array<UINT, 3> constantValues = { constantBufferIdx, materialDescriptor.index, lightDescriptorIndex };
+                std::array<UINT, 3> constantValues = { primitive->perPrimitiveDescriptor.index, materialDescriptor.index, lightDescriptorIndex };
                 commandList->SetGraphicsRoot32BitConstants(0, constantValues.size(), constantValues.data(), 0);
-                commandList->IASetPrimitiveTopology(primitive.primitiveTopology);
-                commandList->SetPipelineState(primitive.PSO->Get());
-                commandList->IASetVertexBuffers(0, (UINT)primitive.vertexBufferViews.size(), primitive.vertexBufferViews.data());
-                commandList->IASetIndexBuffer(&primitive.indexBufferView);
-                commandList->DrawIndexedInstanced(primitive.indexCount, 1, 0, 0, 0);
+                commandList->IASetPrimitiveTopology(primitive->primitiveTopology);
+                commandList->SetPipelineState(primitive->PSO->Get());
+                commandList->IASetVertexBuffers(0, (UINT)primitive->vertexBufferViews.size(), primitive->vertexBufferViews.data());
+                commandList->IASetIndexBuffer(&primitive->indexBufferView);
+                commandList->DrawIndexedInstanced(primitive->indexCount, 1, 0, 0, 0);
 
                 app.Stats.drawCalls++;
             }
-
-            constantBufferIdx++;
         }
     }
 }
@@ -2405,9 +2935,7 @@ void GBufferPass(App& app, ID3D12GraphicsCommandList* commandList)
     commandList->SetDescriptorHeaps(1, ppHeaps);
     commandList->SetGraphicsRootSignature(app.rootSignature.Get());
 
-    for (const auto& model : app.models) {
-        DrawModelGBuffer(app, model, commandList);
-    }
+    DrawMeshesGBuffer(app, commandList);
 }
 
 void LightPass(App& app, ID3D12GraphicsCommandList* commandList)
@@ -2598,15 +3126,15 @@ void DrawMeshEditor(App& app)
     if (ImGui::Begin("Meshes", &app.ImGui.meshesOpen, 0)) {
         Mesh* selectedMesh = nullptr;
 
-        if (ImGui::BeginListBox("Models")) {
+        if (ImGui::BeginListBox("Meshes")) {
             int meshIdx = 0;
             for (auto& model : app.models) {
                 for (auto& mesh : model.meshes) {
-                    std::string label = mesh.name;
+                    std::string label = mesh->name;
                     bool isSelected = meshIdx == selectedMeshIdx;
 
                     if (isSelected) {
-                        selectedMesh = &mesh;
+                        selectedMesh = mesh.get();
                     }
 
                     if (ImGui::Selectable(label.c_str(), isSelected)) {
@@ -2740,7 +3268,7 @@ void DrawMenuBar(App& app)
                 );
 
                 if (gltfFile != nullptr) {
-                    AppAssets assets;
+                    AssetBundle assets;
                     tinygltf::TinyGLTF loader;
                     LoadModelAsset(app, assets, loader, gltfFile);
                     ProcessAssets(app, assets);
@@ -2813,7 +3341,7 @@ int RunApp(int argc, char** argv)
     InitImGui(app);
 
     {
-        AppAssets assets = LoadAssets(app);
+        AssetBundle assets = LoadAssets(app);
         ProcessAssets(app, assets);
     }
 

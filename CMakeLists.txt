@@ -28,14 +28,16 @@ add_executable(mdxr
     src/util.h
     src/mdxr.h
     src/mdxr.cpp
-    src/tiny_gltf_impl.cpp
+    src/pool.h
 
     # third party
     src/stb_image.h
     src/stb_image_write.h
     src/json.hpp
     src/tiny_gltf.h
+    src/tiny_gltf_impl.cpp
     thirdparty/tinyfiledialogs.c
+    thirdparty/D3D12MemoryAllocator/src/D3D12MemAlloc.cpp
 
     ${IMGUI_SOURCES}
 )
@@ -43,6 +45,7 @@ add_executable(mdxr
 include_directories(thirdparty/include)
 include_directories(thirdparty/imgui/)
 include_directories(thirdparty/imgui/backends)
+include_directories(thirdparty/D3D12MemoryAllocator/include)
 
 target_compile_definitions(mdxr
     PRIVATE
