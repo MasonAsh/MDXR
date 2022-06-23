@@ -18,6 +18,10 @@ namespace internal {
 template<typename T>
 using PoolItem = std::unique_ptr<T, internal::PoolItemDeleter<T>>;
 
+
+template<typename T>
+using SharedPoolItem = std::shared_ptr<T>;
+
 template<typename T, int N>
 class PoolBlock {
 public:
@@ -34,6 +38,45 @@ public:
 
     template<typename... Args>
     PoolItem<T> AllocateUnique(Args... constructorArgs)
+    {
+        T* item = Allocate(constructorArgs...);
+        if (!item) {
+            return nullptr;
+        }
+
+        return PoolItem<T>(item, internal::PoolItemDeleter<T>(std::weak_ptr(deleterContext)));
+    }
+
+    template<typename... Args>
+    SharedPoolItem<T> AllocateShared(Args... constructorArgs)
+    {
+        T* item = Allocate(constructorArgs...);
+        if (!item) {
+            return nullptr;
+        }
+
+        return SharedPoolItem<T>(item, internal::PoolItemDeleter<T>(std::weak_ptr(deleterContext)));
+    }
+
+    bool HasFreeSpace() const
+    {
+        return firstFreeIndex != -1;
+    }
+
+    T* NextItem(T* item)
+    {
+        size_t index = item == nullptr ? 0 : (item - &items[0]) + 1;
+        for (; index < N; index++) {
+            if (liveItems[index]) {
+                return &items[index];
+            }
+        }
+
+        return nullptr;
+    }
+private:
+    template<typename... Args>
+    T* Allocate(Args... constructorArgs)
     {
         assert(firstFreeIndex == -1 || !liveItems[firstFreeIndex]);
         if (firstFreeIndex == -1) {
@@ -55,34 +98,16 @@ public:
                 }
             }
 
-            return PoolItem<T>(item, internal::PoolItemDeleter<T>(std::weak_ptr(deleterContext)));
+            return item;
         }
     }
 
-    bool HasFreeSpace() const
-    {
-        return firstFreeIndex != -1;
-    }
-
-    T* NextItem(T* item)
-    {
-        size_t index = item == nullptr ? 0 : (item - &items[0]) + 1;
-        for (; index < N; index++) {
-            if (liveItems[index]) {
-                return &items[index];
-            }
-        }
-
-        return nullptr;
-    }
-private:
     std::array<T, N> items;
     std::array<bool, N> liveItems;
     size_t firstFreeIndex = 0;
 
     std::shared_ptr<internal::PoolItemDeleterContext<T>> deleterContext;
 };
-
 
 namespace internal {
     template<typename T>
@@ -140,27 +165,15 @@ public:
     template<typename... Args>
     PoolItem<T> AllocateUnique(Args... constructorArgs)
     {
-        // If we don't have an active block it's a developer error.
-        // We can handle it in release builds however.
-        assert(activeAllocationBlock);
-
-        if (activeAllocationBlock == nullptr || !activeAllocationBlock->HasFreeSpace()) {
-            // Current block is out of space, see if any other blocks have freed space.
-            activeAllocationBlock = nullptr;
-            for (const auto& block : blocks) {
-                if (block->HasFreeSpace()) {
-                    activeAllocationBlock = block.get();
-                }
-            }
-        }
-
-        if (activeAllocationBlock == nullptr) {
-            // No active blocks have free space, so create another block.
-            blocks.emplace_back(new PoolBlock<T, BlockSize>);
-            activeAllocationBlock = blocks.back().get();
-        }
-
+        UpdateActiveBlock();
         return activeAllocationBlock->AllocateUnique(constructorArgs...);
+    }
+
+    template<typename... Args>
+    SharedPoolItem<T> AllocateShared(Args... constructorArgs)
+    {
+        UpdateActiveBlock();
+        return activeAllocationBlock->AllocateShared(constructorArgs...);
     }
 
     PoolIter Begin()
@@ -191,6 +204,30 @@ public:
         return next;
     }
 private:
+
+    void UpdateActiveBlock()
+    {
+        // If we don't have an active block it's a developer error.
+        // We can handle it in release builds however.
+        assert(activeAllocationBlock);
+
+        if (activeAllocationBlock == nullptr || !activeAllocationBlock->HasFreeSpace()) {
+            // Current block is out of space, see if any other blocks have freed space.
+            activeAllocationBlock = nullptr;
+            for (const auto& block : blocks) {
+                if (block->HasFreeSpace()) {
+                    activeAllocationBlock = block.get();
+                }
+            }
+        }
+
+        if (activeAllocationBlock == nullptr) {
+            // No active blocks have free space, so create another block.
+            blocks.emplace_back(new PoolBlock<T, BlockSize>);
+            activeAllocationBlock = blocks.back().get();
+        }
+    }
+
     std::vector<std::unique_ptr<PoolBlock<T, BlockSize>>> blocks;
     PoolBlock<T, BlockSize>* activeAllocationBlock;
 };

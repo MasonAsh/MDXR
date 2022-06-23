@@ -62,4 +62,6 @@ std::ostream& operator<< (std::ostream& out, const glm::vec3& vec) {
 #define CHECK(code) code
 #endif
 
+#define MDXR_ASSERT(code) if (!(code)) { abort(); }
+
 #endif // UTIL_H

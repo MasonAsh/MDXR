@@ -29,6 +29,7 @@ add_executable(mdxr
     src/mdxr.h
     src/mdxr.cpp
     src/pool.h
+    src/gltftangentspace.cpp
 
     # third party
     src/stb_image.h
@@ -38,6 +39,7 @@ add_executable(mdxr
     src/tiny_gltf_impl.cpp
     thirdparty/tinyfiledialogs.c
     thirdparty/D3D12MemoryAllocator/src/D3D12MemAlloc.cpp
+    thirdparty/mikktspace.c
 
     ${IMGUI_SOURCES}
 )

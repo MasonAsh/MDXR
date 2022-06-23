@@ -50,7 +50,7 @@ PSOutput PSMain(PSInput input)
     ConstantBuffer<MaterialData> mat = GetMaterial();
 
     // We can write ambient light straight to the backbuffer.
-    float4 ambient = { 0.05, 0.05, 0.05, 1.0 };
+    float4 ambient = { 0.00, 0.00, 0.00, 1.0 };
     result.backBuffer = ambient;
 
     // TODO: these checks be done through preprocessor and shader permutations instead

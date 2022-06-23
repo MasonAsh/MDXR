@@ -1,6 +1,7 @@
 #include "mdxr.h"
 #include "util.h"
 #include "pool.h"
+#include <algorithm>
 #include <iostream>
 #include <assert.h>
 #include <d3dcompiler.h>
@@ -29,8 +30,8 @@ using namespace std::chrono;
 
 const int FrameBufferCount = 2;
 const int MaxLightCount = 64;
-const int MaxMaterialCount = 128;
-const int MaxDescriptors = 2048;
+const int MaxMaterialCount = 2048;
+const int MaxDescriptors = 4096;
 const DXGI_FORMAT DepthFormat = DXGI_FORMAT_D32_FLOAT;
 
 enum ConstantIndex {
@@ -104,23 +105,6 @@ struct PSOManager {
     }
 };
 
-enum MaterialType {
-    MaterialType_Unlit,
-    MaterialType_PBR,
-    MaterialType_AlphaBlendPBR,
-};
-
-struct MaterialConstantData {
-    UINT baseColorTextureIdx;
-    UINT normalTextureIdx;
-    UINT metalRoughnessTextureIdx;
-
-    UINT materialType;
-
-    float padding[60];
-};
-static_assert((sizeof(MaterialConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
-
 struct DescriptorReference {
     ID3D12DescriptorHeap* heap;
     int incrementSize;
@@ -154,6 +138,47 @@ struct DescriptorReference {
     }
 };
 
+
+enum MaterialType {
+    MaterialType_Unlit,
+    MaterialType_PBR,
+    MaterialType_AlphaBlendPBR,
+};
+
+struct MaterialConstantData {
+    UINT baseColorTextureIdx;
+    UINT normalTextureIdx;
+    UINT metalRoughnessTextureIdx;
+
+    UINT materialType;
+
+    float padding[60];
+};
+static_assert((sizeof(MaterialConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
+
+struct MaterialTextureDescriptors {
+    DescriptorReference baseColor;
+    DescriptorReference normal;
+    DescriptorReference metalRoughness;
+};
+
+struct Material {
+    MaterialConstantData* constantData;
+    MaterialTextureDescriptors textureDescriptors;
+    DescriptorReference cbvDescriptor;
+
+    MaterialType materialType;
+
+    std::string name;
+
+    void UpdateConstantData()
+    {
+        constantData->baseColorTextureIdx = textureDescriptors.baseColor.index;
+        constantData->normalTextureIdx = textureDescriptors.normal.index;
+        constantData->metalRoughnessTextureIdx = textureDescriptors.metalRoughness.index;
+    }
+};
+
 struct Primitive {
     std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout;
     std::vector<D3D12_VERTEX_BUFFER_VIEW> vertexBufferViews;
@@ -168,6 +193,8 @@ struct Primitive {
     // Optional custom descriptor for special primitive shaders. Can be anything.
     // For example, the skybox uses this for the texcube shader parameter.
     DescriptorReference miscDescriptorParameter;
+
+    SharedPoolItem<Material> material = nullptr;
 };
 
 struct Mesh {
@@ -265,19 +292,21 @@ struct DescriptorArena {
 
 struct IncrementalFence {
     ComPtr<ID3D12Fence> fence;
-    int nextFenceValue;
+    UINT64 targetFenceValue;
+    UINT64 nextFenceValue;
     HANDLE event;
 
     void Initialize(ID3D12Device* device)
     {
+        targetFenceValue = 0;
         ASSERT_HRESULT(
             device->CreateFence(
-                0,
+                targetFenceValue,
                 D3D12_FENCE_FLAG_NONE,
                 IID_PPV_ARGS(&fence)
             )
         );
-        nextFenceValue = 1;
+        nextFenceValue = targetFenceValue + 1;
 
         event = CreateEvent(nullptr, false, false, nullptr);
         if (event == nullptr) {
@@ -289,15 +318,19 @@ struct IncrementalFence {
         }
     }
 
-    void SignalAndWaitQueue(ID3D12CommandQueue* commandQueue)
+    void Signal(ID3D12CommandQueue* commandQueue)
     {
+        CHECK(IsFinished());
         // Signal and increment the fence value.
-        const UINT64 targetFenceValue = nextFenceValue;
+        targetFenceValue = nextFenceValue;
         ASSERT_HRESULT(
             commandQueue->Signal(fence.Get(), targetFenceValue)
         );
         nextFenceValue++;
+    }
 
+    void Wait(ID3D12CommandQueue* commandQueue)
+    {
         // Wait until the previous frame is finished.
         if (fence->GetCompletedValue() < targetFenceValue)
         {
@@ -307,6 +340,17 @@ struct IncrementalFence {
 
             WaitForSingleObject(event, INFINITE);
         }
+    }
+
+    bool IsFinished()
+    {
+        return fence->GetCompletedValue() >= targetFenceValue;
+    }
+
+    void SignalAndWait(ID3D12CommandQueue* commandQueue)
+    {
+        Signal(commandQueue);
+        Wait(commandQueue);
     }
 };
 
@@ -366,34 +410,11 @@ struct LightConstantData {
 };
 static_assert((sizeof(LightConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
 
-struct MaterialTextureDescriptors {
-    DescriptorReference baseColor;
-    DescriptorReference normal;
-    DescriptorReference metalRoughness;
-};
-
 // Store descriptor sizes globally for convenience
 struct {
     int CbvSrvUav;
     int Rtv;
 } G_IncrementSizes;
-
-struct Material {
-    MaterialConstantData* constantData;
-    MaterialTextureDescriptors textureDescriptors;
-    DescriptorReference cbvDescriptor;
-
-    MaterialType materialType;
-
-    std::string name;
-
-    void UpdateConstantData()
-    {
-        constantData->baseColorTextureIdx = textureDescriptors.baseColor.index;
-        constantData->normalTextureIdx = textureDescriptors.normal.index;
-        constantData->metalRoughnessTextureIdx = textureDescriptors.metalRoughness.index;
-    }
-};
 
 template<class T>
 struct ConstantBufferSlice
@@ -483,6 +504,208 @@ struct Light {
     }
 };
 
+class UploadBatch
+{
+public:
+    const UINT64 MaxUploadSize = (UINT64)1000 * 1000 * 1000;
+
+    // Begins an upload batch.
+    // The batch has full control of the command queue during this time.
+    void Begin(D3D12MA::Allocator* allocator, ID3D12CommandAllocator* commandAllocator, ID3D12CommandQueue* commandQueue, IncrementalFence* fence)
+    {
+        this->allocator = allocator;
+        this->fence = fence;
+        this->commandQueue = commandQueue;
+        this->commandAllocator = commandAllocator;
+
+        commandAllocator->GetDevice(IID_PPV_ARGS(&device));
+        ASSERT_HRESULT(
+            device->CreateCommandList(
+                0,
+                D3D12_COMMAND_LIST_TYPE_COPY,
+                commandAllocator,
+                nullptr,
+                IID_PPV_ARGS(&commandList)
+            )
+        );
+        device->Release();
+
+        D3D12MA::Budget budget;
+        this->allocator->GetBudget(&budget, nullptr);
+
+        // Upload up to 1GB at a time
+        uploadBufferSize = std::min(MaxUploadSize, budget.BudgetBytes / 2);
+        D3D12MA::VIRTUAL_BLOCK_DESC blockDesc{};
+        blockDesc.Size = uploadBufferSize;
+        D3D12MA::CreateVirtualBlock(&blockDesc, &virtualBlock);
+
+        auto uploadBufferDesc = CD3DX12_RESOURCE_DESC::Buffer(uploadBufferSize);
+        D3D12MA::ALLOCATION_DESC allocDesc{};
+        allocDesc.HeapType = D3D12_HEAP_TYPE_UPLOAD;
+        ASSERT_HRESULT(
+            allocator->CreateResource(&allocDesc,
+                &uploadBufferDesc,
+                D3D12_RESOURCE_STATE_COMMON,
+                nullptr,
+                &this->uploadBuffer,
+                IID_NULL,
+                nullptr
+            )
+        );
+
+        uploadBuffer->GetResource()->Map(0, nullptr, reinterpret_cast<void**>(&uploadDataPtr));
+    }
+
+    void AddTexture(ID3D12Resource* destResource, D3D12_SUBRESOURCE_DATA* subresourceData, int subresource, int numSubresources)
+    {
+        // Suballocate one resource at a time. It's just easier this way and the end effect should be the same.
+        for (int i = 0; i < numSubresources; i++) {
+            UINT64 requiredBytes = GetRequiredIntermediateSize(destResource, i, 1);
+
+            // FIXME: This case should be possible to handle
+            assert(requiredBytes <= uploadBufferSize);
+
+            UINT64 offset;
+            D3D12MA::VirtualAllocation allocation;
+            D3D12MA::VIRTUAL_ALLOCATION_DESC allocDesc = {};
+            allocDesc.Alignment = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+            allocDesc.Size = requiredBytes;
+            if (!SUCCEEDED(virtualBlock->Allocate(
+                &allocDesc,
+                &allocation,
+                &offset))) {
+                SyncFlush();
+
+                // This *should* work 100%, as we've made sure we're not uploading >
+                // uploadBufferSize at once at this point.
+                ASSERT_HRESULT(
+                    virtualBlock->Allocate(
+                        &allocDesc,
+                        &allocation,
+                        &offset
+                    )
+                );
+            }
+
+            auto resourceDesc = destResource->GetDesc();
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+            device->GetCopyableFootprints(
+                &resourceDesc,
+                i,
+                1,
+                offset,
+                &footprint,
+                nullptr,
+                nullptr,
+                &requiredBytes
+            );
+
+            for (UINT y = 0; y < footprint.Footprint.Height; y++) {
+                UINT8* pSrcPtr = (UINT8*)subresourceData[i].pData + y * footprint.Footprint.RowPitch;
+                UINT8* pDestPtr = uploadDataPtr + footprint.Offset + y * footprint.Footprint.RowPitch;
+                memcpy(pDestPtr, pSrcPtr, subresourceData[i].RowPitch);
+            }
+
+            const CD3DX12_TEXTURE_COPY_LOCATION Dst(destResource, i);
+            const CD3DX12_TEXTURE_COPY_LOCATION Src(uploadBuffer->GetResource(), footprint);
+            commandList->CopyTextureRegion(&Dst, 0, 0, 0, &Src, nullptr);
+        }
+    }
+
+    void AddBuffer(ID3D12Resource* destinationResource, size_t destOffset, void* srcData, size_t numBytes)
+    {
+        // If a big resource can't fit into one upload, split into two. This
+        // will recurse, so if a resource is somehow uploadBufferSize * 2, then
+        // it will get split in recurse calls.
+        if (numBytes > uploadBufferSize) {
+            SyncFlush();
+            int leftoverBytes = numBytes - uploadBufferSize;
+            AddBuffer(destinationResource, destOffset, srcData, uploadBufferSize);
+            AddBuffer(destinationResource, destOffset + uploadBufferSize, srcData, leftoverBytes);
+            return;
+        }
+
+        UINT64 offset;
+        D3D12MA::VirtualAllocation allocation;
+        D3D12MA::VIRTUAL_ALLOCATION_DESC allocDesc = {};
+        allocDesc.Alignment = sizeof(float);
+        allocDesc.Size = numBytes;
+        if (!SUCCEEDED(virtualBlock->Allocate(
+            &allocDesc,
+            &allocation,
+            &offset))) {
+            SyncFlush();
+
+            // This *should* work 100%, as we've made sure we're not uploading >
+            // uploadBufferSize at once at this point.
+            ASSERT_HRESULT(
+                virtualBlock->Allocate(
+                    &allocDesc,
+                    &allocation,
+                    &offset
+                )
+            );
+        }
+
+        memcpy(uploadDataPtr + offset, srcData, numBytes);
+
+        commandList->CopyBufferRegion(destinationResource,
+            destOffset,
+            uploadBuffer->GetResource(),
+            offset,
+            numBytes
+        );
+    }
+
+    void Finish()
+    {
+        AsyncFlush();
+        Wait();
+    }
+private:
+    void AsyncFlush()
+    {
+        commandList->Close();
+        ID3D12CommandList* ppCommandLists[] = { commandList.Get() };
+        commandQueue->ExecuteCommandLists(1, ppCommandLists);
+        this->fence->Signal(commandQueue);
+        virtualBlock->Clear();
+    }
+
+    // Flush, waiting for upload to finish before returning
+    void SyncFlush()
+    {
+        AsyncFlush();
+        Wait();
+    }
+
+    // Wait for any pending uploads to finish
+    void Wait()
+    {
+        if (!this->fence->IsFinished()) {
+            this->fence->Wait(commandQueue);
+        }
+
+        ASSERT_HRESULT(
+            commandList->Reset(commandAllocator, nullptr)
+        );
+    }
+
+    ID3D12CommandQueue* commandQueue;
+    ID3D12CommandAllocator* commandAllocator;
+
+    ComPtr<ID3D12GraphicsCommandList> commandList;
+    IncrementalFence* fence;
+
+    ComPtr<D3D12MA::Allocation> uploadBuffer;
+    UINT64 uploadBufferSize;
+    UINT8* uploadDataPtr;
+
+    D3D12MA::Allocator* allocator;
+    ID3D12Device* device;
+    D3D12MA::VirtualBlock* virtualBlock;
+};
+
 struct App {
     std::string dataDir;
     std::wstring wDataDir;
@@ -509,8 +732,16 @@ struct App {
 
     PSOManager psoManager;
 
-    Pool<Primitive, 1> primitivePool;
-    Pool<Mesh, 1> meshPool;
+    // FIXME:
+    // Ok not good, primitives relies on these, and if these are declared after primitive pool
+    // then we can crash on program exit. It seems like ~Primitive is calling ~shared_ptr<Material>
+    // after its already freed.
+    Pool<Material, 128> materials;
+    ConstantBufferArena<MaterialConstantData> materialConstantBuffer;
+
+    Pool<Primitive, 100> primitivePool;
+    Pool<Mesh, 32> meshPool;
+
 
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12CommandQueue> commandQueue;
@@ -561,8 +792,6 @@ struct App {
 
     ComPtr<D3D12MA::Allocator> mainAllocator;
 
-    ConstantBufferArena<MaterialConstantData> materialConstantBuffer;
-    std::vector<Material> materials;
 
     // DescriptorArena lightingPassDescriptorArena;
     struct {
@@ -602,8 +831,7 @@ struct App {
 
 void SetupDepthStencil(App& app, bool isResize)
 {
-    if (!isResize)
-    {
+    if (!isResize) {
         D3D12_DESCRIPTOR_HEAP_DESC dsHeapDesc = {};
         dsHeapDesc.NumDescriptors = 1;
         dsHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
@@ -1077,11 +1305,11 @@ void CreateMainRootSignature(App& app)
     // FIXME: This is going to have to be dynamic...
     D3D12_STATIC_SAMPLER_DESC sampler = {};
     sampler.Filter = D3D12_FILTER_ANISOTROPIC;
-    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-    sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
     sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
     sampler.MipLODBias = 0;
-    sampler.MaxAnisotropy = 4;
+    sampler.MaxAnisotropy = 16;
     sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
     sampler.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
     sampler.MinLOD = 0.0f;
@@ -1205,7 +1433,7 @@ void SetupLightingPass(App& app)
     );
 }
 
-void PrintCapabilities(ID3D12Device* device)
+void PrintCapabilities(ID3D12Device* device, IDXGIAdapter1* adapter)
 {
     D3D12_FEATURE_DATA_D3D12_OPTIONS featureSupport;
     ASSERT_HRESULT(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &featureSupport, sizeof(featureSupport)));
@@ -1259,6 +1487,24 @@ void PrintCapabilities(ID3D12Device* device)
         std::cout << "Shader model 6_7 is supported\n";
         break;
     }
+
+    {
+        ComPtr<IDXGIAdapter3> adapter3;
+        if (SUCCEEDED(adapter->QueryInterface(IID_PPV_ARGS(&adapter3)))) {
+            DXGI_QUERY_VIDEO_MEMORY_INFO info;
+            if (SUCCEEDED(adapter3->QueryVideoMemoryInfo(
+                0,
+                DXGI_MEMORY_SEGMENT_GROUP_LOCAL,
+                &info
+            ))) {
+                std::cout << "\nVideo memory information:\n";
+                std::cout << "\tBudget: " << info.Budget << " bytes\n";
+                std::cout << "\tAvailable for reservation: " << info.AvailableForReservation << " bytes\n";
+                std::cout << "\tCurrent usage: " << info.CurrentUsage << " bytes\n";
+                std::cout << "\tCurrent reservation: " << info.CurrentReservation << " bytes\n\n";
+            }
+        }
+    }
 }
 
 void InitD3D(App& app)
@@ -1297,7 +1543,7 @@ void InitD3D(App& app)
         D3D12MA::CreateAllocator(&allocatorDesc, &app.mainAllocator)
     );
 
-    PrintCapabilities(device);
+    PrintCapabilities(device, adapter.Get());
 
     // Graphics command queue
     {
@@ -1393,16 +1639,6 @@ void InitD3D(App& app)
         ASSERT_HRESULT(
             device->CreateCommandList(
                 0,
-                D3D12_COMMAND_LIST_TYPE_COPY,
-                app.copyCommandAllocator.Get(),
-                nullptr,
-                IID_PPV_ARGS(&app.copyCommandList)
-            )
-        );
-
-        ASSERT_HRESULT(
-            device->CreateCommandList(
-                0,
                 D3D12_COMMAND_LIST_TYPE_DIRECT,
                 app.commandAllocator.Get(),
                 nullptr,
@@ -1487,7 +1723,7 @@ void WaitForPreviousFrame(App& app)
     // This is code implemented as such for simplicity. More advanced samples 
     // illustrate how to use fences for efficient resource usage.
 
-    app.fence.SignalAndWaitQueue(app.commandQueue.Get());
+    app.fence.SignalAndWait(app.commandQueue.Get());
 
     app.frameIdx = app.swapChain->GetCurrentBackBufferIndex();
 }
@@ -1555,21 +1791,29 @@ AssetBundle LoadAssets(App& app)
     std::string err;
     std::string warn;
 
-    LoadModelAsset(app, assets, loader, app.dataDir + "/floor/floor.gltf");
-    LoadModelAsset(app, assets, loader, app.dataDir + "/FlightHelmet/FlightHelmet.gltf");
+    // LoadModelAsset(app, assets, loader, app.dataDir + "/floor/floor.gltf");
+    // LoadModelAsset(app, assets, loader, app.dataDir + "/FlightHelmet/FlightHelmet.gltf");
 
-    SkyboxAssets skybox;
-    skybox.images[SkyboxImage_Front] = LoadImageFile(app.dataDir + "/skybox/front.png");
-    skybox.images[SkyboxImage_Back] = LoadImageFile(app.dataDir + "/skybox/back.png");
-    skybox.images[SkyboxImage_Left] = LoadImageFile(app.dataDir + "/skybox/left.png");
-    skybox.images[SkyboxImage_Right] = LoadImageFile(app.dataDir + "/skybox/right.png");
-    skybox.images[SkyboxImage_Top] = LoadImageFile(app.dataDir + "/skybox/top.png");
-    skybox.images[SkyboxImage_Bottom] = LoadImageFile(app.dataDir + "/skybox/bottom.png");
-    assets.skybox = skybox;
+    // SkyboxAssets skybox;
+    // skybox.images[SkyboxImage_Front] = LoadImageFile(app.dataDir + "/skybox/front.png");
+    // skybox.images[SkyboxImage_Back] = LoadImageFile(app.dataDir + "/skybox/back.png");
+    // skybox.images[SkyboxImage_Left] = LoadImageFile(app.dataDir + "/skybox/left.png");
+    // skybox.images[SkyboxImage_Right] = LoadImageFile(app.dataDir + "/skybox/right.png");
+    // skybox.images[SkyboxImage_Top] = LoadImageFile(app.dataDir + "/skybox/top.png");
+    // skybox.images[SkyboxImage_Bottom] = LoadImageFile(app.dataDir + "/skybox/bottom.png");
+    // assets.skybox = skybox;
+
+    //LoadModelAsset(app, assets, loader, app.dataDir + "duck.gltf");
+    LoadModelAsset(app, assets, loader, "C:\\Users\\mason\\dev\\glTF-Sample-Models\\Main\\tangified\\sponza_tangents.gltf");
 
     return assets;
 }
 
+// NOTE: for Intel Sponza this goes over video reservation.
+// The upload heap should be created after the target resources are created anyways.
+// UploadModelBuffers should switch to using the UploadBatch abstraction.
+// UploadBatch should query how much memory is available, and split uploads accordingly.
+// After that is done this function will not be necessary.
 ComPtr<ID3D12Resource> CreateUploadHeap(App& app, const std::vector<D3D12_RESOURCE_DESC>& resourceDescs, std::vector<UINT64>& gltfBufferOffsets)
 {
     UINT64 uploadHeapSize = 0;
@@ -1664,7 +1908,7 @@ void CreateModelMaterials(
     App& app,
     const tinygltf::Model& inputModel,
     Model& outputModel,
-    size_t& startingMaterialIdx
+    std::vector<SharedPoolItem<Material>>& modelMaterials
 )
 {
     // Allocate material constant buffers and create views
@@ -1676,7 +1920,7 @@ void CreateModelMaterials(
 
     auto baseTextureDescriptor = outputModel.baseTextureDescriptor;
 
-    startingMaterialIdx = app.materials.size();
+    //startingMaterialIdx = app.materials.size();
 
     for (int i = 0; i < materialCount; i++) {
         auto& inputMaterial = inputModel.materials[i];
@@ -1686,13 +1930,19 @@ void CreateModelMaterials(
         DescriptorReference metalRoughnessTextureDescriptor;
 
         if (inputMaterial.pbrMetallicRoughness.baseColorTexture.index != -1) {
-            baseColorTextureDescriptor = baseTextureDescriptor + inputMaterial.pbrMetallicRoughness.baseColorTexture.index;
+            auto texture = inputModel.textures[inputMaterial.pbrMetallicRoughness.baseColorTexture.index];
+            auto imageIdx = texture.source;
+            baseColorTextureDescriptor = baseTextureDescriptor + imageIdx;
         }
         if (inputMaterial.normalTexture.index != -1) {
-            normalTextureDescriptor = baseTextureDescriptor + inputMaterial.normalTexture.index;
+            auto texture = inputModel.textures[inputMaterial.normalTexture.index];
+            auto imageIdx = texture.source;
+            normalTextureDescriptor = baseTextureDescriptor + imageIdx;
         }
         if (inputMaterial.pbrMetallicRoughness.metallicRoughnessTexture.index != -1) {
-            metalRoughnessTextureDescriptor = baseTextureDescriptor + inputMaterial.pbrMetallicRoughness.metallicRoughnessTexture.index;
+            auto texture = inputModel.textures[inputMaterial.pbrMetallicRoughness.metallicRoughnessTexture.index];
+            auto imageIdx = texture.source;
+            metalRoughnessTextureDescriptor = baseTextureDescriptor + imageIdx;
         }
 
         MaterialType materialType = MaterialType_PBR;
@@ -1707,16 +1957,18 @@ void CreateModelMaterials(
             }
         }
 
-        Material material;
-        material.constantData = &constantBufferSlice.data[i];
-        material.materialType = materialType;
-        material.textureDescriptors.baseColor = baseColorTextureDescriptor;
-        material.textureDescriptors.normal = normalTextureDescriptor;
-        material.textureDescriptors.metalRoughness = metalRoughnessTextureDescriptor;
-        material.cbvDescriptor = descriptorReference + i;
-        material.name = inputMaterial.name;
-        material.UpdateConstantData();
-        app.materials.push_back(material);
+        auto material = app.materials.AllocateShared();
+        // Material material;
+        material->constantData = &constantBufferSlice.data[i];
+        material->materialType = materialType;
+        material->textureDescriptors.baseColor = baseColorTextureDescriptor;
+        material->textureDescriptors.normal = normalTextureDescriptor;
+        material->textureDescriptors.metalRoughness = metalRoughnessTextureDescriptor;
+        material->cbvDescriptor = descriptorReference + i;
+        material->name = inputMaterial.name;
+        material->UpdateConstantData();
+
+        modelMaterials.push_back(SharedPoolItem<Material>(material));
     }
 }
 
@@ -1776,30 +2028,33 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
     std::vector<ComPtr<ID3D12Resource>> resourceBuffers;
     resourceBuffers.reserve(inputModel.buffers.size() + inputModel.images.size());
 
+    UploadBatch uploadBatch;
+    uploadBatch.Begin(app.mainAllocator.Get(), app.copyCommandAllocator.Get(), app.copyCommandQueue.Get(), &app.copyFence);
+
     // Copy all GLTF buffer data to the upload heap
-    size_t uploadHeapPosition = 0;
-    UINT8* uploadHeapPtr;
-    CD3DX12_RANGE readRange(0, 0);
-    uploadHeap->Map(0, &readRange, reinterpret_cast<void**>(&uploadHeapPtr));
-    int bufferIdx = 0;
-    for (bufferIdx = 0; bufferIdx < inputModel.buffers.size(); bufferIdx++) {
-        auto buffer = inputModel.buffers[bufferIdx];
-        auto uploadHeapPosition = uploadOffsets[bufferIdx];
-        memcpy(uploadHeapPtr + uploadHeapPosition, buffer.data.data(), buffer.data.size());
-    }
-    int imageIdx = 0;
-    for (; bufferIdx < uploadOffsets.size(); imageIdx++, bufferIdx++)
-    {
-        auto image = inputModel.images[imageIdx];
-        auto uploadHeapPosition = uploadOffsets[bufferIdx];
-        memcpy(uploadHeapPtr + uploadHeapPosition, image.image.data(), image.image.size());
-    }
-    uploadHeap->Unmap(0, nullptr);
+    // size_t uploadHeapPosition = 0;
+    // UINT8* uploadHeapPtr;
+    // CD3DX12_RANGE readRange(0, 0);
+    // ASSERT_HRESULT(uploadHeap->Map(0, &readRange, reinterpret_cast<void**>(&uploadHeapPtr)));
+    // int bufferIdx = 0;
+    // for (bufferIdx = 0; bufferIdx < inputModel.buffers.size(); bufferIdx++) {
+    //     auto buffer = inputModel.buffers[bufferIdx];
+    //     auto uploadHeapPosition = uploadOffsets[bufferIdx];
+    //     memcpy(uploadHeapPtr + uploadHeapPosition, buffer.data.data(), buffer.data.size());
+    // }
+    // int imageIdx = 0;
+    // for (; bufferIdx < uploadOffsets.size(); imageIdx++, bufferIdx++)
+    // {
+    //     auto image = inputModel.images[imageIdx];
+    //     auto uploadHeapPosition = uploadOffsets[bufferIdx];
+    //     memcpy(uploadHeapPtr + uploadHeapPosition, image.image.data(), image.image.size());
+    // }
+    // uploadHeap->Unmap(0, nullptr);
 
     std::vector<CD3DX12_RESOURCE_BARRIER> resourceBarriers;
 
     // Copy all the gltf buffer data to a dedicated geometry buffer
-    for (bufferIdx = 0; bufferIdx < inputModel.buffers.size(); bufferIdx++) {
+    for (size_t bufferIdx = 0; bufferIdx < inputModel.buffers.size(); bufferIdx++) {
         const auto& gltfBuffer = inputModel.buffers[bufferIdx];
         ComPtr<ID3D12Resource> geometryBuffer;
         CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
@@ -1816,21 +2071,21 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
             )
         );
 
-        app.commandList->CopyBufferRegion(
-            geometryBuffer.Get(), 0, uploadHeap.Get(), uploadOffsets[bufferIdx], gltfBuffer.data.size());
-
-        resourceBuffers.push_back(geometryBuffer);
+        uploadBatch.AddBuffer(geometryBuffer.Get(), 0, (void*)gltfBuffer.data.data(), gltfBuffer.data.size());
+        DEBUG_VAR(gltfBuffer.data.size());
 
         resourceBarriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(
             geometryBuffer.Get(),
             D3D12_RESOURCE_STATE_COPY_DEST,
             D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_INDEX_BUFFER
         ));
+
+        resourceBuffers.push_back(geometryBuffer);
     }
 
     // Upload images to buffers
-    for (; bufferIdx < inputModel.buffers.size() + inputModel.images.size(); bufferIdx++) {
-        const auto& gltfImage = inputModel.images[bufferIdx - inputModel.buffers.size()];
+    for (int i = 0; i < inputModel.images.size(); i++) {
+        const auto& gltfImage = inputModel.images[i];
         ComPtr<ID3D12Resource> buffer;
         CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
         auto resourceDesc = GetImageResourceDesc(gltfImage);
@@ -1846,22 +2101,11 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
             )
         );
 
-        UINT64 requiredSize;
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
-        app.device->GetCopyableFootprints(
-            &resourceDesc,
-            0,
-            1,
-            uploadOffsets[bufferIdx],
-            &footprint,
-            nullptr,
-            nullptr,
-            &requiredSize
-        );
-        // app.commandList->CopyBufferRegion(buffer.Get(), 0, uploadHeap.Get(), gltfBufferOffsets[bufferIdx], gltfImage.image.size());
-        const CD3DX12_TEXTURE_COPY_LOCATION Dst(buffer.Get(), 0);
-        const CD3DX12_TEXTURE_COPY_LOCATION Src(uploadHeap.Get(), footprint);
-        app.commandList->CopyTextureRegion(&Dst, 0, 0, 0, &Src, nullptr);
+        D3D12_SUBRESOURCE_DATA subresourceData;
+        subresourceData.pData = gltfImage.image.data();
+        subresourceData.RowPitch = gltfImage.width * gltfImage.component;
+        subresourceData.SlicePitch = gltfImage.height * subresourceData.RowPitch;
+        uploadBatch.AddTexture(buffer.Get(), &subresourceData, 0, 1);
 
         resourceBuffers.push_back(buffer);
 
@@ -1871,6 +2115,8 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
         ));
     }
+
+    uploadBatch.Finish();
 
     auto endGeometryBuffer = resourceBuffers.begin() + inputModel.buffers.size();
     outGeometryResources = std::span(resourceBuffers.begin(), endGeometryBuffer);
@@ -1938,11 +2184,14 @@ void ResolveMeshTransforms(
     }
 }
 
-void FinalizeModel(
-    Model& outputModel,
+PoolItem<Primitive> CreateModelPrimitive(
     App& app,
+    Model& outputModel,
     const tinygltf::Model& inputModel,
-    size_t startingMaterialIndex
+    const tinygltf::Mesh& inputMesh,
+    const tinygltf::Primitive& inputPrimitive,
+    const std::vector<SharedPoolItem<Material>>& modelMaterials,
+    int perPrimitiveDescriptorIdx
 )
 {
     // Just storing these strings so that we don't have to keep the Model object around.
@@ -1951,7 +2200,6 @@ void FinalizeModel(
         std::string("NORMAL"),
         std::string("TEXCOORD"),
         std::string("TANGENT"),
-        std::string("COLOR"),
     };
 
     // GLTF stores attribute names like "TEXCOORD_0", "TEXCOORD_1", etc.
@@ -1971,187 +2219,236 @@ void FinalizeModel(
 
     const std::vector<ComPtr<ID3D12Resource>>& resourceBuffers = outputModel.buffers;
 
+    auto primitive = app.primitivePool.AllocateUnique();
+
+    primitive->perPrimitiveDescriptor = outputModel.primitiveDataDescriptors + perPrimitiveDescriptorIdx;
+    primitive->constantData = &outputModel.perPrimitiveBufferPtr[perPrimitiveDescriptorIdx];
+    perPrimitiveDescriptorIdx++;
+
+    std::vector<D3D12_VERTEX_BUFFER_VIEW>& vertexBufferViews = primitive->vertexBufferViews;
+
+    // Track what addresses are mapped to a vertex buffer view.
+    // 
+    // The key is the address in the buffer of the first vertex,
+    // the value is an index into the vertexBufferViews array.
+    // 
+    // This needs to be done because certain GLTF models are designed in a way that 
+    // doesn't allow us to have a one-to-one relationship between gltf buffer views 
+    // and d3d buffer views.
+    std::map<D3D12_GPU_VIRTUAL_ADDRESS, UINT> vertexStartOffsetToBufferView;
+
+    // Build per drawcall data 
+    // input layout and vertex buffer views
+    std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout = primitive->inputLayout;
+    inputLayout.reserve(inputPrimitive.attributes.size());
+
+    for (const auto& attrib : inputPrimitive.attributes) {
+        auto [targetSemantic, semanticIndex] = ParseAttribToSemantic(attrib.first);
+        auto semanticName = std::find(SEMANTIC_NAMES.begin(), SEMANTIC_NAMES.end(), targetSemantic);
+
+        if (semanticName == SEMANTIC_NAMES.end()) {
+            std::cout << "Unsupported semantic in " << inputMesh.name << " " << targetSemantic << "\n";
+            continue;
+        }
+
+        D3D12_INPUT_ELEMENT_DESC desc;
+        int accessorIdx = attrib.second;
+        auto& accessor = inputModel.accessors[accessorIdx];
+        desc.SemanticName = semanticName->c_str();
+        desc.SemanticIndex = semanticIndex;
+        desc.InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+        desc.InstanceDataStepRate = 0;
+        UINT64 byteStride;
+
+        switch (accessor.type) {
+        case TINYGLTF_TYPE_VEC2:
+            desc.Format = DXGI_FORMAT_R32G32_FLOAT;
+            byteStride = 4 * 2;
+            break;
+        case TINYGLTF_TYPE_VEC3:
+            desc.Format = DXGI_FORMAT_R32G32B32_FLOAT;
+            byteStride = 4 * 3;
+            break;
+        case TINYGLTF_TYPE_VEC4:
+            desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            byteStride = 4 * 4;
+            break;
+        };
+
+        // Accessors can be linked to the same bufferview, so here we keep
+        // track of what input slot is linked to a bufferview.
+        int bufferViewIdx = accessor.bufferView;
+        auto bufferView = inputModel.bufferViews[bufferViewIdx];
+
+        byteStride = bufferView.byteStride > 0 ? (UINT)bufferView.byteStride : byteStride;
+
+        auto buffer = resourceBuffers[bufferView.buffer];
+        UINT64 vertexStartOffset = bufferView.byteOffset + accessor.byteOffset - (accessor.byteOffset % byteStride);
+        D3D12_GPU_VIRTUAL_ADDRESS vertexStartAddress = buffer->GetGPUVirtualAddress() + vertexStartOffset;
+
+        desc.AlignedByteOffset = (UINT)accessor.byteOffset - vertexStartOffset + (UINT)bufferView.byteOffset;
+        // No d3d buffer view attached to this range of vertices yet, add one
+        if (!vertexStartOffsetToBufferView.contains(vertexStartAddress)) {
+            D3D12_VERTEX_BUFFER_VIEW view;
+            view.BufferLocation = vertexStartAddress;
+            view.SizeInBytes = accessor.count * byteStride;
+            view.StrideInBytes = (UINT)byteStride;
+
+            if (view.BufferLocation + view.SizeInBytes > buffer->GetGPUVirtualAddress() + buffer->GetDesc().Width) {
+                std::cout << "NO!!\n";
+                std::cout << "Mesh " << inputMesh.name << "\n";
+                std::cout << "Input element desc.AlignedByteOffset: " << desc.AlignedByteOffset << "\n";
+                std::cout << "START ADDRESS: " << buffer->GetGPUVirtualAddress() << "\n";
+                std::cout << "END ADDRESS: " << buffer->GetGPUVirtualAddress() + buffer->GetDesc().Width << "\n";
+                DEBUG_VAR(byteStride);
+                DEBUG_VAR(desc.AlignedByteOffset);
+                DEBUG_VAR(accessor.byteOffset);
+                DEBUG_VAR(accessor.count);
+                DEBUG_VAR(view.BufferLocation);
+                DEBUG_VAR(buffer->GetDesc().Width);
+                DEBUG_VAR(vertexStartOffset);
+                DEBUG_VAR(*semanticName);
+                primitive = nullptr;
+                return nullptr;
+            }
+
+            vertexBufferViews.push_back(view);
+            vertexStartOffsetToBufferView[vertexStartAddress] = (UINT)vertexBufferViews.size() - 1;
+        }
+        desc.InputSlot = vertexStartOffsetToBufferView[vertexStartAddress];
+
+        inputLayout.push_back(desc);
+
+        D3D12_PRIMITIVE_TOPOLOGY& topology = primitive->primitiveTopology;
+        switch (inputPrimitive.mode)
+        {
+        case TINYGLTF_MODE_POINTS:
+            topology = D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
+            break;
+        case TINYGLTF_MODE_LINE:
+            topology = D3D_PRIMITIVE_TOPOLOGY_LINELIST;
+            break;
+        case TINYGLTF_MODE_LINE_LOOP:
+            std::cout << "Error: line loops are not supported";
+            return nullptr;
+        case TINYGLTF_MODE_LINE_STRIP:
+            topology = D3D_PRIMITIVE_TOPOLOGY_LINESTRIP;
+            break;
+        case TINYGLTF_MODE_TRIANGLES:
+            topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+            break;
+        case TINYGLTF_MODE_TRIANGLE_STRIP:
+            topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
+            break;
+        case TINYGLTF_MODE_TRIANGLE_FAN:
+            std::cout << "Error: triangle fans are not supported";
+            return nullptr;
+        };
+
+    }
+
+    if (inputPrimitive.material != -1) {
+        auto& material = modelMaterials[inputPrimitive.material];
+        primitive->material = material;
+        if (material->materialType == MaterialType_PBR) {
+            primitive->PSO = CreateMeshPBRPSO(
+                app.psoManager,
+                app.device.Get(),
+                app.dataDir,
+                app.rootSignature.Get(),
+                primitive->inputLayout
+            );
+        } else if (material->materialType == MaterialType_AlphaBlendPBR) {
+            primitive->PSO = CreateMeshAlphaBlendedPBRPSO(
+                app.psoManager,
+                app.device.Get(),
+                app.dataDir,
+                app.rootSignature.Get(),
+                primitive->inputLayout
+            );
+        } else if (material->materialType == MaterialType_Unlit) {
+            primitive->PSO = CreateMeshUnlitPSO(
+                app.psoManager,
+                app.device.Get(),
+                app.dataDir,
+                app.rootSignature.Get(),
+                primitive->inputLayout
+            );
+        }
+    } else {
+        // Just pray this will work
+        primitive->materialIndex = -1;
+        primitive->PSO = CreateMeshUnlitPSO(
+            app.psoManager,
+            app.device.Get(),
+            app.dataDir,
+            app.rootSignature.Get(),
+            primitive->inputLayout
+        );
+    }
+
+    D3D12_INDEX_BUFFER_VIEW& ibv = primitive->indexBufferView;
+    int accessorIdx = inputPrimitive.indices;
+    auto& accessor = inputModel.accessors[accessorIdx];
+    int indexBufferViewIdx = accessor.bufferView;
+    auto bufferView = inputModel.bufferViews[indexBufferViewIdx];
+    ibv.BufferLocation = resourceBuffers[bufferView.buffer]->GetGPUVirtualAddress() + bufferView.byteOffset + accessor.byteOffset;
+    ibv.SizeInBytes = (UINT)(bufferView.byteLength - accessor.byteOffset);
+
+    switch (accessor.componentType) {
+    case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
+        ibv.Format = DXGI_FORMAT_R8_UINT;
+        std::cout << "GLTF mesh uses byte indices which aren't supported " << inputMesh.name;
+        abort();
+        break;
+    case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT:
+        ibv.Format = DXGI_FORMAT_R16_UINT;
+        break;
+    case TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT:
+        ibv.Format = DXGI_FORMAT_R32_UINT;
+        break;
+    };
+
+    primitive->indexCount = (UINT)accessor.count;
+    app.Stats.triangleCount += primitive->indexCount;
+
+    return primitive;
+}
+
+void FinalizeModel(
+    Model& outputModel,
+    App& app,
+    const tinygltf::Model& inputModel,
+    const std::vector<SharedPoolItem<Material>>& modelMaterials
+)
+{
+    const std::vector<ComPtr<ID3D12Resource>>& resourceBuffers = outputModel.buffers;
+
     int perPrimitiveDescriptorIdx = 0;
 
-    for (const auto& mesh : inputModel.meshes) {
+    for (const auto& inputMesh : inputModel.meshes) {
         outputModel.meshes.emplace_back(std::move(app.meshPool.AllocateUnique()));
-        PoolItem<Mesh>& newMesh = outputModel.meshes.back();
-        newMesh->name = mesh.name;
-        std::vector<PoolItem<Primitive>>& primitives = newMesh->primitives;
-        for (const auto& primitive : mesh.primitives) {
-            primitives.emplace_back(app.primitivePool.AllocateUnique());
-            Primitive* drawCall = primitives.back().get();
 
-            drawCall->perPrimitiveDescriptor = outputModel.primitiveDataDescriptors + perPrimitiveDescriptorIdx;
-            drawCall->constantData = &outputModel.perPrimitiveBufferPtr[perPrimitiveDescriptorIdx];
-            perPrimitiveDescriptorIdx++;
+        PoolItem<Mesh>& mesh = outputModel.meshes.back();
+        mesh->name = inputMesh.name;
+        std::vector<PoolItem<Primitive>>& primitives = mesh->primitives;
 
-            std::vector<D3D12_VERTEX_BUFFER_VIEW>& vertexBufferViews = drawCall->vertexBufferViews;
+        for (int primitiveIdx = 0; primitiveIdx < inputMesh.primitives.size(); primitiveIdx++) {
+            const auto& inputPrimitive = inputMesh.primitives[primitiveIdx];
 
-            // Track what addresses are mapped to a vertex buffer view.
-            // 
-            // The key is the address in the buffer of the first vertex,
-            // the value is an index into the vertexBufferViews array.
-            // 
-            // This needs to be done because certain GLTF models are designed in a way that 
-            // doesn't allow us to have a one-to-one relationship between gltf buffer views 
-            // and d3d buffer views.
-            std::map<D3D12_GPU_VIRTUAL_ADDRESS, UINT> vertexStartOffsetToBufferView;
+            auto primitive = CreateModelPrimitive(
+                app,
+                outputModel,
+                inputModel,
+                inputMesh,
+                inputPrimitive,
+                modelMaterials,
+                perPrimitiveDescriptorIdx
+            );
 
-            // Build per drawcall data 
-            // input layout and vertex buffer views
-            std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout = drawCall->inputLayout;
-            inputLayout.reserve(primitive.attributes.size());
-            int InputSlotCount = 0;
-            std::map<int, int> bufferViewToInputSlotMap;
-            for (const auto& attrib : primitive.attributes) {
-                auto [targetSemantic, semanticIndex] = ParseAttribToSemantic(attrib.first);
-                auto semanticName = std::find(SEMANTIC_NAMES.begin(), SEMANTIC_NAMES.end(), targetSemantic);
-                if (semanticName != SEMANTIC_NAMES.end()) {
-                    D3D12_INPUT_ELEMENT_DESC desc;
-                    int accessorIdx = attrib.second;
-                    auto& accessor = inputModel.accessors[accessorIdx];
-                    desc.SemanticName = semanticName->c_str();
-                    desc.SemanticIndex = semanticIndex;
-                    desc.InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
-                    desc.InstanceDataStepRate = 0;
-                    UINT byteStride;
-                    switch (accessor.type) {
-                    case TINYGLTF_TYPE_VEC2:
-                        desc.Format = DXGI_FORMAT_R32G32_FLOAT;
-                        byteStride = 4 * 2;
-                        break;
-                    case TINYGLTF_TYPE_VEC3:
-                        desc.Format = DXGI_FORMAT_R32G32B32_FLOAT;
-                        byteStride = 4 * 3;
-                        break;
-                    case TINYGLTF_TYPE_VEC4:
-                        desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-                        byteStride = 4 * 4;
-                        break;
-                    };
-
-                    // Accessors can be linked to the same bufferview, so here we keep
-                    // track of what input slot is linked to a bufferview.
-                    int bufferViewIdx = accessor.bufferView;
-                    auto bufferView = inputModel.bufferViews[bufferViewIdx];
-
-                    byteStride = bufferView.byteStride > 0 ? (UINT)bufferView.byteStride : byteStride;
-
-                    auto buffer = resourceBuffers[bufferView.buffer];
-                    UINT vertexStartOffset = (UINT)bufferView.byteOffset + (UINT)accessor.byteOffset - (UINT)(accessor.byteOffset % byteStride);
-                    D3D12_GPU_VIRTUAL_ADDRESS vertexStartAddress = buffer->GetGPUVirtualAddress() + vertexStartOffset;
-
-                    desc.AlignedByteOffset = (UINT)accessor.byteOffset - vertexStartOffset + (UINT)bufferView.byteOffset;
-
-                    // No d3d buffer view attached to this range of vertices yet, add one
-                    if (!vertexStartOffsetToBufferView.contains(vertexStartAddress)) {
-                        D3D12_VERTEX_BUFFER_VIEW view;
-                        view.BufferLocation = vertexStartAddress;
-                        view.SizeInBytes = (UINT)accessor.count * byteStride;
-                        view.StrideInBytes = byteStride;
-                        vertexBufferViews.push_back(view);
-                        vertexStartOffsetToBufferView[vertexStartAddress] = (UINT)vertexBufferViews.size() - 1;
-                    }
-                    desc.InputSlot = vertexStartOffsetToBufferView[vertexStartAddress];
-
-                    inputLayout.push_back(desc);
-
-                    D3D12_PRIMITIVE_TOPOLOGY& topology = drawCall->primitiveTopology;
-                    switch (primitive.mode)
-                    {
-                    case TINYGLTF_MODE_POINTS:
-                        topology = D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
-                        break;
-                    case TINYGLTF_MODE_LINE:
-                        topology = D3D_PRIMITIVE_TOPOLOGY_LINELIST;
-                        break;
-                    case TINYGLTF_MODE_LINE_LOOP:
-                        std::cout << "Error: line loops are not supported";
-                        abort();
-                        break;
-                    case TINYGLTF_MODE_LINE_STRIP:
-                        topology = D3D_PRIMITIVE_TOPOLOGY_LINESTRIP;
-                        break;
-                    case TINYGLTF_MODE_TRIANGLES:
-                        topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-                        break;
-                    case TINYGLTF_MODE_TRIANGLE_STRIP:
-                        topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
-                        break;
-                    case TINYGLTF_MODE_TRIANGLE_FAN:
-                        std::cout << "Error: triangle fans are not supported";
-                        abort();
-                        break;
-                    };
-
-                } else {
-                    std::cout << "Unsupported semantic in " << mesh.name << " " << targetSemantic;
-                }
-            }
-
-            if (primitive.material != -1) {
-                drawCall->materialIndex = startingMaterialIndex + primitive.material;
-                if (app.materials[drawCall->materialIndex].materialType == MaterialType_PBR) {
-                    drawCall->PSO = CreateMeshPBRPSO(
-                        app.psoManager,
-                        app.device.Get(),
-                        app.dataDir,
-                        app.rootSignature.Get(),
-                        drawCall->inputLayout
-                    );
-                } else if (app.materials[drawCall->materialIndex].materialType == MaterialType_AlphaBlendPBR) {
-                    drawCall->PSO = CreateMeshAlphaBlendedPBRPSO(
-                        app.psoManager,
-                        app.device.Get(),
-                        app.dataDir,
-                        app.rootSignature.Get(),
-                        drawCall->inputLayout
-                    );
-                } else if (app.materials[drawCall->materialIndex].materialType == MaterialType_Unlit) {
-                    drawCall->PSO = CreateMeshUnlitPSO(
-                        app.psoManager,
-                        app.device.Get(),
-                        app.dataDir,
-                        app.rootSignature.Get(),
-                        drawCall->inputLayout
-                    );
-                }
-            } else {
-                // Just pray this will work
-                drawCall->materialIndex = -1;
-                drawCall->PSO = CreateMeshUnlitPSO(
-                    app.psoManager,
-                    app.device.Get(),
-                    app.dataDir,
-                    app.rootSignature.Get(),
-                    drawCall->inputLayout
-                );
-            }
-
-            {
-                D3D12_INDEX_BUFFER_VIEW& ibv = drawCall->indexBufferView;
-                int accessorIdx = primitive.indices;
-                auto& accessor = inputModel.accessors[accessorIdx];
-                int indexBufferViewIdx = accessor.bufferView;
-                auto bufferView = inputModel.bufferViews[indexBufferViewIdx];
-                ibv.BufferLocation = resourceBuffers[bufferView.buffer]->GetGPUVirtualAddress() + bufferView.byteOffset + accessor.byteOffset;
-                ibv.SizeInBytes = (UINT)(bufferView.byteLength - accessor.byteOffset);
-                switch (accessor.componentType) {
-                case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
-                    ibv.Format = DXGI_FORMAT_R8_UINT;
-                    std::cout << "GLTF mesh uses byte indices which aren't supported " << mesh.name;
-                    abort();
-                    break;
-                case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT:
-                    ibv.Format = DXGI_FORMAT_R16_UINT;
-                    break;
-                case TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT:
-                    ibv.Format = DXGI_FORMAT_R32_UINT;
-                    break;
-                };
-                drawCall->indexCount = (UINT)accessor.count;
-                app.Stats.triangleCount += drawCall->indexCount;
+            if (primitive != nullptr) {
+                mesh->primitives.emplace_back(std::move(primitive));
+                perPrimitiveDescriptorIdx++;
             }
         }
     }
@@ -2243,69 +2540,7 @@ Primitive CreatePrimitiveFromGeometryData(
     Primitive primitive;
 }
 
-class UploadBatch
-{
-public:
-    void AddResource(ID3D12Resource* resource, D3D12_SUBRESOURCE_DATA* subresourceData, UINT64 srcOffset, int subresource, int numSubresources)
-    {
-        UploadEntry uploadEntry;
-        uploadEntry.destBuffer = resource;
-        uploadEntry.destOffset = 0;
-        uploadEntry.numSubresources = numSubresources;
-        uploadEntry.subresource = subresource;
-        uploadEntry.srcData = subresourceData;
-        uploadEntries.push_back(uploadEntry);
-
-        requiredUploadSize += GetRequiredIntermediateSize(resource, subresource, numSubresources);
-    }
-
-    void Execute(D3D12MA::Allocator* allocator, ID3D12GraphicsCommandList* commandList)
-    {
-        auto uploadBufferDesc = CD3DX12_RESOURCE_DESC::Buffer(requiredUploadSize);
-        D3D12MA::ALLOCATION_DESC allocDesc{};
-        allocDesc.HeapType = D3D12_HEAP_TYPE_UPLOAD;
-        ASSERT_HRESULT(
-            allocator->CreateResource(
-                &allocDesc,
-                &uploadBufferDesc,
-                D3D12_RESOURCE_STATE_GENERIC_READ,
-                nullptr,
-                uploadBuffer.GetAddressOf(),
-                IID_NULL,
-                nullptr
-            )
-        );
-
-        UINT64 intermediateOffset = 0;
-        for (const auto& entry : uploadEntries) {
-            intermediateOffset += UpdateSubresources(
-                commandList,
-                entry.destBuffer,
-                uploadBuffer->GetResource(),
-                intermediateOffset,
-                entry.subresource,
-                entry.numSubresources,
-                entry.srcData
-            );
-        }
-    }
-
-    struct UploadEntry {
-        ID3D12Resource* destBuffer;
-        UINT64 destOffset;
-        int subresource;
-        int numSubresources;
-        D3D12_SUBRESOURCE_DATA* srcData;
-        UINT64 srcOffset;
-    };
-
-private:
-    std::vector<UploadEntry> uploadEntries;
-    UINT64 requiredUploadSize = 0;
-    ComPtr<D3D12MA::Allocation> uploadBuffer;
-};
-
-void CreateSkybox(App& app, const SkyboxAssets& asset, ID3D12GraphicsCommandList* commandList)
+void CreateSkybox(App& app, const SkyboxAssets& asset)
 {
     if (!ValidateSkyboxAssets(asset)) {
         return;
@@ -2364,7 +2599,8 @@ void CreateSkybox(App& app, const SkyboxAssets& asset, ID3D12GraphicsCommandList
     }
 
     UploadBatch uploadBatch;
-    uploadBatch.AddResource(cubemap->GetResource(), cubemapSubresourceData, 0, 0, SkyboxImage_Count);
+    uploadBatch.Begin(app.mainAllocator.Get(), app.copyCommandAllocator.Get(), app.copyCommandQueue.Get(), &app.copyFence);
+    uploadBatch.AddTexture(cubemap->GetResource(), cubemapSubresourceData, 0, SkyboxImage_Count);
 
     DescriptorReference texcubeSRV = app.GBufferPass.descriptorHeap.AllocateDescriptors(1, "Skybox SRV");
 
@@ -2392,15 +2628,6 @@ void CreateSkybox(App& app, const SkyboxAssets& asset, ID3D12GraphicsCommandList
             D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, // InputSlotClass
             0                                           // InstanceDataStepRate
         },
-        // {
-        //     "TEXCOORD",                                 // SemanticName
-        //     0,                                          // SemanticIndex
-        //     DXGI_FORMAT_R32G32B32_FLOAT,                // Format
-        //     0,                                          // InputSlot
-        //     D3D12_APPEND_ALIGNED_ELEMENT,               // AlignedByteOffset
-        //     D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, // InputSlotClass
-        //     0                                           // InstanceDataStepRate
-        // },
     };
 
     float vertexData[] = {
@@ -2470,19 +2697,21 @@ void CreateSkybox(App& app, const SkyboxAssets& asset, ID3D12GraphicsCommandList
         );
     }
 
-    D3D12_SUBRESOURCE_DATA vertexSubresourceData;
-    vertexSubresourceData.pData = vertexData;
-    vertexSubresourceData.RowPitch = sizeof(vertexData);
-    vertexSubresourceData.SlicePitch = sizeof(vertexData);
-    uploadBatch.AddResource(vertexBuffer->GetResource(), &vertexSubresourceData, 0, 0, 1);
+    // D3D12_SUBRESOURCE_DATA vertexSubresourceData;
+    // vertexSubresourceData.pData = vertexData;
+    // vertexSubresourceData.RowPitch = sizeof(vertexData);
+    // vertexSubresourceData.SlicePitch = sizeof(vertexData);
+    //uploadBatch.AddResource(vertexBuffer->GetResource(), &vertexSubresourceData, 0, 0, 1);
+    uploadBatch.AddBuffer(vertexBuffer->GetResource(), 0, vertexData, sizeof(vertexData));
 
-    D3D12_SUBRESOURCE_DATA indicesSubresourceData;
-    indicesSubresourceData.pData = indices;
-    indicesSubresourceData.RowPitch = sizeof(indices);
-    indicesSubresourceData.SlicePitch = sizeof(indices);
-    uploadBatch.AddResource(indexBuffer->GetResource(), &indicesSubresourceData, 0, 0, 1);
+    // D3D12_SUBRESOURCE_DATA indicesSubresourceData;
+    // indicesSubresourceData.pData = indices;
+    // indicesSubresourceData.RowPitch = sizeof(indices);
+    // indicesSubresourceData.SlicePitch = sizeof(indices);
+    // uploadBatch.AddResource(indexBuffer->GetResource(), &indicesSubresourceData, 0, 0, 1);
+    uploadBatch.AddBuffer(indexBuffer->GetResource(), 0, reinterpret_cast<void*>(indices), sizeof(indices));
 
-    uploadBatch.Execute(app.mainAllocator.Get(), commandList);
+    uploadBatch.Finish();
 
     PoolItem<Primitive> primitive = app.primitivePool.AllocateUnique();
     primitive->indexBufferView.BufferLocation = indexBuffer->GetResource()->GetGPUVirtualAddress();
@@ -2521,25 +2750,9 @@ void CreateSkybox(App& app, const SkyboxAssets& asset, ID3D12GraphicsCommandList
     app.Skybox.indexBuffer = indexBuffer;
     app.Skybox.vertexBuffer = vertexBuffer;
     app.Skybox.perPrimitiveConstantBuffer = perPrimitiveBuffer;
-
-    commandList->Close();
-
-    ID3D12CommandList* ppCommandLists[] = { commandList };
-    app.commandQueue->ExecuteCommandLists(1, ppCommandLists);
-    WaitForPreviousFrame(app);
-
-    // Primitive primitive;
-    // primitive.PSO = CreateSkyboxPSO(
-    //     app.psoManager,
-    //     app.device.Get(),
-    //     app.dataDir,
-    //     app.rootSignature.Get(),
-    //     inputLayout
-    // );
-    // primitive.inputLayout = inputLayout;
 }
 
-void ProcessAssets(App& app, const AssetBundle& assets)
+void ProcessAssets(App& app, AssetBundle& assets)
 {
     app.commandList->Close();
 
@@ -2552,7 +2765,7 @@ void ProcessAssets(App& app, const AssetBundle& assets)
     );
 
     // TODO: easy candidate for multithreading
-    for (const auto& gltfModel : assets.models) {
+    for (auto& gltfModel : assets.models) {
         if (!ValidateGLTFModel(gltfModel)) {
             continue;
         }
@@ -2580,11 +2793,11 @@ void ProcessAssets(App& app, const AssetBundle& assets)
             textureBuffers
         );
 
-        size_t startingMaterialIndex;
+        std::vector<SharedPoolItem<Material>> modelMaterials;
 
         CreateModelDescriptors(app, gltfModel, model, textureBuffers);
-        CreateModelMaterials(app, gltfModel, model, startingMaterialIndex);
-        FinalizeModel(model, app, gltfModel, startingMaterialIndex);
+        CreateModelMaterials(app, gltfModel, model, modelMaterials);
+        FinalizeModel(model, app, gltfModel, modelMaterials);
 
         app.models.push_back(std::move(model));
 
@@ -2604,8 +2817,12 @@ void ProcessAssets(App& app, const AssetBundle& assets)
     }
 
     if (assets.skybox.has_value()) {
-        CreateSkybox(app, assets.skybox.value(), app.commandList.Get());
+        CreateSkybox(app, assets.skybox.value());
     }
+
+    ASSERT_HRESULT(
+        app.commandList->Close()
+    );
 }
 
 void InitializeCamera(App& app)
@@ -2770,15 +2987,12 @@ void UpdateScene(App& app)
     glm::mat4 projection = glm::perspective(glm::pi<float>() * 0.2f, (float)app.windowWidth / (float)app.windowHeight, 0.1f, 4000.0f);
     glm::mat4 view = UpdateFlyCamera(app, deltaSeconds);
 
-    app.Skybox.mesh->translation = app.camera.translation;
+    if (app.Skybox.mesh) {
+        app.Skybox.mesh->translation = app.camera.translation;
+    }
 
     UpdateLightConstantBuffers(app, projection, view);
     UpdatePerPrimitiveConstantBuffers(app, projection, view);
-}
-
-DescriptorReference GetMaterialDescriptor(const App& app, int materialIndex)
-{
-    return app.materials[materialIndex].cbvDescriptor;
 }
 
 void DrawMeshesGBuffer(App& app, ID3D12GraphicsCommandList* commandList)
@@ -2810,13 +3024,13 @@ void DrawMeshesGBuffer(App& app, ID3D12GraphicsCommandList* commandList)
 
     while (meshIter) {
         for (const auto& primitive : meshIter->primitives) {
-            const auto& material = app.materials[primitive->materialIndex];
+            const auto& material = primitive->material.get();
             // FIXME: if I am not lazy I will SORT by material type
             // Transparent materials drawn in different pass
-            if (material.materialType == MaterialType_AlphaBlendPBR) {
+            if (material->materialType == MaterialType_AlphaBlendPBR) {
                 continue;
             }
-            auto materialDescriptor = GetMaterialDescriptor(app, primitive->materialIndex);
+            auto materialDescriptor = material->cbvDescriptor;
 
             // Set the per-primitive constant buffer
             UINT constantValues[5] = { primitive->perPrimitiveDescriptor.index, materialDescriptor.index, 0, 0, primitive->miscDescriptorParameter.index };
@@ -2833,26 +3047,27 @@ void DrawMeshesGBuffer(App& app, ID3D12GraphicsCommandList* commandList)
     }
 }
 
-void DrawModelAlphaBlendedMeshes(App& app, const Model& model, ID3D12GraphicsCommandList* commandList)
+void DrawAlphaBlendedMeshes(App& app, ID3D12GraphicsCommandList* commandList)
 {
+    auto meshIter = app.meshPool.Begin();
     // FIXME: This seems like a bad looping order..
-    int constantBufferIdx = model.primitiveDataDescriptors.index;
-    for (const auto& mesh : model.meshes) {
+    while (meshIter) {
+        auto& mesh = meshIter.item;
         for (const auto& primitive : mesh->primitives) {
-            const auto& material = app.materials[primitive->materialIndex];
+            auto material = primitive->material.get();
             // FIXME: if I am not lazy I will SORT by material type
             // Only draw alpha blended materials in this pass.
-            if (material.materialType != MaterialType_AlphaBlendPBR) {
+            if (material->materialType != MaterialType_AlphaBlendPBR) {
                 //constantBufferIdx++;
                 continue;
             }
-            auto materialDescriptor = GetMaterialDescriptor(app, primitive->materialIndex);
+            auto materialDescriptor = material->cbvDescriptor;
 
             for (int lightIdx = 0; lightIdx < app.LightBuffer.count; lightIdx++) {
                 int lightDescriptorIndex = app.LightBuffer.cbvHandle.index + lightIdx + 1;
                 // Set the per-primitive constant buffer
-                std::array<UINT, 3> constantValues = { primitive->perPrimitiveDescriptor.index, materialDescriptor.index, lightDescriptorIndex };
-                commandList->SetGraphicsRoot32BitConstants(0, constantValues.size(), constantValues.data(), 0);
+                UINT constantValues[5] = { primitive->perPrimitiveDescriptor.index, materialDescriptor.index, lightDescriptorIndex, 0, primitive->miscDescriptorParameter.index };
+                commandList->SetGraphicsRoot32BitConstants(0, _countof(constantValues), constantValues, 0);
                 commandList->IASetPrimitiveTopology(primitive->primitiveTopology);
                 commandList->SetPipelineState(primitive->PSO->Get());
                 commandList->IASetVertexBuffers(0, (UINT)primitive->vertexBufferViews.size(), primitive->vertexBufferViews.data());
@@ -2862,6 +3077,7 @@ void DrawModelAlphaBlendedMeshes(App& app, const Model& model, ID3D12GraphicsCom
                 app.Stats.drawCalls++;
             }
         }
+        meshIter = app.meshPool.Next(meshIter);
     }
 }
 
@@ -2998,9 +3214,7 @@ void AlphaBlendPass(App& app, ID3D12GraphicsCommandList* commandList)
     commandList->SetDescriptorHeaps(1, ppHeaps);
     commandList->SetGraphicsRootSignature(app.rootSignature.Get());
 
-    for (const auto& model : app.models) {
-        DrawModelAlphaBlendedMeshes(app, model, commandList);
-    }
+    DrawAlphaBlendedMeshes(app, commandList);
 }
 
 void BuildCommandList(App& app)
@@ -3372,8 +3586,8 @@ int RunApp(int argc, char** argv)
                     HandleResize(app, newWidth, newHeight);
                 }
             } else if (e.type == SDL_MOUSEMOTION) {
-                app.mouseState.xrel = e.motion.xrel;
-                app.mouseState.yrel = e.motion.yrel;
+                app.mouseState.xrel += e.motion.xrel;
+                app.mouseState.yrel += e.motion.yrel;
             } else if (e.type == SDL_MOUSEWHEEL) {
                 app.mouseState.scrollDelta = e.wheel.preciseY;
             } else if (e.type == SDL_KEYUP) {
@@ -3433,7 +3647,7 @@ int RunMDXR(int argc, char** argv)
         {
             dxgiDebug->ReportLiveObjects(DXGI_DEBUG_ALL, DXGI_DEBUG_RLO_FLAGS(DXGI_DEBUG_RLO_SUMMARY | DXGI_DEBUG_RLO_IGNORE_INTERNAL));
         }
-    }
+}
 #endif
 
     return status;
