@@ -499,10 +499,6 @@ struct App {
     ComPtr<ID3D12GraphicsCommandList> copyCommandList;
     IncrementalFence copyFence;
 
-    // FIXME: Models should only exist as a concept in the scene graph.
-    // there is no reason the renderer itself has to group it like this.
-    // All the model data should be handled by special allocators and grouped into
-    // resource pools.
     std::vector<Model> models;
 
     unsigned int frameIdx;
@@ -2735,10 +2731,14 @@ void DrawMeshesGBuffer(App& app, ID3D12GraphicsCommandList* commandList)
             const auto& material = primitive->material.get();
             // FIXME: if I am not lazy I will SORT by material type
             // Transparent materials drawn in different pass
-            if (!material || material->materialType == MaterialType_AlphaBlendPBR) {
-                continue;
+            DescriptorReference materialDescriptor;
+
+            if (material) {
+                if (material->materialType == MaterialType_AlphaBlendPBR) {
+                    continue;
+                }
+                materialDescriptor = material->cbvDescriptor;
             }
-            auto materialDescriptor = material->cbvDescriptor;
 
             // Set the per-primitive constant buffer
             UINT constantValues[5] = { primitive->perPrimitiveDescriptor.index, materialDescriptor.index, 0, 0, primitive->miscDescriptorParameter.index };
@@ -2765,7 +2765,7 @@ void DrawAlphaBlendedMeshes(App& app, ID3D12GraphicsCommandList* commandList)
             auto material = primitive->material.get();
             // FIXME: if I am not lazy I will SORT by material type
             // Only draw alpha blended materials in this pass.
-            if (!material || material->materialType == MaterialType_AlphaBlendPBR) {
+            if (!material || material->materialType != MaterialType_AlphaBlendPBR) {
                 continue;
             }
             auto materialDescriptor = material->cbvDescriptor;
