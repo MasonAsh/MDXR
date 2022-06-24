@@ -11,6 +11,10 @@ struct PSInput {
 #define METAL_ROUGHNESS_BUFFER 2
 #define DEPTH_BUFFER 3
 
+TextureCube GetSkyboxTexture() {
+    return ResourceDescriptorHeap[g_MiscDescriptorIndex];
+}
+
 float4 ClipToView(float4 clipCoord)
 {
     float4 view = mul(GetLightPassData().inverseProjection, clipCoord);
@@ -39,7 +43,6 @@ PSInput VSMain(uint id : SV_VertexID)
 float4 PSMain(PSInput input) : SV_TARGET
 {
     ConstantBuffer<LightPassConstantData> passData = GetLightPassData();
-    ConstantBuffer<LightConstantData> light = GetLight();
 
     Texture2D baseColorTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + BASE_COLOR_BUFFER];
     Texture2D normalTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + NORMAL_BUFFER];
@@ -56,25 +59,32 @@ float4 PSMain(PSInput input) : SV_TARGET
 
     float4 viewPos = ScreenToView(float4(input.uv, depth, 1.0f));
 
-    float3 lightToFragment = (-viewPos.xyz) -  (-light.positionViewSpace.xyz);
-    float distance = length(lightToFragment);
-    float attenuation = 1.0f / (distance * distance);
+    float attenuation = 1.0f;
 
     float3 N = normal.xyz;
 
-    // Light direction to fragment
-    float3 Wi = lightToFragment / distance;
+    TextureCube skybox = GetSkyboxTexture();
+    float3 radiance = skybox.Sample(g_sampler, N).rgb * passData.environmentIntensity.rgb;
+
     // Direction from fragment to eye
     float3 Wo = normalize(-viewPos.xyz);
+    float3 Wi = N;
 
-    return ShadePBR(
-        light.colorIntensity.xyz,
-        float4(baseColor, 1.0f),
-        N,
-        roughness,
-        metallic,
-        Wi,
-        Wo,
-        attenuation
-    );
+    float3 H = normalize(Wi + Wo);
+
+    float3 F0 = 0.04;
+    F0 = lerp(F0, baseColor.rgb, metallic);
+
+    float3 kS = FSchlickRoughness(max(0.0, dot(N, Wo)), F0, roughness);
+    float3 kD = 1.0f - kS;
+    float4 diffuseBRDF = float4(kD, 1.0f) * float4(baseColor, 1.0f);
+
+    float4 Lo = (diffuseBRDF)  * float4(radiance, 1);
+
+    float4 color = float4(Lo);
+
+    color = color / (color + 1.0f);
+    color = pow(color, 1.0/2.2);
+
+    return color;
 }

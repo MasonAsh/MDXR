@@ -50,15 +50,15 @@ PSOutput PSMain(PSInput input)
     ConstantBuffer<MaterialData> mat = GetMaterial();
 
     // We can write ambient light straight to the backbuffer.
-    float4 ambient = { 0.00, 0.00, 0.00, 1.0 };
+    float4 ambient = { 0.01, 0.01, 0.01, 1.0 };
     result.backBuffer = ambient;
 
+
+    result.baseColor = mat.baseColorFactor;
     // TODO: these checks be done through preprocessor and shader permutations instead
     if (mat.baseColorTextureIdx != -1) {
         Texture2D baseColorTexture = GetBaseColorTexture(mat);
-        result.baseColor = baseColorTexture.Sample(g_sampler, input.uv);
-    } else {
-        result.baseColor = float4(1.0f, 0.07, 0.57, 1.0);
+        result.baseColor = result.baseColor * baseColorTexture.Sample(g_sampler, input.uv);
     }
 
     if (mat.normalTextureIdx != -1) {
@@ -73,12 +73,10 @@ PSOutput PSMain(PSInput input)
         result.normal = float4(normalize(input.normalVS), 0.0f);
     }
 
+    result.metalRoughness = mat.metalRoughnessFactor;
     if (mat.metalRoughnessIdx != -1) {
         Texture2D metalRoughness = GetMetalRoughnessTexture(mat);
-        result.metalRoughness = metalRoughness.Sample(g_sampler, input.uv);
-    } else {
-        // Default to non-metal with 0.5 roughness
-        result.metalRoughness = float4(0.0f, 1.0f, 0.0f, 1.0f);
+        result.metalRoughness = result.metalRoughness * metalRoughness.Sample(g_sampler, input.uv);
     }
 
     return result;

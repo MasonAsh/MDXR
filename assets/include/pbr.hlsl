@@ -29,6 +29,11 @@ float3 FSchlick(float cosTheta, float3 F0)
     return F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
 }
 
+float3 FSchlickRoughness(float cosTheta, float3 F0, float roughness)
+{
+    return F0 + (max(make_float3(1.0 - roughness), F0) - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
 float4 ShadePBR(
     float3 colorIntensity,
     float4 baseColor,
@@ -40,6 +45,9 @@ float4 ShadePBR(
     float attenuation
 )
 {
+    // 0 roughness means no specular at all, so make sure we have at least a tiny amount
+    roughness = max(0.01, roughness);
+
     // halfway vector
     float3 H = normalize(Wi + Wo);
 
@@ -56,13 +64,9 @@ float4 ShadePBR(
     float G = DistributionGGX(cosWh, roughness);
     float D = GeometrySmith(cosWi, cosWo, roughness);
 
-    float3 kS = F;
     float3 kD = lerp(float3(1,1,1) - F, float3(0, 0, 0), metallic);
-    // float3 kD = 1.0f - kS;
-    // kD *= 1.0f - metallic;
 
     float3 numerator = F * D * G;
-    //float denominator = 4.0f * max(dot(N, Wo), 0.0) * max(dot(N, Wi), 0.0) + 0.0001;
     float denominator = max(Epsilon, 4.0 * cosWi * cosWo);
     float3 specular = numerator / denominator;
 

@@ -4,6 +4,8 @@ struct PrimitiveData {
 };
 
 struct MaterialData {
+    float4 baseColorFactor;
+    float4 metalRoughnessFactor;
     uint baseColorTextureIdx;
     uint normalTextureIdx;
     uint metalRoughnessIdx;
@@ -28,6 +30,7 @@ struct LightConstantData {
 
 struct LightPassConstantData {
     float4x4 inverseProjection;
+    float4 environmentIntensity;
     uint baseGBufferIdx;
     uint debug;
 };

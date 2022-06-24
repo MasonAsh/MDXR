@@ -148,13 +148,16 @@ enum MaterialType {
 };
 
 struct MaterialConstantData {
+    glm::vec4 baseColorFactor;
+    glm::vec4 metalRoughnessFactor;
+
     UINT baseColorTextureIdx;
     UINT normalTextureIdx;
     UINT metalRoughnessTextureIdx;
 
     UINT materialType;
 
-    float padding[60];
+    float padding[52];
 };
 static_assert((sizeof(MaterialConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
 
@@ -169,6 +172,9 @@ struct Material {
     MaterialTextureDescriptors textureDescriptors;
     DescriptorReference cbvDescriptor;
 
+    glm::vec4 baseColorFactor = glm::vec4(1.0f);
+    glm::vec4 metalRoughnessFactor = glm::vec4(0.0f, 1.0f, 0.0f, 1.0f);
+
     MaterialType materialType;
 
     std::string name;
@@ -178,6 +184,8 @@ struct Material {
         constantData->baseColorTextureIdx = textureDescriptors.baseColor.index;
         constantData->normalTextureIdx = textureDescriptors.normal.index;
         constantData->metalRoughnessTextureIdx = textureDescriptors.metalRoughness.index;
+        constantData->baseColorFactor = baseColorFactor;
+        constantData->metalRoughnessFactor = metalRoughnessFactor;
     }
 };
 
@@ -325,9 +333,10 @@ const int GBuffer_RTVCount = GBuffer_Depth;
 
 struct LightPassConstantData {
     glm::mat4 inverseProjectionMatrix;
+    glm::vec4 environmentIntensity;
     UINT baseGBufferIndex;
     UINT debug;
-    float pad[46];
+    float pad[42];
 };
 static_assert((sizeof(LightPassConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
 
@@ -461,8 +470,8 @@ struct App {
         long drawCalls = 0;
     } Stats;
 
-    int windowWidth = 1280;
-    int windowHeight = 720;
+    int windowWidth = 1920;
+    int windowHeight = 1080;
     bool borderlessFullscreen = false;
     bool gpuDebug = false;
 
@@ -530,6 +539,7 @@ struct App {
     struct {
         ManagedPSORef pointLightPSO;
         ManagedPSORef directionalLightPso;
+        ManagedPSORef environentCubemapLightPso;
     } LightPass;
 
     struct {
@@ -804,6 +814,47 @@ ManagedPSORef CreateDirectionalLightPSO(
         device,
         dataDir,
         "lighting_directional",
+        rootSignature,
+        inputLayout,
+        psoDesc
+    );
+}
+
+ManagedPSORef CreateEnvironmentCubemapLightPSO(
+    PSOManager& manager,
+    ID3D12Device* device,
+    const std::string& dataDir,
+    ID3D12RootSignature* rootSignature,
+    const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
+)
+{
+    // Unlike other PSOs, we go clockwise here.
+    CD3DX12_RASTERIZER_DESC rasterizerState(D3D12_DEFAULT);
+    auto psoDesc = DefaultPSODesc();
+    psoDesc.DepthStencilState.DepthEnable = FALSE;
+    psoDesc.DepthStencilState.StencilEnable = FALSE;
+    psoDesc.RasterizerState = rasterizerState;
+
+    // Blending enabled for the accumulation (back) buffer
+    D3D12_RENDER_TARGET_BLEND_DESC blendDesc;
+    blendDesc.BlendEnable = TRUE;
+    blendDesc.LogicOpEnable = FALSE;
+    blendDesc.SrcBlend = D3D12_BLEND_ONE;
+    blendDesc.DestBlend = D3D12_BLEND_ONE;
+    blendDesc.BlendOp = D3D12_BLEND_OP_ADD;
+    blendDesc.SrcBlendAlpha = D3D12_BLEND_ONE;
+    blendDesc.DestBlendAlpha = D3D12_BLEND_ZERO;
+    blendDesc.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    blendDesc.LogicOp = D3D12_LOGIC_OP_NOOP;
+    blendDesc.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+    psoDesc.BlendState.RenderTarget[0] = blendDesc;
+
+    return CreatePSO(
+        manager,
+        device,
+        dataDir,
+        "lighting_environment_cubemap",
         rootSignature,
         inputLayout,
         psoDesc
@@ -1098,6 +1149,7 @@ void SetupLightBuffer(App& app)
     app.LightBuffer.cbvHandle = descriptorHandle;
 
     app.LightBuffer.passData->baseGBufferIndex = app.GBuffer.baseSrvReference.index;
+    app.LightBuffer.passData->environmentIntensity = glm::vec4(0.1f);
 
     for (int i = 0; i < MaxLightCount; i++) {
         // Link convenient light structures back to the constant buffer
@@ -1153,6 +1205,14 @@ void SetupLightingPass(App& app)
     );
 
     app.LightPass.directionalLightPso = CreateDirectionalLightPSO(
+        app.psoManager,
+        app.device.Get(),
+        app.dataDir,
+        app.rootSignature.Get(),
+        inputLayout
+    );
+
+    app.LightPass.environentCubemapLightPso = CreateEnvironmentCubemapLightPSO(
         app.psoManager,
         app.device.Get(),
         app.dataDir,
@@ -1520,7 +1580,8 @@ AssetBundle LoadAssets(App& app)
     std::string warn;
 
     LoadModelAsset(app, assets, loader, app.dataDir + "/floor/floor.gltf");
-    LoadModelAsset(app, assets, loader, app.dataDir + "/FlightHelmet/FlightHelmet.gltf");
+    // LoadModelAsset(app, assets, loader, app.dataDir + "/FlightHelmet/FlightHelmet.gltf");
+    LoadModelAsset(app, assets, loader, app.dataDir + "/metallicsphere.gltf");
 
     SkyboxAssets skybox;
     skybox.images[SkyboxImage_Front] = LoadImageFile(app.dataDir + "/skybox/front.png");
@@ -1692,6 +1753,12 @@ void CreateModelMaterials(
         material->textureDescriptors.baseColor = baseColorTextureDescriptor;
         material->textureDescriptors.normal = normalTextureDescriptor;
         material->textureDescriptors.metalRoughness = metalRoughnessTextureDescriptor;
+        material->baseColorFactor.r = inputMaterial.pbrMetallicRoughness.baseColorFactor[0];
+        material->baseColorFactor.g = inputMaterial.pbrMetallicRoughness.baseColorFactor[1];
+        material->baseColorFactor.b = inputMaterial.pbrMetallicRoughness.baseColorFactor[2];
+        material->baseColorFactor.a = inputMaterial.pbrMetallicRoughness.baseColorFactor[3];
+        material->metalRoughnessFactor.g = inputMaterial.pbrMetallicRoughness.roughnessFactor;
+        material->metalRoughnessFactor.b = inputMaterial.pbrMetallicRoughness.metallicFactor;
         material->cbvDescriptor = descriptorReference + i;
         material->name = inputMaterial.name;
         material->UpdateConstantData();
@@ -1746,7 +1813,6 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
     Model& outputModel,
     App& app,
     const tinygltf::Model& inputModel,
-    ComPtr<ID3D12Resource> uploadHeap,
     const std::vector<D3D12_RESOURCE_DESC>& resourceDescs,
     const std::vector<UINT64>& uploadOffsets,
     std::span<ComPtr<ID3D12Resource>>& outGeometryResources,
@@ -1758,26 +1824,6 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
 
     UploadBatch uploadBatch;
     uploadBatch.Begin(app.mainAllocator.Get(), app.copyCommandAllocator.Get(), app.copyCommandQueue.Get(), &app.copyFence);
-
-    // Copy all GLTF buffer data to the upload heap
-    // size_t uploadHeapPosition = 0;
-    // UINT8* uploadHeapPtr;
-    // CD3DX12_RANGE readRange(0, 0);
-    // ASSERT_HRESULT(uploadHeap->Map(0, &readRange, reinterpret_cast<void**>(&uploadHeapPtr)));
-    // int bufferIdx = 0;
-    // for (bufferIdx = 0; bufferIdx < inputModel.buffers.size(); bufferIdx++) {
-    //     auto buffer = inputModel.buffers[bufferIdx];
-    //     auto uploadHeapPosition = uploadOffsets[bufferIdx];
-    //     memcpy(uploadHeapPtr + uploadHeapPosition, buffer.data.data(), buffer.data.size());
-    // }
-    // int imageIdx = 0;
-    // for (; bufferIdx < uploadOffsets.size(); imageIdx++, bufferIdx++)
-    // {
-    //     auto image = inputModel.images[imageIdx];
-    //     auto uploadHeapPosition = uploadOffsets[bufferIdx];
-    //     memcpy(uploadHeapPtr + uploadHeapPosition, image.image.data(), image.image.size());
-    // }
-    // uploadHeap->Unmap(0, nullptr);
 
     std::vector<CD3DX12_RESOURCE_BARRIER> resourceBarriers;
 
@@ -2101,6 +2147,9 @@ PoolItem<Primitive> CreateModelPrimitive(
                 app.rootSignature.Get(),
                 primitive->inputLayout
             );
+        } else {
+            // Unimplemented MaterialType
+            abort();
         }
     } else {
         // Just pray this will work
@@ -2500,7 +2549,6 @@ void ProcessAssets(App& app, AssetBundle& assets)
         auto resourceDescs = CreateResourceDescriptions(gltfModel);
 
         std::vector<UINT64> uploadOffsets;
-        auto uploadHeap = CreateUploadHeap(app, resourceDescs, uploadOffsets);
 
         std::span<ComPtr<ID3D12Resource>> geometryBuffers;
         std::span<ComPtr<ID3D12Resource>> textureBuffers;
@@ -2513,7 +2561,6 @@ void ProcessAssets(App& app, AssetBundle& assets)
             model,
             app,
             gltfModel,
-            uploadHeap,
             resourceDescs,
             uploadOffsets,
             geometryBuffers,
@@ -2586,6 +2633,7 @@ void InitializeLights(App& app)
 void InitializeScene(App& app) {
     InitializeCamera(app);
     InitializeLights(app);
+    app.models[1].meshes[0]->translation = glm::vec3(0, 0.5f, 0.0f);
 }
 
 glm::mat4 ApplyStandardTransforms(const glm::mat4& base, glm::vec3 translation, glm::vec3 euler, glm::vec3 scale)
@@ -2601,25 +2649,6 @@ glm::mat4 ApplyStandardTransforms(const glm::mat4& base, glm::vec3 translation, 
 void UpdatePerPrimitiveConstantBuffers(App& app, const glm::mat4& projection, const glm::mat4& view)
 {
     glm::mat4 viewProjection = projection * view;
-    // PerPrimitiveConstantData* perPrimitiveBuffer = reinterpret_cast<PerPrimitiveConstantData*>(model.perPrimitiveBufferPtr);
-    // for (int i = 0; i < model.meshes.size(); i++) {
-    //     auto& mesh = model.meshes[i];
-
-    //     auto modelMatrix = ApplyStandardTransforms(
-    //         mesh->baseModelTransform,
-    //         mesh->translation,
-    //         mesh->euler,
-    //         mesh->scale
-    //     );
-
-    //     auto mvp = viewProjection * modelMatrix;
-    //     auto mv = view * modelMatrix;
-    //     for (const auto& primitive : mesh->primitives) {
-    //         perPrimitiveBuffer->MVP = mvp;
-    //         perPrimitiveBuffer->MV = mv;
-    //         perPrimitiveBuffer++;
-    //     }
-    // }
 
     auto meshIter = app.meshPool.Begin();
 
@@ -2902,6 +2931,18 @@ void LightPass(App& app, ID3D12GraphicsCommandList* commandList)
                 DrawFullscreenQuad(app, commandList);
             }
         }
+
+        // Environment cubemap
+        commandList->SetPipelineState(app.LightPass.environentCubemapLightPso->Get());
+        UINT constantValues[5] = {
+            -1,
+            -1,
+            -1,
+            app.LightBuffer.cbvHandle.index,
+            app.Skybox.texcubeSRV.index,
+        };
+        commandList->SetGraphicsRoot32BitConstants(0, _countof(constantValues), constantValues, 0);
+        DrawFullscreenQuad(app, commandList);
     }
 }
 
@@ -3093,18 +3134,6 @@ void DrawLightEditor(App& app)
     }
 
     if (ImGui::Begin("Lights", &app.ImGui.lightsOpen, 0)) {
-        if (ImGui::Button("New light")) {
-            app.LightBuffer.count = glm::min(app.LightBuffer.count + 1, MaxLightCount);
-            selectedLightIdx = app.LightBuffer.count - 1;
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Remove light")) {
-            app.LightBuffer.count = glm::max(app.LightBuffer.count - 1, 0);
-            if (selectedLightIdx == app.LightBuffer.count) {
-                selectedLightIdx--;
-            }
-        }
-
         // const char* const* pLabels = (const char* const*)labels;
         if (ImGui::BeginListBox("Lights")) {
             for (int i = 0; i < app.LightBuffer.count; i++) {
@@ -3116,6 +3145,18 @@ void DrawLightEditor(App& app)
                 }
             }
             ImGui::EndListBox();
+        }
+
+        if (ImGui::Button("New light")) {
+            app.LightBuffer.count = glm::min(app.LightBuffer.count + 1, MaxLightCount);
+            selectedLightIdx = app.LightBuffer.count - 1;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Remove light")) {
+            app.LightBuffer.count = glm::max(app.LightBuffer.count - 1, 0);
+            if (selectedLightIdx == app.LightBuffer.count) {
+                selectedLightIdx--;
+            }
         }
 
         ImGui::Separator();
@@ -3148,6 +3189,9 @@ void DrawLightEditor(App& app)
         } else {
             ImGui::Text("No light selected");
         }
+
+        ImGui::Separator();
+        ImGui::DragFloat3("Environment Intensity", &app.LightBuffer.passData->environmentIntensity[0]);
     }
 
     ImGui::End();
