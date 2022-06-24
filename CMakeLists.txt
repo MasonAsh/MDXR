@@ -30,6 +30,8 @@ add_executable(mdxr
     src/mdxr.cpp
     src/pool.h
     src/gltftangentspace.cpp
+    src/uploadbatch.h
+    src/incrementalfence.h
 
     # third party
     src/stb_image.h

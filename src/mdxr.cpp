@@ -1,6 +1,8 @@
 #include "mdxr.h"
 #include "util.h"
 #include "pool.h"
+#include "incrementalfence.h"
+#include "uploadbatch.h"
 #include <algorithm>
 #include <iostream>
 #include <assert.h>
@@ -290,70 +292,6 @@ struct DescriptorArena {
     }
 };
 
-struct IncrementalFence {
-    ComPtr<ID3D12Fence> fence;
-    UINT64 targetFenceValue;
-    UINT64 nextFenceValue;
-    HANDLE event;
-
-    void Initialize(ID3D12Device* device)
-    {
-        targetFenceValue = 0;
-        ASSERT_HRESULT(
-            device->CreateFence(
-                targetFenceValue,
-                D3D12_FENCE_FLAG_NONE,
-                IID_PPV_ARGS(&fence)
-            )
-        );
-        nextFenceValue = targetFenceValue + 1;
-
-        event = CreateEvent(nullptr, false, false, nullptr);
-        if (event == nullptr) {
-            ASSERT_HRESULT(
-                HRESULT_FROM_WIN32(
-                    GetLastError()
-                )
-            );
-        }
-    }
-
-    void Signal(ID3D12CommandQueue* commandQueue)
-    {
-        CHECK(IsFinished());
-        // Signal and increment the fence value.
-        targetFenceValue = nextFenceValue;
-        ASSERT_HRESULT(
-            commandQueue->Signal(fence.Get(), targetFenceValue)
-        );
-        nextFenceValue++;
-    }
-
-    void Wait(ID3D12CommandQueue* commandQueue)
-    {
-        // Wait until the previous frame is finished.
-        if (fence->GetCompletedValue() < targetFenceValue)
-        {
-            ASSERT_HRESULT(
-                fence->SetEventOnCompletion(targetFenceValue, event)
-            );
-
-            WaitForSingleObject(event, INFINITE);
-        }
-    }
-
-    bool IsFinished()
-    {
-        return fence->GetCompletedValue() >= targetFenceValue;
-    }
-
-    void SignalAndWait(ID3D12CommandQueue* commandQueue)
-    {
-        Signal(commandQueue);
-        Wait(commandQueue);
-    }
-};
-
 struct Camera {
     glm::vec3 translation;
 
@@ -504,208 +442,6 @@ struct Light {
     }
 };
 
-class UploadBatch
-{
-public:
-    const UINT64 MaxUploadSize = (UINT64)1000 * 1000 * 1000;
-
-    // Begins an upload batch.
-    // The batch has full control of the command queue during this time.
-    void Begin(D3D12MA::Allocator* allocator, ID3D12CommandAllocator* commandAllocator, ID3D12CommandQueue* commandQueue, IncrementalFence* fence)
-    {
-        this->allocator = allocator;
-        this->fence = fence;
-        this->commandQueue = commandQueue;
-        this->commandAllocator = commandAllocator;
-
-        commandAllocator->GetDevice(IID_PPV_ARGS(&device));
-        ASSERT_HRESULT(
-            device->CreateCommandList(
-                0,
-                D3D12_COMMAND_LIST_TYPE_COPY,
-                commandAllocator,
-                nullptr,
-                IID_PPV_ARGS(&commandList)
-            )
-        );
-        device->Release();
-
-        D3D12MA::Budget budget;
-        this->allocator->GetBudget(&budget, nullptr);
-
-        // Upload up to 1GB at a time
-        uploadBufferSize = std::min(MaxUploadSize, budget.BudgetBytes / 2);
-        D3D12MA::VIRTUAL_BLOCK_DESC blockDesc{};
-        blockDesc.Size = uploadBufferSize;
-        D3D12MA::CreateVirtualBlock(&blockDesc, &virtualBlock);
-
-        auto uploadBufferDesc = CD3DX12_RESOURCE_DESC::Buffer(uploadBufferSize);
-        D3D12MA::ALLOCATION_DESC allocDesc{};
-        allocDesc.HeapType = D3D12_HEAP_TYPE_UPLOAD;
-        ASSERT_HRESULT(
-            allocator->CreateResource(&allocDesc,
-                &uploadBufferDesc,
-                D3D12_RESOURCE_STATE_COMMON,
-                nullptr,
-                &this->uploadBuffer,
-                IID_NULL,
-                nullptr
-            )
-        );
-
-        uploadBuffer->GetResource()->Map(0, nullptr, reinterpret_cast<void**>(&uploadDataPtr));
-    }
-
-    void AddTexture(ID3D12Resource* destResource, D3D12_SUBRESOURCE_DATA* subresourceData, int subresource, int numSubresources)
-    {
-        // Suballocate one resource at a time. It's just easier this way and the end effect should be the same.
-        for (int i = 0; i < numSubresources; i++) {
-            UINT64 requiredBytes = GetRequiredIntermediateSize(destResource, i, 1);
-
-            // FIXME: This case should be possible to handle
-            assert(requiredBytes <= uploadBufferSize);
-
-            UINT64 offset;
-            D3D12MA::VirtualAllocation allocation;
-            D3D12MA::VIRTUAL_ALLOCATION_DESC allocDesc = {};
-            allocDesc.Alignment = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
-            allocDesc.Size = requiredBytes;
-            if (!SUCCEEDED(virtualBlock->Allocate(
-                &allocDesc,
-                &allocation,
-                &offset))) {
-                SyncFlush();
-
-                // This *should* work 100%, as we've made sure we're not uploading >
-                // uploadBufferSize at once at this point.
-                ASSERT_HRESULT(
-                    virtualBlock->Allocate(
-                        &allocDesc,
-                        &allocation,
-                        &offset
-                    )
-                );
-            }
-
-            auto resourceDesc = destResource->GetDesc();
-            D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
-            device->GetCopyableFootprints(
-                &resourceDesc,
-                i,
-                1,
-                offset,
-                &footprint,
-                nullptr,
-                nullptr,
-                &requiredBytes
-            );
-
-            for (UINT y = 0; y < footprint.Footprint.Height; y++) {
-                UINT8* pSrcPtr = (UINT8*)subresourceData[i].pData + y * footprint.Footprint.RowPitch;
-                UINT8* pDestPtr = uploadDataPtr + footprint.Offset + y * footprint.Footprint.RowPitch;
-                memcpy(pDestPtr, pSrcPtr, subresourceData[i].RowPitch);
-            }
-
-            const CD3DX12_TEXTURE_COPY_LOCATION Dst(destResource, i);
-            const CD3DX12_TEXTURE_COPY_LOCATION Src(uploadBuffer->GetResource(), footprint);
-            commandList->CopyTextureRegion(&Dst, 0, 0, 0, &Src, nullptr);
-        }
-    }
-
-    void AddBuffer(ID3D12Resource* destinationResource, size_t destOffset, void* srcData, size_t numBytes)
-    {
-        // If a big resource can't fit into one upload, split into two. This
-        // will recurse, so if a resource is somehow uploadBufferSize * 2, then
-        // it will get split in recurse calls.
-        if (numBytes > uploadBufferSize) {
-            SyncFlush();
-            int leftoverBytes = numBytes - uploadBufferSize;
-            AddBuffer(destinationResource, destOffset, srcData, uploadBufferSize);
-            AddBuffer(destinationResource, destOffset + uploadBufferSize, srcData, leftoverBytes);
-            return;
-        }
-
-        UINT64 offset;
-        D3D12MA::VirtualAllocation allocation;
-        D3D12MA::VIRTUAL_ALLOCATION_DESC allocDesc = {};
-        allocDesc.Alignment = sizeof(float);
-        allocDesc.Size = numBytes;
-        if (!SUCCEEDED(virtualBlock->Allocate(
-            &allocDesc,
-            &allocation,
-            &offset))) {
-            SyncFlush();
-
-            // This *should* work 100%, as we've made sure we're not uploading >
-            // uploadBufferSize at once at this point.
-            ASSERT_HRESULT(
-                virtualBlock->Allocate(
-                    &allocDesc,
-                    &allocation,
-                    &offset
-                )
-            );
-        }
-
-        memcpy(uploadDataPtr + offset, srcData, numBytes);
-
-        commandList->CopyBufferRegion(destinationResource,
-            destOffset,
-            uploadBuffer->GetResource(),
-            offset,
-            numBytes
-        );
-    }
-
-    void Finish()
-    {
-        AsyncFlush();
-        Wait();
-    }
-private:
-    void AsyncFlush()
-    {
-        commandList->Close();
-        ID3D12CommandList* ppCommandLists[] = { commandList.Get() };
-        commandQueue->ExecuteCommandLists(1, ppCommandLists);
-        this->fence->Signal(commandQueue);
-        virtualBlock->Clear();
-    }
-
-    // Flush, waiting for upload to finish before returning
-    void SyncFlush()
-    {
-        AsyncFlush();
-        Wait();
-    }
-
-    // Wait for any pending uploads to finish
-    void Wait()
-    {
-        if (!this->fence->IsFinished()) {
-            this->fence->Wait(commandQueue);
-        }
-
-        ASSERT_HRESULT(
-            commandList->Reset(commandAllocator, nullptr)
-        );
-    }
-
-    ID3D12CommandQueue* commandQueue;
-    ID3D12CommandAllocator* commandAllocator;
-
-    ComPtr<ID3D12GraphicsCommandList> commandList;
-    IncrementalFence* fence;
-
-    ComPtr<D3D12MA::Allocation> uploadBuffer;
-    UINT64 uploadBufferSize;
-    UINT8* uploadDataPtr;
-
-    D3D12MA::Allocator* allocator;
-    ID3D12Device* device;
-    D3D12MA::VirtualBlock* virtualBlock;
-};
-
 struct App {
     std::string dataDir;
     std::wstring wDataDir;
@@ -732,15 +468,11 @@ struct App {
 
     PSOManager psoManager;
 
-    // FIXME:
-    // Ok not good, primitives relies on these, and if these are declared after primitive pool
-    // then we can crash on program exit. It seems like ~Primitive is calling ~shared_ptr<Material>
-    // after its already freed.
-    Pool<Material, 128> materials;
-    ConstantBufferArena<MaterialConstantData> materialConstantBuffer;
 
     Pool<Primitive, 100> primitivePool;
     Pool<Mesh, 32> meshPool;
+    Pool<Material, 128> materials;
+    ConstantBufferArena<MaterialConstantData> materialConstantBuffer;
 
 
     ComPtr<ID3D12Device> device;
@@ -1791,20 +1523,20 @@ AssetBundle LoadAssets(App& app)
     std::string err;
     std::string warn;
 
-    // LoadModelAsset(app, assets, loader, app.dataDir + "/floor/floor.gltf");
-    // LoadModelAsset(app, assets, loader, app.dataDir + "/FlightHelmet/FlightHelmet.gltf");
+    LoadModelAsset(app, assets, loader, app.dataDir + "/floor/floor.gltf");
+    LoadModelAsset(app, assets, loader, app.dataDir + "/FlightHelmet/FlightHelmet.gltf");
 
-    // SkyboxAssets skybox;
-    // skybox.images[SkyboxImage_Front] = LoadImageFile(app.dataDir + "/skybox/front.png");
-    // skybox.images[SkyboxImage_Back] = LoadImageFile(app.dataDir + "/skybox/back.png");
-    // skybox.images[SkyboxImage_Left] = LoadImageFile(app.dataDir + "/skybox/left.png");
-    // skybox.images[SkyboxImage_Right] = LoadImageFile(app.dataDir + "/skybox/right.png");
-    // skybox.images[SkyboxImage_Top] = LoadImageFile(app.dataDir + "/skybox/top.png");
-    // skybox.images[SkyboxImage_Bottom] = LoadImageFile(app.dataDir + "/skybox/bottom.png");
-    // assets.skybox = skybox;
+    SkyboxAssets skybox;
+    skybox.images[SkyboxImage_Front] = LoadImageFile(app.dataDir + "/skybox/front.png");
+    skybox.images[SkyboxImage_Back] = LoadImageFile(app.dataDir + "/skybox/back.png");
+    skybox.images[SkyboxImage_Left] = LoadImageFile(app.dataDir + "/skybox/left.png");
+    skybox.images[SkyboxImage_Right] = LoadImageFile(app.dataDir + "/skybox/right.png");
+    skybox.images[SkyboxImage_Top] = LoadImageFile(app.dataDir + "/skybox/top.png");
+    skybox.images[SkyboxImage_Bottom] = LoadImageFile(app.dataDir + "/skybox/bottom.png");
+    assets.skybox = skybox;
 
     //LoadModelAsset(app, assets, loader, app.dataDir + "duck.gltf");
-    LoadModelAsset(app, assets, loader, "C:\\Users\\mason\\dev\\glTF-Sample-Models\\Main\\tangified\\sponza_tangents.gltf");
+    // LoadModelAsset(app, assets, loader, "C:\\Users\\mason\\dev\\glTF-Sample-Models\\Main\\tangified\\sponza_tangents.gltf");
 
     return assets;
 }
@@ -2072,7 +1804,6 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
         );
 
         uploadBatch.AddBuffer(geometryBuffer.Get(), 0, (void*)gltfBuffer.data.data(), gltfBuffer.data.size());
-        DEBUG_VAR(gltfBuffer.data.size());
 
         resourceBarriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(
             geometryBuffer.Get(),
@@ -2997,29 +2728,6 @@ void UpdateScene(App& app)
 
 void DrawMeshesGBuffer(App& app, ID3D12GraphicsCommandList* commandList)
 {
-    // for (const auto& mesh : model.meshes) {
-    //     for (const auto& primitive : mesh->primitives) {
-    //         const auto& material = app.materials[primitive->materialIndex];
-    //         // FIXME: if I am not lazy I will SORT by material type
-    //         // Transparent materials drawn in different pass
-    //         if (material.materialType == MaterialType_AlphaBlendPBR) {
-    //             continue;
-    //         }
-    //         auto materialDescriptor = GetMaterialDescriptor(app, model, primitive->materialIndex);
-
-    //         // Set the per-primitive constant buffer
-    //         UINT constantValues[2] = { primitive->perPrimitiveDescriptor.index, materialDescriptor.index };
-    //         commandList->SetGraphicsRoot32BitConstants(0, 2, constantValues, 0);
-    //         commandList->IASetPrimitiveTopology(primitive->primitiveTopology);
-    //         commandList->SetPipelineState(primitive->PSO->Get());
-    //         commandList->IASetVertexBuffers(0, (UINT)primitive->vertexBufferViews.size(), primitive->vertexBufferViews.data());
-    //         commandList->IASetIndexBuffer(&primitive->indexBufferView);
-    //         commandList->DrawIndexedInstanced(primitive->indexCount, 1, 0, 0, 0);
-
-    //         app.Stats.drawCalls++;
-    //     }
-    // }
-
     auto meshIter = app.meshPool.Begin();
 
     while (meshIter) {
@@ -3027,7 +2735,7 @@ void DrawMeshesGBuffer(App& app, ID3D12GraphicsCommandList* commandList)
             const auto& material = primitive->material.get();
             // FIXME: if I am not lazy I will SORT by material type
             // Transparent materials drawn in different pass
-            if (material->materialType == MaterialType_AlphaBlendPBR) {
+            if (!material || material->materialType == MaterialType_AlphaBlendPBR) {
                 continue;
             }
             auto materialDescriptor = material->cbvDescriptor;
@@ -3057,8 +2765,7 @@ void DrawAlphaBlendedMeshes(App& app, ID3D12GraphicsCommandList* commandList)
             auto material = primitive->material.get();
             // FIXME: if I am not lazy I will SORT by material type
             // Only draw alpha blended materials in this pass.
-            if (material->materialType != MaterialType_AlphaBlendPBR) {
-                //constantBufferIdx++;
+            if (!material || material->materialType == MaterialType_AlphaBlendPBR) {
                 continue;
             }
             auto materialDescriptor = material->cbvDescriptor;
@@ -3388,10 +3095,14 @@ void DrawLightEditor(App& app)
     if (ImGui::Begin("Lights", &app.ImGui.lightsOpen, 0)) {
         if (ImGui::Button("New light")) {
             app.LightBuffer.count = glm::min(app.LightBuffer.count + 1, MaxLightCount);
+            selectedLightIdx = app.LightBuffer.count - 1;
         }
         ImGui::SameLine();
         if (ImGui::Button("Remove light")) {
             app.LightBuffer.count = glm::max(app.LightBuffer.count - 1, 0);
+            if (selectedLightIdx == app.LightBuffer.count) {
+                selectedLightIdx--;
+            }
         }
 
         // const char* const* pLabels = (const char* const*)labels;
@@ -3647,7 +3358,7 @@ int RunMDXR(int argc, char** argv)
         {
             dxgiDebug->ReportLiveObjects(DXGI_DEBUG_ALL, DXGI_DEBUG_RLO_FLAGS(DXGI_DEBUG_RLO_SUMMARY | DXGI_DEBUG_RLO_IGNORE_INTERNAL));
         }
-}
+    }
 #endif
 
     return status;

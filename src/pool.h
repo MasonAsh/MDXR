@@ -26,12 +26,19 @@ template<typename T, int N>
 class PoolBlock {
 public:
     PoolBlock() : liveItems{ false }, deleterContext(new internal::PoolItemDeleterContext<T>) {
-        deleterContext->items = items.data();
+        deleterContext->items = items;
         deleterContext->liveItems = liveItems.data();
         deleterContext->firstFreeIndex = &firstFreeIndex;
     }
 
     ~PoolBlock() {
+        for (int i = 0; i < N; i++) {
+            if (liveItems[i]) {
+                items[i].~T();
+                liveItems[i] = false;
+            }
+        }
+
         // All leftover deleters will see this go null since they have a weak_ptr to it
         deleterContext = nullptr;
     }
@@ -102,7 +109,8 @@ private:
         }
     }
 
-    std::array<T, N> items;
+    // Placed in union to avoid automatic destructor call
+    union { T items[N]; };
     std::array<bool, N> liveItems;
     size_t firstFreeIndex = 0;
 
@@ -125,6 +133,9 @@ namespace internal {
         void operator()(T* item) {
             if (auto lock = context.lock()) {
                 size_t index = item - lock->items;
+                if (!lock->liveItems[index]) {
+                    return;
+                }
                 item->~T();
                 lock->liveItems[index] = false;
                 if (index <= *lock->firstFreeIndex || *lock->firstFreeIndex == -1) {
