@@ -15,7 +15,6 @@
 #include "dxgidebug.h"
 #include "stb_image.h"
 #include <chrono>
-#include <algorithm>
 #include <span>
 #include <ranges>
 #include <fstream>
@@ -27,6 +26,9 @@
 #include "imgui_impl_sdl.h"
 #include "tinyfiledialogs.h"
 #include "D3D12MemAlloc.h"
+#include "GFSDK_Aftermath_GpuCrashDump.h"
+#include <dxgitype.h>
+#include <DXProgrammableCapture.h>
 
 using namespace std::chrono;
 
@@ -53,73 +55,128 @@ struct PerPrimitiveConstantData {
 };
 static_assert((sizeof(PerPrimitiveConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
 
-struct ManagedPSO {
+struct alignas(16) GenerateMipsConstantData {
+    UINT srcMipLevel;
+    UINT numMipLevels;
+    UINT srcDimension;
+    UINT isSRGB;
+    glm::vec2 texelSize;
+    float padding[58];
+};
+static_assert((sizeof(GenerateMipsConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
+
+struct PSOGraphicsShaderPaths {
+    std::wstring vertex;
+    std::wstring pixel;
+};
+
+class IManagedPSO {
+public:
+    virtual ID3D12PipelineState* Get() = 0;
+    virtual void reload(ID3D12Device* device) = 0;
+};
+
+struct ManagedGraphicsPSO : public IManagedPSO {
     ComPtr<ID3D12PipelineState> PSO;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc;
-    std::wstring vertexShaderPath;
-    std::wstring pixelShaderPath;
+    PSOGraphicsShaderPaths shaderPaths;
     std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout;
 
-    ID3D12PipelineState* Get()
+    ID3D12PipelineState* Get() override
     {
         return PSO.Get();
     }
 
     // FIXME: This leaks. Shouldn't be a big deal since this is just for debugging, but something to keep in mind.
-    void reload(ID3D12Device* device)
+    void reload(ID3D12Device* device) override
     {
-        ComPtr<ID3DBlob> vertexShader;
-        ComPtr<ID3DBlob> pixelShader;
-        if (!SUCCEEDED(D3DReadFileToBlob(vertexShaderPath.c_str(), &vertexShader))) {
-            std::wcout << "Failed to read vertex shader " << vertexShader << "\n";
-            return;
+        ComPtr<ID3DBlob> vertexShader = nullptr;
+        ComPtr<ID3DBlob> pixelShader = nullptr;
+
+        if (!shaderPaths.vertex.empty()) {
+            if (!SUCCEEDED(D3DReadFileToBlob(shaderPaths.vertex.c_str(), &vertexShader))) {
+                std::wcout << "Failed to read vertex shader " << shaderPaths.vertex << "\n";
+                return;
+            }
+            desc.VS = { reinterpret_cast<UINT8*>(vertexShader->GetBufferPointer()), vertexShader->GetBufferSize() };
         }
-        if (!SUCCEEDED(D3DReadFileToBlob(pixelShaderPath.c_str(), &pixelShader))) {
-            std::wcout << "Failed to read pixel shader " << pixelShaderPath << "\n";
-            return;
+        if (!shaderPaths.pixel.empty()) {
+            if (!SUCCEEDED(D3DReadFileToBlob(shaderPaths.pixel.c_str(), &pixelShader))) {
+                std::wcout << "Failed to read pixel shader " << shaderPaths.pixel << "\n";
+                return;
+            }
+            desc.PS = { reinterpret_cast<UINT8*>(pixelShader->GetBufferPointer()), pixelShader->GetBufferSize() };
         }
 
-        desc.VS = { reinterpret_cast<UINT8*>(vertexShader->GetBufferPointer()), vertexShader->GetBufferSize() };
-        desc.PS = { reinterpret_cast<UINT8*>(pixelShader->GetBufferPointer()), pixelShader->GetBufferSize() };
-        ID3D12PipelineState* NewPSO;
+        ComPtr<ID3D12PipelineState> NewPSO;
         if (!SUCCEEDED(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&NewPSO)))) {
             std::wcout << L"Error: PSO reload failed for PSO with\n"
-                << L"Vertex shader: " << vertexShaderPath << L"\n"
-                << L"Pixel shader: " << pixelShaderPath << L"\n";
+                << L"Vertex shader: " << shaderPaths.vertex << L"\n"
+                << L"Pixel shader: " << shaderPaths.pixel << L"\n";
             return;
         }
         PSO = NewPSO;
     }
 };
 
-typedef std::shared_ptr<ManagedPSO> ManagedPSORef;
+struct ManagedComputePSO : public IManagedPSO {
+    ComPtr<ID3D12PipelineState> PSO;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC desc;
+    std::wstring computeShaderPath;
+
+    ID3D12PipelineState* Get() override
+    {
+        return PSO.Get();
+    }
+
+    void reload(ID3D12Device* device) override
+    {
+        ComPtr<ID3DBlob> computeShader = nullptr;
+
+        if (!SUCCEEDED(D3DReadFileToBlob(computeShaderPath.c_str(), &computeShader))) {
+            std::wcout << "Failed to read compute shader " << computeShaderPath << "\n";
+            return;
+        }
+        desc.CS = { reinterpret_cast<UINT8*>(computeShader->GetBufferPointer()), computeShader->GetBufferSize() };
+
+        ComPtr<ID3D12PipelineState> NewPSO;
+        if (!SUCCEEDED(device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&NewPSO)))) {
+            std::wcout << L"Error: PSO reload failed for PSO with\n"
+                << L"Compute shader: " << computeShaderPath << L"\n";
+            return;
+        }
+        PSO = NewPSO;
+    }
+};
+
+typedef std::shared_ptr<IManagedPSO> ManagedPSORef;
 
 struct PSOManager {
-    std::vector<std::weak_ptr<ManagedPSO>> PSOs;
+    std::vector<std::weak_ptr<IManagedPSO>> PSOs;
 
     void reload(ID3D12Device* device)
     {
         for (auto& PSO : PSOs) {
-            if (std::shared_ptr<ManagedPSO> pso = PSO.lock()) {
+            if (std::shared_ptr<IManagedPSO> pso = PSO.lock()) {
                 pso->reload(device);
             }
         }
     }
 };
 
-struct DescriptorReference {
+struct DescriptorRef {
     ID3D12DescriptorHeap* heap;
     int incrementSize;
     UINT index;
 
-    DescriptorReference()
+    DescriptorRef()
         : heap(nullptr)
         , incrementSize(0)
         , index(-1)
     {
     }
 
-    DescriptorReference(ID3D12DescriptorHeap* heap, UINT index, int incrementSize)
+    DescriptorRef(ID3D12DescriptorHeap* heap, UINT index, int incrementSize)
         : heap(heap)
         , index(index)
         , incrementSize(incrementSize)
@@ -134,9 +191,9 @@ struct DescriptorReference {
         return CD3DX12_GPU_DESCRIPTOR_HANDLE(heap->GetGPUDescriptorHandleForHeapStart(), index, incrementSize);
     }
 
-    DescriptorReference operator+(int offset) const
+    DescriptorRef operator+(int offset) const
     {
-        return DescriptorReference(heap, index + offset, incrementSize);
+        return DescriptorRef(heap, index + offset, incrementSize);
     }
 };
 
@@ -162,15 +219,15 @@ struct MaterialConstantData {
 static_assert((sizeof(MaterialConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
 
 struct MaterialTextureDescriptors {
-    DescriptorReference baseColor;
-    DescriptorReference normal;
-    DescriptorReference metalRoughness;
+    DescriptorRef baseColor;
+    DescriptorRef normal;
+    DescriptorRef metalRoughness;
 };
 
 struct Material {
     MaterialConstantData* constantData;
     MaterialTextureDescriptors textureDescriptors;
-    DescriptorReference cbvDescriptor;
+    DescriptorRef cbvDescriptor;
 
     glm::vec4 baseColorFactor = glm::vec4(1.0f);
     glm::vec4 metalRoughnessFactor = glm::vec4(0.0f, 1.0f, 0.0f, 1.0f);
@@ -197,12 +254,12 @@ struct Primitive {
     ManagedPSORef PSO;
     UINT indexCount;
     UINT materialIndex;
-    DescriptorReference perPrimitiveDescriptor;
+    DescriptorRef perPrimitiveDescriptor;
     PerPrimitiveConstantData* constantData;
 
     // Optional custom descriptor for special primitive shaders. Can be anything.
     // For example, the skybox uses this for the texcube shader parameter.
-    DescriptorReference miscDescriptorParameter;
+    DescriptorRef miscDescriptorParameter;
 
     SharedPoolItem<Material> material = nullptr;
 };
@@ -212,6 +269,10 @@ struct Mesh {
     Mesh(Mesh&& mesh) = default;
     Mesh(const Mesh& mesh) = delete;
 
+    // TODO: 
+    // an array of pool items can be optimized to delete all it's items
+    // in one batch. There should be a PoolItemArray structure with a similar
+    // interface to std::vector
     std::vector<PoolItem<Primitive>> primitives;
 
     // This is the base transform as defined in the GLTF model
@@ -233,9 +294,9 @@ struct Model {
     std::vector<ComPtr<ID3D12Resource>> buffers;
     std::vector<PoolItem<Mesh>> meshes;
 
-    DescriptorReference primitiveDataDescriptors;
-    DescriptorReference baseTextureDescriptor;
-    DescriptorReference baseMaterialDescriptor;
+    DescriptorRef primitiveDataDescriptors;
+    DescriptorRef baseTextureDescriptor;
+    DescriptorRef baseMaterialDescriptor;
 
     // All of the child mesh constant buffers stored in this constant buffer
     ComPtr<ID3D12Resource> perPrimitiveConstantBuffer;
@@ -262,12 +323,30 @@ struct AssetBundle {
 };
 
 // Fixed capacity descriptor heap. Aborts when the size outgrows initial capacity.
+//
+// There are two types of descriptors that can be allocated with DescriptorArena:
+//  * Static descriptors for the lifetime of the program with AllocateDesciptors
+//  * Temporary descriptors pushed onto a stack with [Push|Pop]DescriptorStack
+// 
+// Static descriptors grow from the left side of the heap while the stack grows
+// from the right.
 struct DescriptorArena {
+    // Left side of descriptor heap is permanent descriptors
+    // Right side is a stack for temporary allocations
     ComPtr<ID3D12DescriptorHeap> descriptorHeap;
     size_t capacity;
     size_t size;
     UINT descriptorIncrementSize;
     std::string debugName;
+    DescriptorRef stackPtr;
+
+    // Temporary descriptors can be allocated from the right side of the heap
+    UINT stack;
+
+    ID3D12DescriptorHeap* Heap()
+    {
+        return descriptorHeap.Get();
+    }
 
     void Initialize(ID3D12Device* device, D3D12_DESCRIPTOR_HEAP_DESC heapDesc, const std::string& debugName)
     {
@@ -281,22 +360,46 @@ struct DescriptorArena {
         );
         capacity = heapDesc.NumDescriptors;
         size = 0;
+        stack = 0;
+
+        stackPtr = DescriptorRef(descriptorHeap.Get(), capacity - 1, descriptorIncrementSize);
     }
 
-    DescriptorReference AllocateDescriptors(UINT count, const char* debugName) {
+    DescriptorRef AllocateDescriptors(UINT count, const char* debugName)
+    {
         if (debugName != nullptr) {
             std::cout << this->debugName << " allocation info: " <<
                 "\n\tIndex: " << this->size <<
                 "\n\tCount: " << count <<
                 "\n\tReason: " << debugName << "\n";
         }
-        DescriptorReference reference(descriptorHeap.Get(), size, descriptorIncrementSize);
+        DescriptorRef reference(descriptorHeap.Get(), size, descriptorIncrementSize);
         size += count;
-        if (size > capacity) {
+        if (size + stack > capacity) {
             std::cerr << "Error: descriptor heap is not large enough\n";
             abort();
         }
         return reference;
+    }
+
+    // Allocate some temporary descriptors.
+    // These descriptors are allocated from the opposite side of the heap.
+    DescriptorRef PushDescriptorStack(UINT count)
+    {
+        if (size + (capacity - stackPtr.index) + count > capacity) {
+            std::cerr << "Error: descriptor heap is not large enough\n";
+            abort();
+        }
+
+        stackPtr.index -= count;
+
+        return stackPtr;
+    }
+
+    // Pops temporary descriptors from stack
+    void PopDescriptorStack(UINT count)
+    {
+        stackPtr.index += count;
     }
 };
 
@@ -377,10 +480,32 @@ struct ConstantBufferArena
 {
     static_assert((sizeof(T) % 256) == 0, "T must be 256-byte aligned");
 
-    void Initialize(ID3D12Device* device, ComPtr<ID3D12Resource> resource, UINT64 offsetInBuffer)
+    void InitializeWithCapacity(D3D12MA::Allocator* allocator, UINT count)
+    {
+        this->offset = 0;
+        this->size = 0;
+        this->capacity = count;
+        auto resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(sizeof(T) * count);
+        D3D12MA::ALLOCATION_DESC allocDesc{};
+        allocDesc.HeapType = D3D12_HEAP_TYPE_UPLOAD;
+        ASSERT_HRESULT(
+            allocator->CreateResource(
+                &allocDesc,
+                &resourceDesc,
+                D3D12_RESOURCE_STATE_COMMON,
+                nullptr,
+                &allocation,
+                IID_PPV_ARGS(&resource)
+            )
+        );
+        resource->Map(0, nullptr, reinterpret_cast<void**>(&mappedPtr));
+    }
+
+    void InitializeWithBuffer(ComPtr<ID3D12Resource> resource, UINT64 offsetInBuffer)
     {
         this->resource = resource;
         this->capacity = resource->GetDesc().Width / sizeof(T);
+        this->offset = offsetInBuffer;
         this->size = 0;
         resource->Map(0, nullptr, reinterpret_cast<void**>(&mappedPtr));
     }
@@ -407,7 +532,7 @@ struct ConstantBufferArena
         CD3DX12_CPU_DESCRIPTOR_HANDLE descriptorHandle(startDescriptor);
         for (int i = 0; i < slice.data.size(); i++) {
             D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
-            cbvDesc.BufferLocation = resource->GetGPUVirtualAddress() + ((slice.index + i) * sizeof(T));
+            cbvDesc.BufferLocation = resource->GetGPUVirtualAddress() + offset + ((slice.index + i) * sizeof(T));
             cbvDesc.SizeInBytes = sizeof(T);
             device->CreateConstantBufferView(
                 &cbvDesc,
@@ -418,9 +543,11 @@ struct ConstantBufferArena
     }
 
     ComPtr<ID3D12Resource> resource;
+    ComPtr<D3D12MA::Allocation> allocation;
     T* mappedPtr;
     int capacity = 0;
     int size = 0;
+    UINT64 offset;
 };
 
 enum LightType {
@@ -486,16 +613,18 @@ struct App {
 
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12CommandQueue> commandQueue;
+    ComPtr<ID3D12CommandAllocator> commandAllocator;
     ComPtr<IDXGISwapChain3> swapChain;
     ComPtr<ID3D12DescriptorHeap> rtvHeap;
     ComPtr<ID3D12Resource> renderTargets[FrameBufferCount];
-    ComPtr<ID3D12CommandAllocator> commandAllocator;
-    ComPtr<ID3D12CommandAllocator> copyCommandAllocator;
     ComPtr<ID3D12RootSignature> rootSignature;
     ComPtr<ID3D12PipelineState> pipelineState;
     ComPtr<ID3D12GraphicsCommandList> commandList;
     CD3DX12_VIEWPORT viewport;
     CD3DX12_RECT scissorRect;
+
+    ComPtr<ID3D12CommandQueue> computeQueue;
+    ComPtr<ID3D12CommandAllocator> computeCommandAllocator;
 
     ComPtr<ID3D12Resource> depthStencilBuffer;
     ComPtr<ID3D12DescriptorHeap> dsHeap;
@@ -505,6 +634,7 @@ struct App {
     tinygltf::TinyGLTF loader;
 
     ComPtr<ID3D12CommandQueue> copyCommandQueue;
+    ComPtr<ID3D12CommandAllocator> copyCommandAllocator;
     ComPtr<ID3D12GraphicsCommandList> copyCommandList;
     IncrementalFence copyFence;
 
@@ -523,17 +653,13 @@ struct App {
         bool showStats = true;
     } ImGui;
 
-    struct {
-        DescriptorArena descriptorHeap;
-    } GBufferPass;
+    DescriptorArena descriptorArena;
 
     ComPtr<D3D12MA::Allocator> mainAllocator;
 
-
-    // DescriptorArena lightingPassDescriptorArena;
     struct {
         std::array<ComPtr<ID3D12Resource>, GBuffer_Count - 1> renderTargets;
-        DescriptorReference baseSrvReference;
+        DescriptorRef baseSrvReference;
     } GBuffer;
 
     struct {
@@ -550,7 +676,7 @@ struct App {
         LightPassConstantData* passData;
         LightConstantData* lightConstantData;
 
-        DescriptorReference cbvHandle;
+        DescriptorRef cbvHandle;
 
         int count;
     } LightBuffer;
@@ -562,9 +688,16 @@ struct App {
         ComPtr<D3D12MA::Allocation> vertexBuffer;
         ComPtr<D3D12MA::Allocation> indexBuffer;
         ComPtr<D3D12MA::Allocation> perPrimitiveConstantBuffer;
-        DescriptorReference texcubeSRV;
+        DescriptorRef texcubeSRV;
         PoolItem<Mesh> mesh;
     } Skybox;
+
+    struct {
+        ComPtr<ID3D12RootSignature> rootSignature;
+        ManagedPSORef PSO;
+    } MipMapGenerator;
+
+    ComPtr<IDXGraphicsAnalysis> graphicsAnalysis;
 };
 
 void SetupDepthStencil(App& app, bool isResize)
@@ -620,7 +753,7 @@ void SetupRenderTargets(App& app)
     }
 }
 
-D3D12_GRAPHICS_PIPELINE_STATE_DESC DefaultPSODesc()
+D3D12_GRAPHICS_PIPELINE_STATE_DESC DefaultGraphicsPSODesc()
 {
     // GLTF expects CCW winding order
     CD3DX12_RASTERIZER_DESC rasterizerState(D3D12_DEFAULT);
@@ -643,51 +776,90 @@ D3D12_GRAPHICS_PIPELINE_STATE_DESC DefaultPSODesc()
     return psoDesc;
 }
 
-ManagedPSORef CreatePSO(
+ManagedPSORef CreateGraphicsPSO(
     PSOManager& manager,
     ID3D12Device* device,
-    const std::string& dataDir,
-    const std::string& shaderName,
+    const PSOGraphicsShaderPaths& paths,
     ID3D12RootSignature* rootSignature,
     std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout,
     D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc
 )
 {
-    std::wstring wDataDir = convert_to_wstring(dataDir);
-    std::wstring wShaderName = convert_to_wstring(shaderName);
-
-    ComPtr<ID3DBlob> vertexShader;
-    ComPtr<ID3DBlob> pixelShader;
-    const std::wstring vertexShaderPath = (wDataDir + L"/" + wShaderName + L".cvert");
-    const std::wstring pixelShaderPath = (wDataDir + L"/" + wShaderName + L".cpixel");
-    ASSERT_HRESULT(
-        D3DReadFileToBlob(vertexShaderPath.c_str(), &vertexShader)
-    );
-    ASSERT_HRESULT(
-        D3DReadFileToBlob(pixelShaderPath.c_str(), &pixelShader)
-    );
-
-    auto mPso = std::make_shared<ManagedPSO>();
+    auto mPso = std::make_shared<ManagedGraphicsPSO>();
     mPso->desc = psoDesc;
     mPso->inputLayout = inputLayout;
-
     mPso->desc.pRootSignature = rootSignature;
-    mPso->desc.VS = { reinterpret_cast<UINT8*>(vertexShader->GetBufferPointer()), vertexShader->GetBufferSize() };
-    mPso->desc.PS = { reinterpret_cast<UINT8*>(pixelShader->GetBufferPointer()), pixelShader->GetBufferSize() };
     mPso->desc.InputLayout = { mPso->inputLayout.data(), (UINT)mPso->inputLayout.size() };
-
-    ASSERT_HRESULT(
-        device->CreateGraphicsPipelineState(
-            &mPso->desc,
-            IID_PPV_ARGS(&mPso->PSO)
-        )
-    );
-    mPso->vertexShaderPath = vertexShaderPath;
-    mPso->pixelShaderPath = pixelShaderPath;
+    mPso->shaderPaths = paths;
+    mPso->reload(device);
 
     manager.PSOs.emplace_back(mPso);
 
     return mPso;
+}
+
+ManagedPSORef SimpleCreateGraphicsPSO(
+    PSOManager& manager,
+    ID3D12Device* device,
+    const std::string& baseShaderPath,
+    ID3D12RootSignature* rootSignature,
+    std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout,
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc
+)
+{
+    std::wstring wBaseShaderPath = convert_to_wstring(baseShaderPath);
+
+    const std::wstring vertexShaderPath = (wBaseShaderPath + L".cvert");
+    const std::wstring pixelShaderPath = (wBaseShaderPath + L".cpixel");
+
+    PSOGraphicsShaderPaths paths;
+    paths.vertex = vertexShaderPath;
+    paths.pixel = pixelShaderPath;
+
+    return CreateGraphicsPSO(
+        manager,
+        device,
+        paths,
+        rootSignature,
+        inputLayout,
+        psoDesc
+    );
+}
+
+ManagedPSORef CreateComputePSO(
+    PSOManager& manager,
+    ID3D12Device* device,
+    const std::string& baseShaderPath,
+    ID3D12RootSignature* rootSignature,
+    D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc
+)
+{
+    auto mPso = std::make_shared<ManagedComputePSO>();
+    mPso->desc = psoDesc;
+    mPso->desc.pRootSignature = rootSignature;
+    mPso->computeShaderPath = convert_to_wstring(baseShaderPath + ".ccomp");
+    mPso->reload(device);
+
+    manager.PSOs.emplace_back(mPso);
+
+    return mPso;
+}
+
+ManagedPSORef CreateMipMapGeneratorPSO(
+    PSOManager& manager,
+    ID3D12Device* device,
+    const std::string& dataDir,
+    ID3D12RootSignature* rootSignature
+)
+{
+    D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
+    return CreateComputePSO(
+        manager,
+        device,
+        dataDir + "generatemipmaps",
+        rootSignature,
+        desc
+    );
 }
 
 D3D12_RESOURCE_DESC GBufferResourceDesc(GBufferTarget target, int windowWidth, int windowHeight);
@@ -700,16 +872,15 @@ ManagedPSORef CreateMeshPBRPSO(
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
 )
 {
-    auto psoDesc = DefaultPSODesc();
+    auto psoDesc = DefaultGraphicsPSODesc();
     psoDesc.NumRenderTargets = GBuffer_RTVCount + 1;
     for (int i = 1; i < psoDesc.NumRenderTargets; i++) {
         psoDesc.RTVFormats[i] = GBufferResourceDesc((GBufferTarget)(i - 1), 0, 0).Format;
     }
-    return CreatePSO(
+    return SimpleCreateGraphicsPSO(
         manager,
         device,
-        dataDir,
-        "mesh_gbuffer_pbr",
+        dataDir + "mesh_gbuffer_pbr",
         rootSignature,
         inputLayout,
         psoDesc
@@ -724,7 +895,7 @@ ManagedPSORef CreateMeshAlphaBlendedPBRPSO(
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
 )
 {
-    auto psoDesc = DefaultPSODesc();
+    auto psoDesc = DefaultGraphicsPSODesc();
     psoDesc.NumRenderTargets = GBuffer_RTVCount + 1;
     for (int i = 1; i < psoDesc.NumRenderTargets; i++) {
         psoDesc.RTVFormats[i] = GBufferResourceDesc((GBufferTarget)(i - 1), 0, 0).Format;
@@ -744,11 +915,10 @@ ManagedPSORef CreateMeshAlphaBlendedPBRPSO(
 
     psoDesc.BlendState.RenderTarget[0] = blendDesc;
 
-    return CreatePSO(
+    return SimpleCreateGraphicsPSO(
         manager,
         device,
-        dataDir,
-        "mesh_alpha_blended_pbr",
+        dataDir + "mesh_alpha_blended_pbr",
         rootSignature,
         inputLayout,
         psoDesc
@@ -763,16 +933,15 @@ ManagedPSORef CreateMeshUnlitPSO(
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
 )
 {
-    auto psoDesc = DefaultPSODesc();
+    auto psoDesc = DefaultGraphicsPSODesc();
     psoDesc.NumRenderTargets = GBuffer_RTVCount + 1;
     for (int i = 1; i < psoDesc.NumRenderTargets; i++) {
         psoDesc.RTVFormats[i] = GBufferResourceDesc((GBufferTarget)(i - 1), 0, 0).Format;
     }
-    return CreatePSO(
+    return SimpleCreateGraphicsPSO(
         manager,
         device,
-        dataDir,
-        "mesh_gbuffer_unlit",
+        dataDir + "mesh_gbuffer_unlit",
         rootSignature,
         inputLayout,
         psoDesc
@@ -789,7 +958,7 @@ ManagedPSORef CreateDirectionalLightPSO(
 {
     // Unlike other PSOs, we go clockwise here.
     CD3DX12_RASTERIZER_DESC rasterizerState(D3D12_DEFAULT);
-    auto psoDesc = DefaultPSODesc();
+    auto psoDesc = DefaultGraphicsPSODesc();
     psoDesc.DepthStencilState.DepthEnable = FALSE;
     psoDesc.DepthStencilState.StencilEnable = FALSE;
     psoDesc.RasterizerState = rasterizerState;
@@ -809,11 +978,10 @@ ManagedPSORef CreateDirectionalLightPSO(
 
     psoDesc.BlendState.RenderTarget[0] = blendDesc;
 
-    return CreatePSO(
+    return SimpleCreateGraphicsPSO(
         manager,
         device,
-        dataDir,
-        "lighting_directional",
+        dataDir + "lighting_directional",
         rootSignature,
         inputLayout,
         psoDesc
@@ -830,7 +998,7 @@ ManagedPSORef CreateEnvironmentCubemapLightPSO(
 {
     // Unlike other PSOs, we go clockwise here.
     CD3DX12_RASTERIZER_DESC rasterizerState(D3D12_DEFAULT);
-    auto psoDesc = DefaultPSODesc();
+    auto psoDesc = DefaultGraphicsPSODesc();
     psoDesc.DepthStencilState.DepthEnable = FALSE;
     psoDesc.DepthStencilState.StencilEnable = FALSE;
     psoDesc.RasterizerState = rasterizerState;
@@ -850,11 +1018,10 @@ ManagedPSORef CreateEnvironmentCubemapLightPSO(
 
     psoDesc.BlendState.RenderTarget[0] = blendDesc;
 
-    return CreatePSO(
+    return SimpleCreateGraphicsPSO(
         manager,
         device,
-        dataDir,
-        "lighting_environment_cubemap",
+        dataDir + "lighting_environment_cubemap",
         rootSignature,
         inputLayout,
         psoDesc
@@ -871,7 +1038,7 @@ ManagedPSORef CreatePointLightPSO(
 {
     // Unlike other PSOs, we go clockwise here.
     CD3DX12_RASTERIZER_DESC rasterizerState(D3D12_DEFAULT);
-    auto psoDesc = DefaultPSODesc();
+    auto psoDesc = DefaultGraphicsPSODesc();
     psoDesc.DepthStencilState.DepthEnable = FALSE;
     psoDesc.DepthStencilState.StencilEnable = FALSE;
     psoDesc.RasterizerState = rasterizerState;
@@ -891,11 +1058,10 @@ ManagedPSORef CreatePointLightPSO(
 
     psoDesc.BlendState.RenderTarget[0] = blendDesc;
 
-    return CreatePSO(
+    return SimpleCreateGraphicsPSO(
         manager,
         device,
-        dataDir,
-        "lighting_point",
+        dataDir + "lighting_point",
         rootSignature,
         inputLayout,
         psoDesc
@@ -910,7 +1076,7 @@ ManagedPSORef CreateSkyboxPSO(
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
 )
 {
-    auto psoDesc = DefaultPSODesc();
+    auto psoDesc = DefaultGraphicsPSODesc();
     psoDesc.NumRenderTargets = GBuffer_RTVCount + 1;
     for (int i = 1; i < psoDesc.NumRenderTargets; i++) {
         psoDesc.RTVFormats[i] = GBufferResourceDesc((GBufferTarget)(i - 1), 0, 0).Format;
@@ -920,11 +1086,10 @@ ManagedPSORef CreateSkyboxPSO(
     rasterizerState.FrontCounterClockwise = FALSE;
     psoDesc.RasterizerState = rasterizerState;
 
-    return CreatePSO(
+    return SimpleCreateGraphicsPSO(
         manager,
         device,
-        dataDir,
-        "skybox",
+        dataDir + "skybox",
         rootSignature,
         inputLayout,
         psoDesc
@@ -971,14 +1136,13 @@ void SetupGBuffer(App& app, bool isResize)
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         //app.lightingPassDescriptorArena.Initialize(app.device.Get(), heapDesc, "LightPassArena");
-        app.GBuffer.baseSrvReference = app.GBufferPass.descriptorHeap.AllocateDescriptors(GBuffer_Count, "GBuffer SRVs");
+        app.GBuffer.baseSrvReference = app.descriptorArena.AllocateDescriptors(GBuffer_Count, "GBuffer SRVs");
     } else {
         // If we're resizing then we need to release existing gbuffer
         for (auto& renderTarget : app.GBuffer.renderTargets) {
             renderTarget = nullptr;
         }
     }
-
 
     CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(app.rtvHeap->GetCPUDescriptorHandleForHeapStart(), FrameBufferCount, G_IncrementSizes.Rtv);
     CD3DX12_CPU_DESCRIPTOR_HANDLE srvHandle = app.GBuffer.baseSrvReference.CPUHandle();
@@ -1083,15 +1247,15 @@ void CreateMainRootSignature(App& app)
 
     // FIXME: This is going to have to be dynamic...
     D3D12_STATIC_SAMPLER_DESC sampler = {};
-    sampler.Filter = D3D12_FILTER_ANISOTROPIC;
+    sampler.Filter = D3D12_FILTER_MIN_LINEAR_MAG_POINT_MIP_LINEAR;
     sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
     sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
     sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
     sampler.MipLODBias = 0;
-    sampler.MaxAnisotropy = 16;
+    sampler.MaxAnisotropy = 4;
     sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
     sampler.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
-    sampler.MinLOD = 0.0f;
+    sampler.MinLOD = -D3D12_FLOAT32_MAX;
     sampler.MaxLOD = D3D12_FLOAT32_MAX;
     sampler.ShaderRegister = 0;
     sampler.RegisterSpace = 0;
@@ -1131,9 +1295,74 @@ void CreateMainRootSignature(App& app)
     );
 }
 
+void SetupMipMapGenerator(App& app)
+{
+    ID3D12Device* device = app.device.Get();
+    D3D12_FEATURE_DATA_ROOT_SIGNATURE featureData = {};
+    featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &featureData, sizeof(featureData))))
+    {
+        featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_0;
+    }
+
+    CD3DX12_ROOT_PARAMETER1 rootParameters[1];
+
+    rootParameters->InitAsConstants(6, 0);
+
+    D3D12_ROOT_SIGNATURE_FLAGS rootSignatureFlags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
+
+    CD3DX12_STATIC_SAMPLER_DESC sampler(
+        0,
+        D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+        D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        D3D12_TEXTURE_ADDRESS_MODE_CLAMP
+    );
+
+    CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rootSignatureDesc;
+    rootSignatureDesc.Init_1_1(
+        _countof(rootParameters),
+        rootParameters,
+        1,
+        &sampler,
+        rootSignatureFlags
+    );
+
+    ComPtr<ID3DBlob> signature;
+    ComPtr<ID3DBlob> error;
+    if (!SUCCEEDED(
+        D3DX12SerializeVersionedRootSignature(
+            &rootSignatureDesc,
+            featureData.HighestVersion,
+            &signature,
+            &error
+        )
+    )) {
+        std::cout << "Error: root signature compilation failed\n";
+        std::cout << (char*)error->GetBufferPointer();
+        abort();
+    }
+
+    ASSERT_HRESULT(
+        device->CreateRootSignature(
+            0,
+            signature->GetBufferPointer(),
+            signature->GetBufferSize(),
+            IID_PPV_ARGS(&app.MipMapGenerator.rootSignature)
+        )
+    );
+
+    app.MipMapGenerator.PSO = CreateMipMapGeneratorPSO(
+        app.psoManager,
+        device,
+        app.dataDir,
+        app.MipMapGenerator.rootSignature.Get()
+    );
+}
+
 void SetupLightBuffer(App& app)
 {
-    auto descriptorHandle = app.GBufferPass.descriptorHeap.AllocateDescriptors(MaxLightCount + 1, "light pass and light buffer");
+    auto descriptorHandle = app.descriptorArena.AllocateDescriptors(MaxLightCount + 1, "light pass and light buffer");
 
     CreateConstantBufferAndViews(
         app,
@@ -1174,7 +1403,7 @@ void SetupMaterialBuffer(App& app)
         )
     );
 
-    app.materialConstantBuffer.Initialize(app.device.Get(), resource, 0);
+    app.materialConstantBuffer.InitializeWithBuffer(resource, 0);
 }
 
 void SetupGBufferPass(App& app)
@@ -1183,7 +1412,7 @@ void SetupGBufferPass(App& app)
     heapDesc.NumDescriptors = MaxDescriptors;
     heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    app.GBufferPass.descriptorHeap.Initialize(app.device.Get(), heapDesc, "GBufferPassArena");
+    app.descriptorArena.Initialize(app.device.Get(), heapDesc, "GBufferPassArena");
 
     SetupMaterialBuffer(app);
 }
@@ -1295,6 +1524,26 @@ void PrintCapabilities(ID3D12Device* device, IDXGIAdapter1* adapter)
     }
 }
 
+void Aftermath_GpuCrashDumpCb(const void* pGpuCrashDump, const uint32_t gpuCrashDumpSize, void* pUserData)
+{
+    App* app = reinterpret_cast<App*>(pUserData);
+}
+
+void Aftermath_ShaderDebugInfoCb(const void* pShaderDebugInfo, const uint32_t shaderDebugInfoSize, void* pUserData)
+{
+    App* app = reinterpret_cast<App*>(pUserData);
+}
+
+void Aftermath_GpuCrashDumpDescriptionCb(PFN_GFSDK_Aftermath_AddGpuCrashDumpDescription addValue, void* pUserData)
+{
+
+}
+
+void Aftermath_ResolveMarkerCb(const void* pMarker, void* pUserData, void** resolvedMarkerData, uint32_t* markerSize)
+{
+
+}
+
 void InitD3D(App& app)
 {
     if (app.gpuDebug) {
@@ -1308,6 +1557,24 @@ void InitD3D(App& app)
         ComPtr<ID3D12Debug1> debugController1;
         ASSERT_HRESULT(debugController->QueryInterface(IID_PPV_ARGS(&debugController1)));
         debugController1->SetEnableGPUBasedValidation(true);
+
+        // GFSDK_Aftermath_EnableGpuCrashDumps(
+        //     GFSDK_Aftermath_Version_API,
+        //     GFSDK_Aftermath_GpuCrashDumpWatchedApiFlags_DX,
+        //     GFSDK_Aftermath_GpuCrashDumpFeatureFlags_Default,
+        //     Aftermath_GpuCrashDumpCb,
+        //     Aftermath_ShaderDebugInfoCb,
+        //     Aftermath_GpuCrashDumpDescriptionCb,
+        //     Aftermath_ResolveMarkerCb,
+        //     reinterpret_cast<void*>(&app)
+        // );
+
+        ComPtr<ID3D12DeviceRemovedExtendedDataSettings> pDredSettings;
+        ASSERT_HRESULT(D3D12GetDebugInterface(IID_PPV_ARGS(&pDredSettings)));
+        pDredSettings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+        pDredSettings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+
+        DXGIGetDebugInterface1(0, IID_PPV_ARGS(&app.graphicsAnalysis));
     }
 
     ComPtr<IDXGIFactory4> dxgiFactory;
@@ -1323,6 +1590,15 @@ void InitD3D(App& app)
     );
 
     ID3D12Device* device = app.device.Get();
+
+    if (app.gpuDebug) {
+        // Break on debug layer errors or corruption
+        ComPtr<ID3D12InfoQueue> infoQueue;
+        app.device->QueryInterface(IID_PPV_ARGS(&infoQueue));
+        infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, true);
+        infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, true);
+        infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, false);
+    }
 
     D3D12MA::ALLOCATOR_DESC allocatorDesc = {};
     allocatorDesc.pDevice = device;
@@ -1352,6 +1628,17 @@ void InitD3D(App& app)
 
         ASSERT_HRESULT(
             device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&app.copyCommandQueue))
+        );
+    }
+
+    // Compute command queue
+    {
+        D3D12_COMMAND_QUEUE_DESC queueDesc = {};
+        queueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+        queueDesc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+
+        ASSERT_HRESULT(
+            device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&app.computeQueue))
         );
     }
 
@@ -1406,12 +1693,21 @@ void InitD3D(App& app)
 
     CreateMainRootSignature(app);
 
+    SetupMipMapGenerator(app);
+
     SetupLightingPass(app);
 
     ASSERT_HRESULT(
         device->CreateCommandAllocator(
             D3D12_COMMAND_LIST_TYPE_COPY,
             IID_PPV_ARGS(&app.copyCommandAllocator)
+        )
+    );
+
+    ASSERT_HRESULT(
+        device->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_COMPUTE,
+            IID_PPV_ARGS(&app.computeCommandAllocator)
         )
     );
 
@@ -1433,6 +1729,18 @@ void InitD3D(App& app)
                 IID_PPV_ARGS(&app.commandList)
             )
         );
+
+        ASSERT_HRESULT(
+            device->CreateCommandList(
+                0,
+                D3D12_COMMAND_LIST_TYPE_COPY,
+                app.copyCommandAllocator.Get(),
+                nullptr,
+                IID_PPV_ARGS(&app.copyCommandList)
+            )
+        );
+
+        ASSERT_HRESULT(app.copyCommandList->Close());
     }
 
     {
@@ -1584,59 +1892,17 @@ AssetBundle LoadAssets(App& app)
     LoadModelAsset(app, assets, loader, app.dataDir + "/metallicsphere.gltf");
 
     SkyboxAssets skybox;
-    skybox.images[SkyboxImage_Front] = LoadImageFile(app.dataDir + "/skybox/front.png");
-    skybox.images[SkyboxImage_Back] = LoadImageFile(app.dataDir + "/skybox/back.png");
-    skybox.images[SkyboxImage_Left] = LoadImageFile(app.dataDir + "/skybox/left.png");
-    skybox.images[SkyboxImage_Right] = LoadImageFile(app.dataDir + "/skybox/right.png");
-    skybox.images[SkyboxImage_Top] = LoadImageFile(app.dataDir + "/skybox/top.png");
-    skybox.images[SkyboxImage_Bottom] = LoadImageFile(app.dataDir + "/skybox/bottom.png");
+    skybox.images[SkyboxImage_Front] = LoadImageFile(app.dataDir + "/StudioLights/pz.png");
+    skybox.images[SkyboxImage_Back] = LoadImageFile(app.dataDir + "/StudioLights/nz.png");
+    skybox.images[SkyboxImage_Left] = LoadImageFile(app.dataDir + "/StudioLights/nx.png");
+    skybox.images[SkyboxImage_Right] = LoadImageFile(app.dataDir + "/StudioLights/px.png");
+    skybox.images[SkyboxImage_Top] = LoadImageFile(app.dataDir + "/StudioLights/py.png");
+    skybox.images[SkyboxImage_Bottom] = LoadImageFile(app.dataDir + "/StudioLights/ny.png");
     assets.skybox = skybox;
 
-    //LoadModelAsset(app, assets, loader, app.dataDir + "duck.gltf");
     // LoadModelAsset(app, assets, loader, "C:\\Users\\mason\\dev\\glTF-Sample-Models\\Main\\tangified\\sponza_tangents.gltf");
 
     return assets;
-}
-
-// NOTE: for Intel Sponza this goes over video reservation.
-// The upload heap should be created after the target resources are created anyways.
-// UploadModelBuffers should switch to using the UploadBatch abstraction.
-// UploadBatch should query how much memory is available, and split uploads accordingly.
-// After that is done this function will not be necessary.
-ComPtr<ID3D12Resource> CreateUploadHeap(App& app, const std::vector<D3D12_RESOURCE_DESC>& resourceDescs, std::vector<UINT64>& gltfBufferOffsets)
-{
-    UINT64 uploadHeapSize = 0;
-
-    // Compute upload heap size
-    for (const auto& desc : resourceDescs) {
-        // For textures we need to skip to the next multiple of D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.
-        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
-            uploadHeapSize += D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - (uploadHeapSize % D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
-        }
-        UINT64 requiredSize;
-        app.device->GetCopyableFootprints(&desc, 0, 1, 0, nullptr, nullptr, nullptr, &requiredSize);
-        gltfBufferOffsets.push_back(uploadHeapSize);
-        uploadHeapSize += requiredSize;
-    }
-
-    ID3D12Device* device = app.device.Get();
-
-    ComPtr<ID3D12Resource> uploadHeap;
-
-    CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_UPLOAD);
-    auto resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(uploadHeapSize);
-    ASSERT_HRESULT(
-        device->CreateCommittedResource(
-            &heapProps,
-            D3D12_HEAP_FLAG_NONE,
-            &resourceDesc,
-            D3D12_RESOURCE_STATE_GENERIC_READ,
-            nullptr,
-            IID_PPV_ARGS(&uploadHeap)
-        )
-    );
-
-    return uploadHeap;
 }
 
 void CreateModelDescriptors(
@@ -1658,7 +1924,7 @@ void CreateModelDescriptors(
     // Create per-primitive constant buffer
     ComPtr<ID3D12Resource> perPrimitiveConstantBuffer;
     {
-        auto descriptorRef = app.GBufferPass.descriptorHeap.AllocateDescriptors(numConstantBuffers, "PerPrimitiveConstantBuffer");
+        auto descriptorRef = app.descriptorArena.AllocateDescriptors(numConstantBuffers, "PerPrimitiveConstantBuffer");
         auto cpuHandle = descriptorRef.CPUHandle();
         CreateConstantBufferAndViews(
             app,
@@ -1672,7 +1938,7 @@ void CreateModelDescriptors(
 
     // Create SRVs
     {
-        auto descriptorRef = app.GBufferPass.descriptorHeap.AllocateDescriptors(textureResources.size(), "MeshTextures");
+        auto descriptorRef = app.descriptorArena.AllocateDescriptors(textureResources.size(), "MeshTextures");
         auto cpuHandle = descriptorRef.CPUHandle();
         //CD3DX12_CPU_DESCRIPTOR_HANDLE cpuHandle(mainDescriptorHeap->GetCPUDescriptorHandleForHeapStart(), (int)inputModel.meshes.size(), incrementSize);
         for (const auto& textureResource : textureResources) {
@@ -1681,7 +1947,7 @@ void CreateModelDescriptors(
             srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             srvDesc.Format = textureDesc.Format;
             srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-            srvDesc.Texture2D.MipLevels = 1;
+            srvDesc.Texture2D.MipLevels = textureDesc.MipLevels;
             app.device->CreateShaderResourceView(textureResource.Get(), &srvDesc, cpuHandle);
             cpuHandle.Offset(1, incrementSize);
         }
@@ -1702,7 +1968,7 @@ void CreateModelMaterials(
 {
     // Allocate material constant buffers and create views
     int materialCount = inputModel.materials.size();
-    auto descriptorReference = app.GBufferPass.descriptorHeap.AllocateDescriptors(materialCount, "model materials");
+    auto descriptorReference = app.descriptorArena.AllocateDescriptors(materialCount, "model materials");
     auto constantBufferSlice = app.materialConstantBuffer.Allocate(materialCount);
     app.materialConstantBuffer.CreateViews(app.device.Get(), constantBufferSlice, descriptorReference.CPUHandle());
     outputModel.baseMaterialDescriptor = descriptorReference;
@@ -1714,9 +1980,9 @@ void CreateModelMaterials(
     for (int i = 0; i < materialCount; i++) {
         auto& inputMaterial = inputModel.materials[i];
 
-        DescriptorReference baseColorTextureDescriptor;
-        DescriptorReference normalTextureDescriptor;
-        DescriptorReference metalRoughnessTextureDescriptor;
+        DescriptorRef baseColorTextureDescriptor;
+        DescriptorRef normalTextureDescriptor;
+        DescriptorRef metalRoughnessTextureDescriptor;
 
         if (inputMaterial.pbrMetallicRoughness.baseColorTexture.index != -1) {
             auto texture = inputModel.textures[inputMaterial.pbrMetallicRoughness.baseColorTexture.index];
@@ -1770,14 +2036,17 @@ void CreateModelMaterials(
 D3D12_RESOURCE_DESC GetImageResourceDesc(const tinygltf::Image& image)
 {
     D3D12_RESOURCE_DESC desc = {};
-    desc.MipLevels = 1;
     desc.Width = image.width;
     desc.Height = image.height;
     desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    D3D12_RESOURCE_FLAG_NONE;
     desc.DepthOrArraySize = 1;
     desc.SampleDesc.Count = 1;
     desc.SampleDesc.Quality = 0;
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    // Generate as many mips as we can
+    UINT highestDimension = std::max((UINT)desc.Width, desc.Height);
+    desc.MipLevels = (UINT16)std::floor(std::log2(highestDimension)) + 1;
 
     CHECK(image.component == STBI_rgb_alpha);
 
@@ -1795,35 +2064,356 @@ D3D12_RESOURCE_DESC GetImageResourceDesc(const tinygltf::Image& image)
     return desc;
 }
 
-std::vector<D3D12_RESOURCE_DESC> CreateResourceDescriptions(const tinygltf::Model& model)
+void DeviceRemovedHandler(ID3D12Device* device)
 {
-    std::vector<D3D12_RESOURCE_DESC> descs;
-    for (const auto& buffer : model.buffers) {
-        D3D12_RESOURCE_DESC desc = CD3DX12_RESOURCE_DESC::Buffer(buffer.data.size());
-        descs.push_back(desc);
+    ComPtr<ID3D12DeviceRemovedExtendedData> pDred;
+    ASSERT_HRESULT(device->QueryInterface(IID_PPV_ARGS(&pDred)));
+
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT DredAutoBreadcrumbsOutput;
+    D3D12_DRED_PAGE_FAULT_OUTPUT DredPageFaultOutput;
+    ASSERT_HRESULT(pDred->GetPageFaultAllocationOutput(&DredPageFaultOutput));
+    ASSERT_HRESULT(pDred->GetAutoBreadcrumbsOutput(&DredAutoBreadcrumbsOutput));
+
+    std::cout << "PAGE FAULT INFORMATION:\n"
+        << "\tVirtualAddress: " << DredPageFaultOutput.PageFaultVA << "\n";
+
+    std::cout << "DRED Breadcrumbs:\n";
+    auto breadcrumb = DredAutoBreadcrumbsOutput.pHeadAutoBreadcrumbNode;
+    while (breadcrumb) {
+        std::cout << "\tCommandList: " << breadcrumb->pCommandListDebugNameA << "\n";
+        std::cout << "\tBreadcrumbCount: " << breadcrumb->BreadcrumbCount << "\n";
+        breadcrumb = breadcrumb->pNext;
     }
-    for (const auto& image : model.images) {
-        auto desc = GetImageResourceDesc(image);
-        descs.push_back(desc);
+}
+
+// Generates mip maps for a range of textures. The `textures` must have their
+// MipLevels already set. Textures must also be UAV compatible.
+void GenerateMipMaps(App& app, const std::span<ComPtr<ID3D12Resource>>& textures, const std::vector<bool>& textureIsSRGB)
+{
+    if (textures.size() == 0) {
+        return;
     }
-    return descs;
+
+    UINT descriptorCount = 0;
+
+    // Create SRVs for the base mip
+    auto baseTextureDescriptor = app.descriptorArena.PushDescriptorStack(textures.size());
+    descriptorCount += textures.size();
+    for (int i = 0; i < textures.size(); i++) {
+        auto textureDesc = textures[i]->GetDesc();
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvDesc.Format = textureDesc.Format;
+        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Texture2D.MipLevels = textureDesc.MipLevels;
+        app.device->CreateShaderResourceView(textures[i].Get(), &srvDesc, (baseTextureDescriptor + i).CPUHandle());
+    }
+
+    ComPtr<D3D12MA::Allocation> constantBuffer;
+
+    auto resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(sizeof(GenerateMipsConstantData));
+    D3D12MA::ALLOCATION_DESC allocDesc{};
+    allocDesc.HeapType = D3D12_HEAP_TYPE_UPLOAD;
+    ASSERT_HRESULT(
+        app.mainAllocator->CreateResource(
+            &allocDesc,
+            &resourceDesc,
+            D3D12_RESOURCE_STATE_COMMON,
+            nullptr,
+            &constantBuffer,
+            IID_NULL, nullptr
+        )
+    );
+
+    ComPtr<ID3D12GraphicsCommandList> commandList;
+    ASSERT_HRESULT(
+        app.device->CreateCommandList(
+            0,
+            D3D12_COMMAND_LIST_TYPE_COMPUTE,
+            app.computeCommandAllocator.Get(),
+            nullptr,
+            IID_PPV_ARGS(&commandList)
+        )
+    );
+
+    commandList->SetPipelineState(app.MipMapGenerator.PSO->Get());
+    commandList->SetComputeRootSignature(app.MipMapGenerator.rootSignature.Get());
+
+    ID3D12DescriptorHeap* ppHeaps[] = { app.descriptorArena.Heap() };
+    commandList->SetDescriptorHeaps(_countof(ppHeaps), ppHeaps);
+
+    size_t cbvCount = 0;
+    // Dry run to find the total number of constant buffers to allocate
+    for (size_t textureIdx = 0; textureIdx < textures.size(); textureIdx++) {
+        auto resourceDesc = textures[textureIdx]->GetDesc();
+        for (UINT srcMip = 0; srcMip < resourceDesc.MipLevels - 1; ) {
+            UINT64 srcWidth = resourceDesc.Width >> srcMip;
+            UINT64 srcHeight = resourceDesc.Height >> srcMip;
+            UINT64 dstWidth = (UINT)(srcWidth >> 1);
+            UINT64 dstHeight = srcHeight >> 1;
+
+            DWORD mipCount;
+            _BitScanForward(&mipCount, (dstWidth == 1 ? dstHeight : dstWidth) | (dstHeight == 1 ? dstWidth : dstHeight));
+
+            mipCount = std::min<DWORD>(4, mipCount + 1);
+            mipCount = (srcMip + mipCount) >= resourceDesc.MipLevels ? resourceDesc.MipLevels - srcMip - 1 : mipCount;
+
+            srcMip += mipCount;
+
+            cbvCount++;
+        }
+    }
+
+    ConstantBufferArena<GenerateMipsConstantData> constantBufferArena;
+    constantBufferArena.InitializeWithCapacity(app.mainAllocator.Get(), cbvCount);
+    auto constantBuffers = constantBufferArena.Allocate(cbvCount);
+
+    auto cbvs = app.descriptorArena.PushDescriptorStack(cbvCount);
+    descriptorCount += cbvCount;
+
+    constantBufferArena.CreateViews(app.device.Get(), constantBuffers, cbvs.CPUHandle());
+
+    UINT totalUAVs = 0;
+    UINT cbvIndex = 0;
+
+    for (size_t textureIdx = 0; textureIdx < textures.size(); textureIdx++) {
+        auto resourceDesc = textures[textureIdx]->GetDesc();
+        std::vector<CD3DX12_RESOURCE_BARRIER> resourceBarriers;
+        for (UINT srcMip = 0; srcMip < resourceDesc.MipLevels - 1; ) {
+            UINT64 srcWidth = resourceDesc.Width >> srcMip;
+            UINT64 srcHeight = resourceDesc.Height >> srcMip;
+            UINT64 dstWidth = (UINT)(srcWidth >> 1);
+            UINT64 dstHeight = srcHeight >> 1;
+
+            DWORD mipCount;
+            _BitScanForward(&mipCount, (dstWidth == 1 ? dstHeight : dstWidth) | (dstHeight == 1 ? dstWidth : dstHeight));
+
+            mipCount = std::min<DWORD>(4, mipCount + 1);
+            mipCount = (srcMip + mipCount) >= resourceDesc.MipLevels ? resourceDesc.MipLevels - srcMip - 1 : mipCount;
+
+            dstWidth = std::max<DWORD>(1, dstWidth);
+            dstHeight = std::max<DWORD>(1, dstHeight);
+
+            auto uavs = app.descriptorArena.PushDescriptorStack(mipCount);
+            descriptorCount += mipCount;
+            for (UINT mip = 0; mip < mipCount; mip++) {
+                D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+                uavDesc.Format = resourceDesc.Format;
+                uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+                uavDesc.Texture2D.MipSlice = srcMip + mip + 1;
+
+                app.device->CreateUnorderedAccessView(textures[textureIdx].Get(), nullptr, &uavDesc, (uavs + mip).CPUHandle());
+            }
+
+            constantBuffers.data[cbvIndex].srcMipLevel = srcMip;
+            constantBuffers.data[cbvIndex].srcDimension = (srcHeight & 1) << 1 | (srcWidth & 1);
+            constantBuffers.data[cbvIndex].isSRGB = 0 /*textureIsSRGB[textureIdx]*/; // SRGB does not seem to work right
+            constantBuffers.data[cbvIndex].numMipLevels = mipCount;
+            constantBuffers.data[cbvIndex].texelSize.x = 1.0f / (float)dstWidth;
+            constantBuffers.data[cbvIndex].texelSize.y = 1.0f / (float)dstHeight;
+
+            UINT constantValues[6] = {
+                uavs.index,
+                uavs.index + 1,
+                uavs.index + 2,
+                uavs.index + 3,
+                cbvs.index + cbvIndex,
+                (baseTextureDescriptor + textureIdx).index
+            };
+
+            commandList->SetComputeRoot32BitConstants(0, _countof(constantValues), constantValues, 0);
+            commandList->Dispatch(std::ceil((float)dstWidth / 8.0f), std::ceil((float)dstHeight / 8.0f), 1);
+
+            CD3DX12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::UAV(textures[textureIdx].Get());
+            commandList->ResourceBarrier(1, &barrier);
+
+            cbvIndex++;
+            srcMip += mipCount;
+        }
+    }
+
+    commandList->Close();
+
+    ID3D12CommandList* ppCommandLists[] = { commandList.Get() };
+    app.computeQueue->ExecuteCommandLists(_countof(ppCommandLists), ppCommandLists);
+    app.fence.SignalAndWait(app.computeQueue.Get());
+
+    if (app.graphicsAnalysis) {
+        app.graphicsAnalysis->EndCapture();
+    }
+
+    app.descriptorArena.PopDescriptorStack(descriptorCount);
+}
+
+void LoadModelTextures(
+    App& app,
+    Model& outputModel,
+    tinygltf::Model& inputModel,
+    std::vector<CD3DX12_RESOURCE_BARRIER>& resourceBarriers,
+    const std::vector<bool>& textureIsSRGB
+)
+{
+    if (app.graphicsAnalysis) {
+        app.graphicsAnalysis->BeginCapture();
+    }
+
+    // We generate mips on unordered access view textures, but these textures
+    // are slow for rendering, so we have to copy them to normal textures
+    // aftwards.
+    std::vector<ComPtr<ID3D12Resource>> stagingTexturesForMipMaps;
+    stagingTexturesForMipMaps.reserve(inputModel.images.size());
+
+    UploadBatch uploadBatch;
+    uploadBatch.Begin(app.mainAllocator.Get(), app.copyCommandQueue.Get(), &app.copyFence);
+
+    // Upload images to buffers
+    for (int i = 0; i < inputModel.images.size(); i++) {
+        const auto& gltfImage = inputModel.images[i];
+        ComPtr<ID3D12Resource> buffer;
+        CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
+        auto resourceDesc = GetImageResourceDesc(gltfImage);
+        resourceDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        auto resourceState = D3D12_RESOURCE_STATE_COMMON;
+        ASSERT_HRESULT(
+            app.device->CreateCommittedResource(
+                &heapProps,
+                D3D12_HEAP_FLAG_NONE,
+                &resourceDesc,
+                resourceState,
+                nullptr,
+                IID_PPV_ARGS(&buffer)
+            )
+        );
+
+        D3D12_SUBRESOURCE_DATA subresourceData;
+        subresourceData.pData = gltfImage.image.data();
+        subresourceData.RowPitch = gltfImage.width * gltfImage.component;
+        subresourceData.SlicePitch = gltfImage.height * subresourceData.RowPitch;
+        uploadBatch.AddTexture(buffer.Get(), &subresourceData, 0, 1);
+
+        stagingTexturesForMipMaps.push_back(buffer);
+    }
+
+    uploadBatch.Finish();
+
+    // Now that the images are uploaded these can be free'd
+    for (auto& image : inputModel.images) {
+        image.image.clear();
+        image.image.shrink_to_fit();
+    }
+
+    GenerateMipMaps(app, stagingTexturesForMipMaps, textureIsSRGB);
+
+    D3D12MA::Budget localBudget;
+    app.mainAllocator->GetBudget(&localBudget, nullptr);
+
+    // Only use up to 75% remaining memory on these uploads
+    size_t maxUploadBytes = localBudget.BudgetBytes / 2;
+    size_t pendingUploadBytes = 0;
+
+    ASSERT_HRESULT(
+        app.copyCommandList->Reset(
+            app.copyCommandAllocator.Get(),
+            nullptr
+        )
+    );
+
+    // Copy mip map textures to non-UAV textures for the model.
+    for (int textureIdx = 0; textureIdx < inputModel.images.size(); textureIdx++) {
+        // FIXME: This would be much better with aliased resources, but that will 
+        // require switching the model to use the D3D12MA system for placed resources.
+        ComPtr<ID3D12Resource> destResource;
+        CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
+        auto resourceDesc = GetImageResourceDesc(inputModel.images[textureIdx]);
+
+        auto allocInfo = app.device->GetResourceAllocationInfo(0, 1, &resourceDesc);
+        if (pendingUploadBytes > 0 && allocInfo.SizeInBytes + pendingUploadBytes > maxUploadBytes) {
+            // Flush the upload
+            ASSERT_HRESULT(app.copyCommandList->Close());
+            ID3D12CommandList* ppCommandLists[] = { app.copyCommandList.Get() };
+            app.copyCommandQueue->ExecuteCommandLists(_countof(ppCommandLists), ppCommandLists);
+            app.copyFence.SignalAndWait(app.copyCommandQueue.Get());
+
+            // Clear the previous staging textures to free memory
+            for (int stageIdx = 0; stageIdx < textureIdx; stageIdx++) {
+                stagingTexturesForMipMaps[stageIdx] = nullptr;
+            }
+
+            ASSERT_HRESULT(
+                app.copyCommandList->Reset(
+                    app.copyCommandAllocator.Get(),
+                    nullptr
+                )
+            );
+
+            pendingUploadBytes = 0;
+        }
+
+        ASSERT_HRESULT(
+            app.device->CreateCommittedResource(
+                &heapProps,
+                D3D12_HEAP_FLAG_NONE,
+                &resourceDesc,
+                D3D12_RESOURCE_STATE_COMMON,
+                nullptr,
+                IID_PPV_ARGS(&destResource)
+            )
+        );
+
+        pendingUploadBytes += allocInfo.SizeInBytes;
+
+        app.copyCommandList->CopyResource(destResource.Get(), stagingTexturesForMipMaps[textureIdx].Get());
+        outputModel.buffers.push_back(destResource);
+
+        resourceBarriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(
+            outputModel.buffers.back().Get(),
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+        ));
+    }
+
+    ASSERT_HRESULT(app.copyCommandList->Close());
+    if (pendingUploadBytes > 0) {
+        ID3D12CommandList* ppCommandLists[] = { app.copyCommandList.Get() };
+        app.copyCommandQueue->ExecuteCommandLists(_countof(ppCommandLists), ppCommandLists);
+        app.copyFence.SignalAndWait(app.copyCommandQueue.Get());
+    }
+}
+
+// Gets a vector of booleans parallel to inputModel.images to determine which
+// images are SRGB. This information is needed to generate the mipmaps properly.
+std::vector<bool> DetermineSRGBTextures(const tinygltf::Model& inputModel)
+{
+    std::vector<bool> textureIsSRGB(inputModel.images.size(), false);
+
+    // The only textures in a GLTF model that are SRGB are the base color textures.
+    for (const auto& material : inputModel.materials) {
+        auto textureIndex = material.pbrMetallicRoughness.baseColorTexture.index;
+        if (textureIndex != -1) {
+            auto imageIndex = inputModel.textures[textureIndex].source;
+            textureIsSRGB[imageIndex] = true;
+        }
+    }
+
+    return textureIsSRGB;
 }
 
 std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
     Model& outputModel,
     App& app,
-    const tinygltf::Model& inputModel,
-    const std::vector<D3D12_RESOURCE_DESC>& resourceDescs,
+    tinygltf::Model& inputModel,
     const std::vector<UINT64>& uploadOffsets,
     std::span<ComPtr<ID3D12Resource>>& outGeometryResources,
     std::span<ComPtr<ID3D12Resource>>& outTextureResources
 )
 {
-    std::vector<ComPtr<ID3D12Resource>> resourceBuffers;
+    std::vector<bool> textureIsSRGB = DetermineSRGBTextures(inputModel);
+
+    std::vector<ComPtr<ID3D12Resource>>& resourceBuffers = outputModel.buffers;
     resourceBuffers.reserve(inputModel.buffers.size() + inputModel.images.size());
 
     UploadBatch uploadBatch;
-    uploadBatch.Begin(app.mainAllocator.Get(), app.copyCommandAllocator.Get(), app.copyCommandQueue.Get(), &app.copyFence);
+    uploadBatch.Begin(app.mainAllocator.Get(), app.copyCommandQueue.Get(), &app.copyFence);
 
     std::vector<CD3DX12_RESOURCE_BARRIER> resourceBarriers;
 
@@ -1856,46 +2446,19 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
         resourceBuffers.push_back(geometryBuffer);
     }
 
-    // Upload images to buffers
-    for (int i = 0; i < inputModel.images.size(); i++) {
-        const auto& gltfImage = inputModel.images[i];
-        ComPtr<ID3D12Resource> buffer;
-        CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
-        auto resourceDesc = GetImageResourceDesc(gltfImage);
-        auto resourceState = D3D12_RESOURCE_STATE_COMMON;
-        ASSERT_HRESULT(
-            app.device->CreateCommittedResource(
-                &heapProps,
-                D3D12_HEAP_FLAG_NONE,
-                &resourceDesc,
-                resourceState,
-                nullptr,
-                IID_PPV_ARGS(&buffer)
-            )
-        );
-
-        D3D12_SUBRESOURCE_DATA subresourceData;
-        subresourceData.pData = gltfImage.image.data();
-        subresourceData.RowPitch = gltfImage.width * gltfImage.component;
-        subresourceData.SlicePitch = gltfImage.height * subresourceData.RowPitch;
-        uploadBatch.AddTexture(buffer.Get(), &subresourceData, 0, 1);
-
-        resourceBuffers.push_back(buffer);
-
-        resourceBarriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(
-            buffer.Get(),
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
-        ));
-    }
-
     uploadBatch.Finish();
+
+    LoadModelTextures(
+        app,
+        outputModel,
+        inputModel,
+        resourceBarriers,
+        textureIsSRGB
+    );
 
     auto endGeometryBuffer = resourceBuffers.begin() + inputModel.buffers.size();
     outGeometryResources = std::span(resourceBuffers.begin(), endGeometryBuffer);
     outTextureResources = std::span(endGeometryBuffer, resourceBuffers.end());
-
-    outputModel.buffers = resourceBuffers;
 
     app.commandList->ResourceBarrier((UINT)resourceBarriers.size(), resourceBarriers.data());
 
@@ -2328,6 +2891,7 @@ void CreateSkybox(App& app, const SkyboxAssets& asset)
     ComPtr<D3D12MA::Allocation> perPrimitiveBuffer;
 
     auto cubemapDesc = GetImageResourceDesc(asset.images[0]);
+    cubemapDesc.MipLevels = 1;
     cubemapDesc.DepthOrArraySize = SkyboxImage_Count;
     {
         D3D12MA::ALLOCATION_DESC allocDesc{};
@@ -2361,7 +2925,7 @@ void CreateSkybox(App& app, const SkyboxAssets& asset)
         );
     }
 
-    DescriptorReference perPrimitiveCbv = app.GBufferPass.descriptorHeap.AllocateDescriptors(1, "Skybox PerPrimitive CBV");
+    DescriptorRef perPrimitiveCbv = app.descriptorArena.AllocateDescriptors(1, "Skybox PerPrimitive CBV");
     D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
     cbvDesc.BufferLocation = perPrimitiveBuffer->GetResource()->GetGPUVirtualAddress();
     cbvDesc.SizeInBytes = sizeof(PerPrimitiveConstantData);
@@ -2375,10 +2939,10 @@ void CreateSkybox(App& app, const SkyboxAssets& asset)
     }
 
     UploadBatch uploadBatch;
-    uploadBatch.Begin(app.mainAllocator.Get(), app.copyCommandAllocator.Get(), app.copyCommandQueue.Get(), &app.copyFence);
+    uploadBatch.Begin(app.mainAllocator.Get(), app.copyCommandQueue.Get(), &app.copyFence);
     uploadBatch.AddTexture(cubemap->GetResource(), cubemapSubresourceData, 0, SkyboxImage_Count);
 
-    DescriptorReference texcubeSRV = app.GBufferPass.descriptorHeap.AllocateDescriptors(1, "Skybox SRV");
+    DescriptorRef texcubeSRV = app.descriptorArena.AllocateDescriptors(1, "Skybox SRV");
 
     D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
     srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -2473,18 +3037,7 @@ void CreateSkybox(App& app, const SkyboxAssets& asset)
         );
     }
 
-    // D3D12_SUBRESOURCE_DATA vertexSubresourceData;
-    // vertexSubresourceData.pData = vertexData;
-    // vertexSubresourceData.RowPitch = sizeof(vertexData);
-    // vertexSubresourceData.SlicePitch = sizeof(vertexData);
-    //uploadBatch.AddResource(vertexBuffer->GetResource(), &vertexSubresourceData, 0, 0, 1);
     uploadBatch.AddBuffer(vertexBuffer->GetResource(), 0, vertexData, sizeof(vertexData));
-
-    // D3D12_SUBRESOURCE_DATA indicesSubresourceData;
-    // indicesSubresourceData.pData = indices;
-    // indicesSubresourceData.RowPitch = sizeof(indices);
-    // indicesSubresourceData.SlicePitch = sizeof(indices);
-    // uploadBatch.AddResource(indexBuffer->GetResource(), &indicesSubresourceData, 0, 0, 1);
     uploadBatch.AddBuffer(indexBuffer->GetResource(), 0, reinterpret_cast<void*>(indices), sizeof(indices));
 
     uploadBatch.Finish();
@@ -2530,7 +3083,7 @@ void CreateSkybox(App& app, const SkyboxAssets& asset)
 
 void ProcessAssets(App& app, AssetBundle& assets)
 {
-    app.commandList->Close();
+    ASSERT_HRESULT(app.commandList->Close());
 
     ASSERT_HRESULT(
         app.commandAllocator->Reset()
@@ -2546,8 +3099,6 @@ void ProcessAssets(App& app, AssetBundle& assets)
             continue;
         }
 
-        auto resourceDescs = CreateResourceDescriptions(gltfModel);
-
         std::vector<UINT64> uploadOffsets;
 
         std::span<ComPtr<ID3D12Resource>> geometryBuffers;
@@ -2561,7 +3112,6 @@ void ProcessAssets(App& app, AssetBundle& assets)
             model,
             app,
             gltfModel,
-            resourceDescs,
             uploadOffsets,
             geometryBuffers,
             textureBuffers
@@ -2575,7 +3125,7 @@ void ProcessAssets(App& app, AssetBundle& assets)
 
         app.models.push_back(std::move(model));
 
-        app.commandList->Close();
+        ASSERT_HRESULT(app.commandList->Close());
 
         ID3D12CommandList* ppCommandLists[] = { app.commandList.Get() };
         app.commandQueue->ExecuteCommandLists(1, ppCommandLists);
@@ -2633,7 +3183,7 @@ void InitializeLights(App& app)
 void InitializeScene(App& app) {
     InitializeCamera(app);
     InitializeLights(app);
-    app.models[1].meshes[0]->translation = glm::vec3(0, 0.5f, 0.0f);
+    // app.models[1].meshes[0]->translation = glm::vec3(0, 0.5f, 0.0f);
 }
 
 glm::mat4 ApplyStandardTransforms(const glm::mat4& base, glm::vec3 translation, glm::vec3 euler, glm::vec3 scale)
@@ -2760,7 +3310,7 @@ void DrawMeshesGBuffer(App& app, ID3D12GraphicsCommandList* commandList)
             const auto& material = primitive->material.get();
             // FIXME: if I am not lazy I will SORT by material type
             // Transparent materials drawn in different pass
-            DescriptorReference materialDescriptor;
+            DescriptorRef materialDescriptor;
 
             if (material) {
                 if (material->materialType == MaterialType_AlphaBlendPBR) {
@@ -2882,7 +3432,7 @@ void GBufferPass(App& app, ID3D12GraphicsCommandList* commandList)
 
     BindAndClearGBufferRTVs(app, commandList);
 
-    ID3D12DescriptorHeap* mainDescriptorHeap = app.GBufferPass.descriptorHeap.descriptorHeap.Get();
+    ID3D12DescriptorHeap* mainDescriptorHeap = app.descriptorArena.Heap();
     ID3D12DescriptorHeap* ppHeaps[] = { mainDescriptorHeap };
     commandList->SetDescriptorHeaps(1, ppHeaps);
     commandList->SetGraphicsRootSignature(app.rootSignature.Get());
@@ -2898,7 +3448,7 @@ void LightPass(App& app, ID3D12GraphicsCommandList* commandList)
     commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
 
     {
-        auto descriptorHeap = app.GBufferPass.descriptorHeap.descriptorHeap;
+        auto descriptorHeap = app.descriptorArena.descriptorHeap;
         ID3D12DescriptorHeap* ppHeaps[] = { descriptorHeap.Get() };
         commandList->SetDescriptorHeaps(_countof(ppHeaps), ppHeaps);
         // Root signature must be set AFTER heaps are set when CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED is set.
@@ -2957,7 +3507,7 @@ void AlphaBlendPass(App& app, ID3D12GraphicsCommandList* commandList)
     CD3DX12_CPU_DESCRIPTOR_HANDLE dsvHandle(app.dsHeap->GetCPUDescriptorHandleForHeapStart());
     commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, &dsvHandle);
 
-    ID3D12DescriptorHeap* mainDescriptorHeap = app.GBufferPass.descriptorHeap.descriptorHeap.Get();
+    ID3D12DescriptorHeap* mainDescriptorHeap = app.descriptorArena.Heap();
     ID3D12DescriptorHeap* ppHeaps[] = { mainDescriptorHeap };
     commandList->SetDescriptorHeaps(1, ppHeaps);
     commandList->SetGraphicsRootSignature(app.rootSignature.Get());

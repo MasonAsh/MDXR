@@ -7,5 +7,9 @@ Foreach-Object {
     dxc.exe -HV 2021 -E PSMain -T ps_6_6 $_.FullName -Od -Fo "data/$($_.BaseName).cpixel" -Zi -Qembed_debug
     $ExitStatus += $LASTEXITCODE
 }
+Get-ChildItem "assets/" -Filter *.hlslc |
+Foreach-Object {
+    dxc.exe -HV 2021 -E CSMain -T cs_6_6 $_.FullName -Od -Fo "data/$($_.BaseName).ccomp" -Zi -Qembed_debug
+}
 
 exit $ExitStatus;

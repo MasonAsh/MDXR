@@ -2,14 +2,23 @@ cmake_minimum_required(VERSION 3.7)
 
 project(mdxr)
 
-set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/modules/")
-
 set(CMAKE_CXX_STANDARD 23)
 
 set(CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION 19041)
 
+set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+
 find_package(SDL2 REQUIRED)
 include_directories(${SDL2_INCLUDE_DIR})
+
+find_package(NsightAftermath)
+get_filename_component(NsightAftermath_LIBRARY_DIR ${NsightAftermath_LIBRARY} DIRECTORY)
+message(STATUS "Nsight Aftermath FOUND = ${NsightAftermath_FOUND}")
+message(STATUS "Nsight Aftermath Lib Dir = ${NsightAftermath_LIBRARY_DIR}")
+message(STATUS "Nsight Aftermath Lib = ${NsightAftermath_LIBRARY}")
+message(STATUS "Nsight Aftermath Headers Include = ${NsightAftermath_INCLUDE_DIR}")
+
+include_directories(${NsightAftermath_INCLUDE_DIR})
 
 add_subdirectory(DirectX-Headers)
 
@@ -61,7 +70,17 @@ target_compile_definitions(mdxr
         $<$<CONFIG:RelWithDebInfo>:D3DCOMPILE_DEBUG=1>
 )
 
-target_link_libraries(mdxr ${SDL2_LIBRARY} ${SDL2MAIN_LIBRARY} DirectX-Headers DirectX-Guids D3d12 DXGI D3DCompiler DXGuid)
+target_link_libraries(mdxr 
+    ${SDL2_LIBRARY}
+    ${SDL2MAIN_LIBRARY} 
+    DirectX-Headers 
+    DirectX-Guids 
+    D3d12 
+    DXGI 
+    D3DCompiler 
+    DXGuid
+    ${NsightAftermath_LIBRARY}
+)
 
 # file(COPY ${CMAKE_SOURCE_DIR}/D3D12 DESTINATION ${TARGET_FILE_DIR})
 

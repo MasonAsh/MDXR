@@ -11,24 +11,30 @@ public:
 
     // Begins an upload batch.
     // The batch has full control of the command queue during this time.
-    void Begin(D3D12MA::Allocator* allocator, ID3D12CommandAllocator* commandAllocator, ID3D12CommandQueue* commandQueue, IncrementalFence* fence)
+    void Begin(D3D12MA::Allocator* allocator, ID3D12CommandQueue* commandQueue, IncrementalFence* fence)
     {
         this->allocator = allocator;
         this->fence = fence;
         this->commandQueue = commandQueue;
-        this->commandAllocator = commandAllocator;
 
-        commandAllocator->GetDevice(IID_PPV_ARGS(&device));
+        commandQueue->GetDevice(IID_PPV_ARGS(&device));
+        device->Release();
+
+        device->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_COPY,
+            IID_PPV_ARGS(&commandAllocator)
+        );
+
         ASSERT_HRESULT(
             device->CreateCommandList(
                 0,
                 D3D12_COMMAND_LIST_TYPE_COPY,
-                commandAllocator,
+                commandAllocator.Get(),
                 nullptr,
                 IID_PPV_ARGS(&commandList)
             )
         );
-        device->Release();
+
 
         D3D12MA::Budget budget;
         this->allocator->GetBudget(&budget, nullptr);
@@ -74,7 +80,7 @@ public:
                 &allocDesc,
                 &allocation,
                 &offset))) {
-                SyncFlush();
+                Flush();
 
                 // This *should* work 100%, as we've made sure we're not uploading >
                 // uploadBufferSize at once at this point.
@@ -118,7 +124,7 @@ public:
         // will recurse, so if a resource is somehow uploadBufferSize * 2, then
         // it will get split in recurse calls.
         if (numBytes > uploadBufferSize) {
-            SyncFlush();
+            Flush();
             int leftoverBytes = numBytes - uploadBufferSize;
             AddBuffer(destinationResource, destOffset, srcData, uploadBufferSize);
             AddBuffer(destinationResource, destOffset + uploadBufferSize, srcData, leftoverBytes);
@@ -134,7 +140,7 @@ public:
             &allocDesc,
             &allocation,
             &offset))) {
-            SyncFlush();
+            Flush();
 
             // This *should* work 100%, as we've made sure we're not uploading >
             // uploadBufferSize at once at this point.
@@ -159,40 +165,24 @@ public:
 
     void Finish()
     {
-        AsyncFlush();
-        Wait();
+        Flush();
+
+        ASSERT_HRESULT(commandList->Close());
     }
 private:
-    void AsyncFlush()
+    void Flush()
     {
         commandList->Close();
         ID3D12CommandList* ppCommandLists[] = { commandList.Get() };
         commandQueue->ExecuteCommandLists(1, ppCommandLists);
-        this->fence->Signal(commandQueue);
+        this->fence->SignalAndWait(commandQueue);
         virtualBlock->Clear();
-    }
 
-    // Flush, waiting for upload to finish before returning
-    void SyncFlush()
-    {
-        AsyncFlush();
-        Wait();
-    }
-
-    // Wait for any pending uploads to finish
-    void Wait()
-    {
-        if (!this->fence->IsFinished()) {
-            this->fence->Wait(commandQueue);
-        }
-
-        ASSERT_HRESULT(
-            commandList->Reset(commandAllocator, nullptr)
-        );
+        ASSERT_HRESULT(commandList->Reset(commandAllocator.Get(), nullptr));
     }
 
     ID3D12CommandQueue* commandQueue;
-    ID3D12CommandAllocator* commandAllocator;
+    ComPtr<ID3D12CommandAllocator> commandAllocator;
 
     ComPtr<ID3D12GraphicsCommandList> commandList;
     IncrementalFence* fence;

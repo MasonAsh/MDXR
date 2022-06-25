@@ -1,5 +1,5 @@
-#include "include/common.hlsl"
-#include "include/pbr.hlsl"
+#include "common.hlsli"
+#include "pbr.hlsli"
 
 struct VSInput {
     float3 position : POSITION;

@@ -1,0 +1,229 @@
+// Adapted from https://www.3dgep.com/learning-directx-12-4/#The_Compute_Shader
+
+#define NO_DEFAULT_RESOURCES
+#include "common.hlsli"
+
+#define BLOCK_SIZE 8
+#define WIDTH_HEIGHT_EVEN 0     // Both the width and the height of the texture are even.
+#define WIDTH_ODD_HEIGHT_EVEN 1 // The texture width is odd and the height is even.
+#define WIDTH_EVEN_HEIGHT_ODD 2 // The texture width is even and the height is odd.
+#define WIDTH_HEIGHT_ODD 3      // Both the width and height of the texture are odd.
+
+cbuffer Indices : register(b0) {
+    uint g_OutMip0;
+    uint g_OutMip1;
+    uint g_OutMip2;
+    uint g_OutMip3;
+    uint g_GenerateMipsCBIdx;
+    uint g_srcMipDescriptorIdx;
+};
+
+struct ComputeShaderInput {
+    uint3 groupID : SV_GroupID;
+    uint3 groupThreadID : SV_GroupThreadID;
+    uint3 dispatchThreadID : SV_DispatchThreadID;
+    uint groupIndex : SV_GroupIndex;
+};
+
+struct MipsConstantData {
+    uint srcMipLevel;
+    uint numMipLevels;
+    uint srcDimension;
+    bool isSRGB;
+    float2 texelSize;
+};
+
+SamplerState g_sampler : register(s0);
+
+Texture2D<float4> GetSrcMip(MipsConstantData mipsData)
+{
+    return ResourceDescriptorHeap[g_srcMipDescriptorIdx];
+}
+
+RWTexture2D<float4> GetOutMip0()
+{
+    return ResourceDescriptorHeap[g_OutMip0];
+}
+
+RWTexture2D<float4> GetOutMip1()
+{
+    return ResourceDescriptorHeap[g_OutMip1];
+}
+
+RWTexture2D<float4> GetOutMip2()
+{
+    return ResourceDescriptorHeap[g_OutMip2];
+}
+
+RWTexture2D<float4> GetOutMip3()
+{
+    return ResourceDescriptorHeap[g_OutMip3];
+}
+
+ConstantBuffer<MipsConstantData> GetMipsConstantData()
+{
+    return ResourceDescriptorHeap[g_GenerateMipsCBIdx];
+}
+
+groupshared float gs_R[64];
+groupshared float gs_G[64];
+groupshared float gs_B[64];
+groupshared float gs_A[64];
+
+void StoreColor(uint index, float4 color)
+{
+    gs_R[index] = color.r;
+    gs_G[index] = color.g;
+    gs_B[index] = color.b;
+    gs_A[index] = color.a;
+}
+
+float4 LoadColor(uint index)
+{
+    return float4( gs_R[index], gs_G[index], gs_B[index], gs_A[index] );
+}
+
+// http://chilliant.blogspot.com/2012/08/srgb-approximations-for-hlsl.html
+float3 ConvertToLinear(float3 x)
+{
+    return x * (x * (x * 0.305306011 + 0.682171111) + 0.012522878);
+}
+
+float3 ConvertToSRGB(float3 x)
+{
+    float3 s1 = sqrt(x);
+    float3 s2 = sqrt(s1);
+    float3 s3 = sqrt(s2);
+    return 0.662002687 * s1 + 0.684122060 * s2 - 0.323583601 * s3 - 0.0225411470 * x;
+}
+
+// Convert linear color to sRGB before storing if the original source is 
+// an sRGB texture.
+float4 PackColor(float4 x)
+{
+    if (GetMipsConstantData().isSRGB)
+    {
+        return float4(ConvertToSRGB(x.rgb), x.a);
+    }
+    else
+    {
+        return x;
+    }
+}
+
+[numthreads(BLOCK_SIZE, BLOCK_SIZE, 1)]
+void CSMain(ComputeShaderInput input)
+{
+    ConstantBuffer<MipsConstantData> mipsData = GetMipsConstantData();
+    Texture2D srcMip = GetSrcMip(mipsData);
+
+    uint srcMipLevel = mipsData.srcMipLevel;
+    float2 texelSize = mipsData.texelSize;
+    uint numMipLevels = mipsData.numMipLevels;
+
+    float4 src1 = (float4)0;
+
+    switch (mipsData.srcDimension)
+    {
+        case WIDTH_HEIGHT_EVEN:
+        {
+            float2 uv = texelSize * (input.dispatchThreadID.xy + 0.5);
+            src1 = srcMip.SampleLevel(g_sampler, uv, srcMipLevel);
+        }
+        break;
+        case WIDTH_ODD_HEIGHT_EVEN:
+        {
+            float2 uv1 = texelSize * ( input.dispatchThreadID.xy + float2( 0.25, 0.5 ) );
+            float2 offset = texelSize * float2( 0.5, 0.0 );
+ 
+            src1 = 0.5 * ( srcMip.SampleLevel( g_sampler, uv1, srcMipLevel ) +
+                           srcMip.SampleLevel( g_sampler, uv1 + offset, srcMipLevel ) );
+        }
+        break;
+        case WIDTH_EVEN_HEIGHT_ODD:
+        {
+            // > 2:1 in Y dimension
+            // Use 2 bilinear samples to guarantee we don't undersample when downsizing by more than 2x
+            // vertically.
+            float2 uv1 = texelSize * ( input.dispatchThreadID.xy + float2( 0.5, 0.25 ) );
+            float2 offset = texelSize * float2( 0.0, 0.5 );
+ 
+            src1 = 0.5 * ( srcMip.SampleLevel( g_sampler, uv1, srcMipLevel ) +
+                           srcMip.SampleLevel( g_sampler, uv1 + offset, srcMipLevel ) );
+        }
+        break;
+        case WIDTH_HEIGHT_ODD:
+        {
+            // > 2:1 in in both dimensions
+            // Use 4 bilinear samples to guarantee we don't undersample when downsizing by more than 2x
+            // in both directions.
+            float2 uv1 = texelSize * ( input.dispatchThreadID.xy + float2( 0.25, 0.25 ) );
+            float2 offset = texelSize * 0.5;
+ 
+            src1 =  srcMip.SampleLevel(g_sampler, uv1, srcMipLevel);
+            src1 += srcMip.SampleLevel(g_sampler, uv1 + float2(offset.x, 0.0),      srcMipLevel);
+            src1 += srcMip.SampleLevel(g_sampler, uv1 + float2(0.0,      offset.y), srcMipLevel);
+            src1 += srcMip.SampleLevel(g_sampler, uv1 + float2(offset.x, offset.y), srcMipLevel);
+            src1 *= 0.25;
+        }
+        break;
+    };
+
+    GetOutMip0()[input.dispatchThreadID.xy] = PackColor( src1 );
+
+    if (numMipLevels == 1) {
+        return;
+    }
+
+    StoreColor(input.groupIndex, src1);
+
+    GroupMemoryBarrierWithGroupSync();
+
+    // With low three bits for X and high three bits for Y, this bit mask
+    // (binary: 001001) checks that X and Y are even.
+    if ((input.groupIndex & 0x9) == 0) {
+        float4 src2 = LoadColor(input.groupIndex & 0x01);
+        float4 src3 = LoadColor(input.groupIndex + 0x08);
+        float4 src4 = LoadColor(input.groupIndex + 0x09);
+        src1 = 0.25 * (src1 + src2 + src3 + src4);
+
+        GetOutMip1()[input.dispatchThreadID.xy / 2] = PackColor(src1);
+        StoreColor(input.groupIndex, src1);
+    }
+
+    if (numMipLevels == 2) {
+        return;
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    // This bit mask (binary: 011011) checks that X and Y are multiples of four.
+    if ((input.groupIndex & 0x1B) == 0)
+    {
+        float4 src2 = LoadColor(input.groupIndex + 0x02);
+        float4 src3 = LoadColor(input.groupIndex + 0x10);
+        float4 src4 = LoadColor(input.groupIndex + 0x12);
+        src1 = 0.25 * (src1 + src2 + src3 + src4);
+ 
+        GetOutMip2()[input.dispatchThreadID.xy / 4] = PackColor(src1);
+        StoreColor(input.groupIndex, src1);
+    }
+
+    if (numMipLevels == 3) {
+        return;
+    }
+ 
+    GroupMemoryBarrierWithGroupSync();
+
+    // This bit mask would be 111111 (X & Y multiples of 8), but only one
+    // thread fits that criteria.
+    if (input.groupIndex == 0)
+    {
+        float4 src2 = LoadColor( input.groupIndex + 0x04 );
+        float4 src3 = LoadColor( input.groupIndex + 0x20 );
+        float4 src4 = LoadColor( input.groupIndex + 0x24 );
+        src1 = 0.25 * ( src1 + src2 + src3 + src4 );
+ 
+        GetOutMip3()[input.dispatchThreadID.xy / 8] = PackColor(src1);
+    }
+}

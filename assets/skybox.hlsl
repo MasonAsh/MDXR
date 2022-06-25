@@ -1,4 +1,4 @@
-#include "include/common.hlsl"
+#include "common.hlsli"
 
 struct Vertex {
     float3 pos : POSITION;
