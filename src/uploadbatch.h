@@ -118,14 +118,14 @@ public:
         }
     }
 
-    void AddBuffer(ID3D12Resource* destinationResource, size_t destOffset, void* srcData, size_t numBytes)
+    void AddBuffer(ID3D12Resource* destinationResource, UINT64 destOffset, void* srcData, UINT64 numBytes)
     {
         // If a big resource can't fit into one upload, split into two. This
         // will recurse, so if a resource is somehow uploadBufferSize * 2, then
         // it will get split in recurse calls.
         if (numBytes > uploadBufferSize) {
             Flush();
-            int leftoverBytes = numBytes - uploadBufferSize;
+            UINT64 leftoverBytes = numBytes - uploadBufferSize;
             AddBuffer(destinationResource, destOffset, srcData, uploadBufferSize);
             AddBuffer(destinationResource, destOffset + uploadBufferSize, srcData, leftoverBytes);
             return;

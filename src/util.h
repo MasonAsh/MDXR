@@ -1,5 +1,4 @@
-#if !defined(UTIL_H)
-#define UTIL_H
+#pragma once
 
 #include <assert.h>
 #include <comdef.h> 
@@ -10,6 +9,7 @@
 #include <locale>
 #include <codecvt>
 #include <string>
+#include <limits>
 
 #include "glm/glm.hpp"
 #include "glm/gtc/matrix_access.hpp"
@@ -48,8 +48,7 @@ std::array<
 }
 
 // Allow printing glm data types with cout
-
-std::ostream& operator<< (std::ostream& out, const glm::vec3& vec) {
+inline std::ostream& operator<< (std::ostream& out, const glm::vec3& vec) {
     out << "{"
         << vec.x << " " << vec.y << " " << vec.z
         << "}";
@@ -57,7 +56,7 @@ std::ostream& operator<< (std::ostream& out, const glm::vec3& vec) {
     return out;
 }
 
-std::ostream& operator<< (std::ostream& out, const glm::vec4& vec) {
+inline std::ostream& operator<< (std::ostream& out, const glm::vec4& vec) {
     out << "{"
         << vec.x << " " << vec.y << " " << vec.z << " " << vec.w
         << "}";
@@ -65,7 +64,7 @@ std::ostream& operator<< (std::ostream& out, const glm::vec4& vec) {
     return out;
 }
 
-std::ostream& operator<< (std::ostream& out, const glm::mat4& matrix) {
+inline std::ostream& operator<< (std::ostream& out, const glm::mat4& matrix) {
     out << "\n"
         << glm::row(matrix, 0) << "\n"
         << glm::row(matrix, 1) << "\n"
@@ -137,4 +136,11 @@ private:
     PerformancePrecision precision;
 };
 
-#endif // UTIL_H
+// Like static_cast, but asserts if there's a loss of data
+template<typename Out, typename In>
+Out assert_cast(In input)
+{
+    bool condition = input <= std::numeric_limits<Out>::max();
+    CHECK(condition);
+    return static_cast<Out>(input);
+}

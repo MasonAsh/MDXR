@@ -41,13 +41,12 @@ add_executable(mdxr
     src/gltftangentspace.cpp
     src/uploadbatch.h
     src/incrementalfence.h
+    src/pso.h
+    src/pso.cpp
+    src/gbuffer.h
 
     # third party
-    src/stb_image.h
-    src/stb_image_write.h
-    src/json.hpp
-    src/tiny_gltf.h
-    src/tiny_gltf_impl.cpp
+    thirdparty/tiny_gltf_impl.cpp
     thirdparty/tinyfiledialogs.c
     thirdparty/D3D12MemoryAllocator/src/D3D12MemAlloc.cpp
     thirdparty/mikktspace.c
@@ -66,8 +65,8 @@ target_compile_definitions(mdxr
         GLM_FORCE_DEPTH_ZERO_TO_ONE
         _CRT_SECURE_NO_WARNINGS
     PUBLIC
-        $<$<CONFIG:Debug>:D3DCOMPILE_DEBUG=1>
-        $<$<CONFIG:RelWithDebInfo>:D3DCOMPILE_DEBUG=1>
+        $<$<CONFIG:Debug>:MDXR_DEBUG=1>
+        $<$<CONFIG:RelWithDebInfo>:MDXR_DEBUG=1>
 )
 
 target_link_libraries(mdxr 

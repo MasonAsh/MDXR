@@ -15,8 +15,8 @@ struct MikkTSpaceUserData {
 
     std::vector<glm::vec3>* tangentBufferData;
 
-    int tangentBufferIdx = -1;
-    int tangentBufferViewIdx = -1;
+    size_t tangentBufferIdx = SIZE_MAX;
+    size_t tangentBufferViewIdx = SIZE_MAX;
     size_t tangentAccessor;
 
     tinygltf::Buffer tangentBuffer;
@@ -81,7 +81,7 @@ bool PrepareUserData(MikkTSpaceUserData* user, size_t meshIdx, size_t primitiveI
     buffer.data.resize(buffer.data.size() + tangentByteCount);
 
     tinygltf::BufferView bufferView;
-    bufferView.buffer = user->tangentBufferIdx;
+    bufferView.buffer = (int)user->tangentBufferIdx;
     bufferView.byteOffset = user->tangentBuffer.data.size();
     bufferView.byteStride = sizeof(glm::vec3);
     bufferView.dracoDecoded = false;
@@ -91,7 +91,7 @@ bool PrepareUserData(MikkTSpaceUserData* user, size_t meshIdx, size_t primitiveI
     user->tangentBufferViewIdx = model.bufferViews.size();
 
     tinygltf::Accessor tangentAccessor;
-    tangentAccessor.bufferView = user->tangentBufferIdx;
+    tangentAccessor.bufferView = (int)user->tangentBufferIdx;
     tangentAccessor.byteOffset = 0;
     tangentAccessor.componentType = TINYGLTF_COMPONENT_TYPE_FLOAT;
     tangentAccessor.type = TINYGLTF_TYPE_VEC3;
@@ -100,7 +100,7 @@ bool PrepareUserData(MikkTSpaceUserData* user, size_t meshIdx, size_t primitiveI
 
     model.accessors.push_back(std::move(tangentAccessor));
     user->tangentAccessor = model.accessors.size() - 1;
-    primitive.attributes["TANGENT"] = user->tangentAccessor;
+    primitive.attributes["TANGENT"] = (int)user->tangentAccessor;
 
     return true;
 }
@@ -112,7 +112,7 @@ int m_getNumFaces(const SMikkTSpaceContext* pContext)
     auto& model = user->model;
     auto& mesh = user->model.meshes[user->meshIdx];
     auto& primitive = mesh.primitives[user->primitiveIdx];
-    return model.accessors[primitive.indices].count / 3;
+    return (int)model.accessors[primitive.indices].count / 3;
 }
 
 // Returns the number of vertices on face number iFace
@@ -186,7 +186,7 @@ void SampleAccessor(const tinygltf::Model& model, const tinygltf::Accessor& acce
     auto& buffer = model.buffers[bufferView.buffer];
     tinygltf::GetNumComponentsInType(accessor.type);
     size_t stride = accessor.ByteStride(bufferView);
-    int accessorSize = GetAccessorSize(accessor.componentType, accessor.type);
+    size_t accessorSize = GetAccessorSize(accessor.componentType, accessor.type);
     size_t byteIndex = bufferView.byteOffset + accessor.byteOffset + (offsetInElements * stride);
     memcpy(out, &buffer.data[byteIndex], accessorSize);
 }
@@ -197,12 +197,12 @@ void WriteAccessor(tinygltf::Model& model, const tinygltf::Accessor& accessor, s
     auto& buffer = model.buffers[bufferView.buffer];
     tinygltf::GetNumComponentsInType(accessor.type);
     size_t stride = accessor.ByteStride(bufferView);
-    int accessorSize = GetAccessorSize(accessor.componentType, accessor.type);
+    size_t accessorSize = GetAccessorSize(accessor.componentType, accessor.type);
     size_t byteIndex = bufferView.byteOffset + accessor.byteOffset + (offsetInElements * stride);
     memcpy(reinterpret_cast<void*>(&buffer.data[byteIndex]), in, accessorSize);
 }
 
-void GetAttribute(const tinygltf::Model& model, int accessor, int indicesAccessorIdx, float fvAttributeOut[], const int iFace, const int iVert)
+void GetAttribute(const tinygltf::Model& model, size_t accessor, size_t indicesAccessorIdx, float fvAttributeOut[], const int iFace, const int iVert)
 {
     auto& attribAccessor = model.accessors[accessor];
     auto& indicesAccessor = model.accessors[indicesAccessorIdx];
@@ -215,7 +215,7 @@ void GetAttribute(const tinygltf::Model& model, int accessor, int indicesAccesso
     SampleAccessor(model, attribAccessor, vertex, fvAttributeOut);
 }
 
-void SetAttribute(tinygltf::Model& model, int accessor, int indicesAccessorIdx, const float fvAttributeIn[], const int iFace, const int iVert)
+void SetAttribute(tinygltf::Model& model, size_t accessor, size_t indicesAccessorIdx, const float fvAttributeIn[], const int iFace, const int iVert)
 {
     auto& attribAccessor = model.accessors[accessor];
     auto& indicesAccessor = model.accessors[indicesAccessorIdx];

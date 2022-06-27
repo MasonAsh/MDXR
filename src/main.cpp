@@ -15,5 +15,5 @@ int main(int argc, char** argv)
         return -1;
     }
 
-    RunMDXR(argc, argv);
+    return RunMDXR(argc, argv);
 }

@@ -22,7 +22,7 @@ using PoolItem = std::unique_ptr<T, internal::PoolItemDeleter<T>>;
 template<typename T>
 using SharedPoolItem = std::shared_ptr<T>;
 
-template<typename T, int N>
+template<typename T, size_t N>
 class PoolBlock {
 public:
     PoolBlock() : liveItems{ false }, deleterContext(new internal::PoolItemDeleterContext<T>) {
@@ -32,7 +32,7 @@ public:
     }
 
     ~PoolBlock() {
-        for (int i = 0; i < N; i++) {
+        for (size_t i = 0; i < N; i++) {
             if (liveItems[i]) {
                 items[i].~T();
                 liveItems[i] = false;
@@ -85,8 +85,8 @@ private:
     template<typename... Args>
     T* Allocate(Args... constructorArgs)
     {
-        assert(firstFreeIndex == -1 || !liveItems[firstFreeIndex]);
-        if (firstFreeIndex == -1) {
+        assert(firstFreeIndex == SIZE_MAX || !liveItems[firstFreeIndex]);
+        if (firstFreeIndex == SIZE_MAX) {
             return nullptr;
         } else {
             T* item = &items[firstFreeIndex];
@@ -96,7 +96,7 @@ private:
             liveItems[firstFreeIndex] = true;
 
             // Find the next free index.
-            int i = firstFreeIndex + 1;
+            size_t i = firstFreeIndex + 1;
             firstFreeIndex = -1;
             for (; i < N; i++) {
                 if (!liveItems[i]) {
