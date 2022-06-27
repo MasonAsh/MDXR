@@ -21,7 +21,7 @@ PSInput VSMain(Vertex input)
     PSInput output;
     // Keep skybox at the far plane by locking Z to W
     output.pos = mul(primitive.MVP, float4(input.pos, 0.0f)).xyww;
-    output.pos.z = output.pos.z * 0.9999999f;
+    output.pos.z = output.pos.z * 0.9999f;
     // Sample the texcube with just vertex position
     output.texcoord = input.pos;
 

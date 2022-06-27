@@ -4,12 +4,15 @@
 #include <assert.h>
 #include <comdef.h> 
 #include <iostream>
+#include <format>
+#include <chrono>
 
 #include <locale>
 #include <codecvt>
 #include <string>
 
 #include "glm/glm.hpp"
+#include "glm/gtc/matrix_access.hpp"
 
 #define ASSERT_HRESULT(hr) \
     { \
@@ -44,11 +47,30 @@ std::array<
         sizeof...(T)>{std::forward<T>(values)...};
 }
 
-// Allow printing glm vectors with cout
+// Allow printing glm data types with cout
+
 std::ostream& operator<< (std::ostream& out, const glm::vec3& vec) {
     out << "{"
         << vec.x << " " << vec.y << " " << vec.z
         << "}";
+
+    return out;
+}
+
+std::ostream& operator<< (std::ostream& out, const glm::vec4& vec) {
+    out << "{"
+        << vec.x << " " << vec.y << " " << vec.z << " " << vec.w
+        << "}";
+
+    return out;
+}
+
+std::ostream& operator<< (std::ostream& out, const glm::mat4& matrix) {
+    out << "\n"
+        << glm::row(matrix, 0) << "\n"
+        << glm::row(matrix, 1) << "\n"
+        << glm::row(matrix, 2) << "\n"
+        << glm::row(matrix, 3) << "\n";
 
     return out;
 }
@@ -63,5 +85,56 @@ std::ostream& operator<< (std::ostream& out, const glm::vec3& vec) {
 #endif
 
 #define MDXR_ASSERT(code) if (!(code)) { abort(); }
+
+enum class PerformancePrecision
+{
+    Seconds,
+    Milliseconds,
+    Nanoseconds,
+};
+
+class ScopedPerformanceTracker
+{
+public:
+    ScopedPerformanceTracker(const char* name, PerformancePrecision precision, const char* numberFormat = "{:.4f}")
+        : name(name)
+        , precision(precision)
+        , numberFormat(numberFormat)
+    {
+        std::cout << "Beginning " << name << "\n";
+        startNS = std::chrono::steady_clock::now().time_since_epoch().count();
+    }
+
+    ~ScopedPerformanceTracker()
+    {
+        unsigned long long now = std::chrono::steady_clock::now().time_since_epoch().count();
+        unsigned long long delta = now - startNS;
+
+        std::cout << name << " finished: ";
+
+        switch (precision) {
+        case PerformancePrecision::Seconds:
+        {
+            float seconds = (float)delta / (float)1e+9;
+            std::cout << std::format(numberFormat, seconds) << " seconds elapsed\n";
+        }
+        break;
+        case PerformancePrecision::Milliseconds:
+        {
+            float millis = (float)delta / 1000000.0f;
+            std::cout << std::format(numberFormat, millis) << " milliseconds elapsed\n";
+        }
+        break;
+        case PerformancePrecision::Nanoseconds:
+            std::cout << delta << " nanoseconds elapsed\n";
+            break;
+        }
+    }
+private:
+    unsigned long long startNS;
+    const char* name;
+    const char* numberFormat;
+    PerformancePrecision precision;
+};
 
 #endif // UTIL_H

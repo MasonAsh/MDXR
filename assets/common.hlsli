@@ -30,6 +30,7 @@ struct LightConstantData {
 
 struct LightPassConstantData {
     float4x4 inverseProjection;
+    float4x4 inverseView;
     float4 environmentIntensity;
     uint baseGBufferIdx;
     uint debug;

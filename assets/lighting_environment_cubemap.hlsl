@@ -63,8 +63,10 @@ float4 PSMain(PSInput input) : SV_TARGET
 
     float3 N = normal.xyz;
 
+    float3 worldSpaceNormal = mul(passData.inverseView, float4(N, 0.0)).xyz;
+
     TextureCube skybox = GetSkyboxTexture();
-    float3 radiance = skybox.Sample(g_sampler, N).rgb * passData.environmentIntensity.rgb;
+    float3 radiance = skybox.Sample(g_sampler, worldSpaceNormal).rgb * passData.environmentIntensity.rgb;
 
     // Direction from fragment to eye
     float3 Wo = normalize(-viewPos.xyz);
