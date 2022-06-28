@@ -37,6 +37,7 @@ add_executable(mdxr
     src/util.h
     src/mdxr.h
     src/mdxr.cpp
+    src/app.h
     src/pool.h
     src/gltftangentspace.cpp
     src/uploadbatch.h
@@ -44,6 +45,15 @@ add_executable(mdxr
     src/pso.h
     src/pso.cpp
     src/gbuffer.h
+    src/d3dutils.h
+    src/assets.h
+    src/assets.cpp
+    src/scene.h
+    src/scene.cpp
+    src/gui.h
+    src/gui.cpp
+    src/renderer.h
+    src/renderer.cpp
 
     # third party
     thirdparty/tiny_gltf_impl.cpp

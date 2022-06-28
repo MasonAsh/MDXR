@@ -1,5 +1,7 @@
 #pragma once
 
+#define NOMINMAX
+
 #include <assert.h>
 #include <comdef.h> 
 #include <iostream>
@@ -11,8 +13,10 @@
 #include <string>
 #include <limits>
 
-#include "glm/glm.hpp"
-#include "glm/gtc/matrix_access.hpp"
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_access.hpp>
+#include <glm/gtx/transform.hpp>
+#include <glm/gtx/euler_angles.hpp>
 
 #define ASSERT_HRESULT(hr) \
     { \
@@ -143,4 +147,14 @@ Out assert_cast(In input)
     bool condition = input <= std::numeric_limits<Out>::max();
     CHECK(condition);
     return static_cast<Out>(input);
+}
+
+inline glm::mat4 ApplyStandardTransforms(const glm::mat4& base, glm::vec3 translation, glm::vec3 euler, glm::vec3 scale)
+{
+    glm::mat4 transform = base;
+    transform = glm::translate(transform, translation);
+    transform = glm::scale(transform, scale);
+    transform = transform * glm::eulerAngleXYZ(euler.x, euler.y, euler.z);
+
+    return transform;
 }
