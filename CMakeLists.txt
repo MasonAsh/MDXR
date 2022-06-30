@@ -32,7 +32,7 @@ set(IMGUI_SOURCES
     thirdparty/imgui/backends/imgui_impl_dx12.cpp
 )
 
-add_executable(mdxr
+add_executable(mdxr WIN32
     src/main.cpp
     src/util.h
     src/mdxr.h

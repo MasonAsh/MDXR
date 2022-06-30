@@ -265,7 +265,7 @@ void GenerateMipMaps(App& app, const std::span<ComPtr<ID3D12Resource>>& textures
         app.mainAllocator->CreateResource(
             &allocDesc,
             &resourceDesc,
-            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
             nullptr,
             &constantBuffer,
             IID_NULL, nullptr
@@ -1163,7 +1163,7 @@ void CreateSkybox(App& app, const SkyboxAssets& asset)
             app.mainAllocator->CreateResource(
                 &allocDesc,
                 &resourceDesc,
-                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
                 nullptr,
                 &perPrimitiveBuffer,
                 IID_NULL, nullptr

@@ -7,7 +7,7 @@
 class UploadBatch
 {
 public:
-    const UINT64 MaxUploadSize = (UINT64)1000 * 1000 * 1000;
+    const UINT64 MaxUploadSize = (UINT64)1000 * 1000 * 128;
 
     // Begins an upload batch.
     // The batch has full control of the command queue during this time.
@@ -51,7 +51,7 @@ public:
         ASSERT_HRESULT(
             allocator->CreateResource(&allocDesc,
                 &uploadBufferDesc,
-                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
                 nullptr,
                 &this->uploadBuffer,
                 IID_NULL,

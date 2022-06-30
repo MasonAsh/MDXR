@@ -25,6 +25,7 @@
         _com_error err(val); \
         LPCTSTR errMsg = err.ErrorMessage(); \
         std::cout << "Failed HRESULT(" << val << "): " << errMsg << "\n"; \
+        std::cout << #hr << "\n";\
         abort(); \
     }\
     }

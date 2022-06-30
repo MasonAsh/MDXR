@@ -392,18 +392,24 @@ void InitD3D(App& app)
         ComPtr<ID3D12Debug> debugController;
         if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debugController)))) {
             debugController->EnableDebugLayer();
+			ComPtr<ID3D12Debug1> debugController1;
+			ASSERT_HRESULT(debugController->QueryInterface(IID_PPV_ARGS(&debugController1)));
+            if (debugController1) {
+                debugController1->SetEnableGPUBasedValidation(true);
+            }
         } else {
             std::cout << "Failed to enable D3D12 debug layer\n";
         }
 
-        ComPtr<ID3D12Debug1> debugController1;
-        ASSERT_HRESULT(debugController->QueryInterface(IID_PPV_ARGS(&debugController1)));
-        debugController1->SetEnableGPUBasedValidation(true);
-
         ComPtr<ID3D12DeviceRemovedExtendedDataSettings> pDredSettings;
-        ASSERT_HRESULT(D3D12GetDebugInterface(IID_PPV_ARGS(&pDredSettings)));
-        pDredSettings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-        pDredSettings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+        D3D12GetDebugInterface(IID_PPV_ARGS(&pDredSettings));
+        if (pDredSettings) {
+			pDredSettings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+			pDredSettings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+        }
+        else {
+            std::cout << "Failed to load DRED\n";
+        }
 
         DXGIGetDebugInterface1(0, IID_PPV_ARGS(&app.graphicsAnalysis));
     }
@@ -426,9 +432,14 @@ void InitD3D(App& app)
         // Break on debug layer errors or corruption
         ComPtr<ID3D12InfoQueue> infoQueue;
         app.device->QueryInterface(IID_PPV_ARGS(&infoQueue));
-        infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, true);
-        infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, true);
-        infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, false);
+        if (infoQueue) {
+			infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, true);
+			infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, true);
+			infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, false);
+        }
+        else {
+            std::cout << "Failed to set info queue breakpoints\n";
+        }
     }
 
     D3D12MA::ALLOCATOR_DESC allocatorDesc = {};

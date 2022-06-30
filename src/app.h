@@ -373,7 +373,7 @@ struct ConstantBufferArena
             allocator->CreateResource(
                 &allocDesc,
                 &resourceDesc,
-                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
                 nullptr,
                 &allocation,
                 IID_PPV_ARGS(&resource)
