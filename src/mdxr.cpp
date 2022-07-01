@@ -183,15 +183,17 @@ void ToggleBorderlessWindow(App& app)
 int RunApp(int argc, char** argv)
 {
     App app;
+    app.running = true;
 
     InitApp(app, argc, argv);
     InitWindow(app);
     InitD3D(app);
     InitImGui(app);
 
+    StartAssetThread(app);
+
     {
-        AssetBundle assets = LoadAssets(app.dataDir);
-        ProcessAssets(app, assets);
+        StartSceneAssetLoad(app);
     }
 
     InitializeScene(app);
@@ -204,7 +206,6 @@ int RunApp(int argc, char** argv)
     int mouseX, mouseY;
     int buttonState = SDL_GetMouseState(&mouseX, &mouseY);
 
-    app.running = true;
     while (app.running) {
         long long frameTick = steady_clock::now().time_since_epoch().count();
         app.mouseState.xrel = 0;
@@ -264,6 +265,9 @@ int RunApp(int argc, char** argv)
     }
 
     WaitForPreviousFrame(app);
+
+    NotifyAssetThread(app);
+    app.AssetThread.thread.join();
 
     CleanImGui();
     SDL_DestroyWindow(app.window);

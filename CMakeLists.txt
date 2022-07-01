@@ -20,6 +20,9 @@ message(STATUS "Nsight Aftermath Headers Include = ${NsightAftermath_INCLUDE_DIR
 
 include_directories(${NsightAftermath_INCLUDE_DIR})
 
+find_package(WinPixEventRuntime)
+include_directories(${WinPixEventRuntime_INCLUDE_DIR})
+
 add_subdirectory(DirectX-Headers)
 
 set(IMGUI_SOURCES
@@ -89,6 +92,7 @@ target_link_libraries(mdxr
     D3DCompiler 
     DXGuid
     ${NsightAftermath_LIBRARY}
+    WinPixEventRuntime::WinPixEventRuntime
 )
 
 # file(COPY ${CMAKE_SOURCE_DIR}/D3D12 DESTINATION ${TARGET_FILE_DIR})

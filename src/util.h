@@ -12,6 +12,7 @@
 #include <codecvt>
 #include <string>
 #include <limits>
+#include <sstream>
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_access.hpp>
@@ -79,7 +80,7 @@ inline std::ostream& operator<< (std::ostream& out, const glm::mat4& matrix) {
     return out;
 }
 
-#define DEBUG_VAR(vec) std::cout << #vec << ": " << vec << "\n";
+#define DEBUG_VAR(vec) DebugLog() << #vec << ": " << vec << "\n";
 
 // Like assert, but the code still gets executed in release mode
 #ifdef _DEBUG
@@ -159,3 +160,20 @@ inline glm::mat4 ApplyStandardTransforms(const glm::mat4& base, glm::vec3 transl
 
     return transform;
 }
+
+class DebugLog {
+public:
+    ~DebugLog()
+    {
+        OutputDebugStringA(ss.str().c_str());
+    }
+
+    template<class T>
+    DebugLog& operator <<(const T& arg)
+    {
+        ss << arg;
+        return *this;
+    }
+private:
+    std::stringstream ss;
+};

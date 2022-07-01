@@ -4,6 +4,8 @@
 #include "d3dutils.h"
 #include "uploadbatch.h"
 
+#include <pix3.h>
+
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 #include <glm/gtx/quaternion.hpp>
@@ -65,41 +67,6 @@ tinygltf::Image LoadImageFile(const std::string& imagePath)
     stbi_image_free(imageData);
 
     return image;
-}
-
-AssetBundle LoadAssets(const std::string& dataDir)
-{
-    AssetBundle assets;
-
-    tinygltf::TinyGLTF loader;
-    std::string err;
-    std::string warn;
-
-    LoadModelAsset(assets, loader, dataDir + "/floor/floor.gltf");
-    LoadModelAsset(assets, loader, dataDir + "/metallicsphere.gltf");
-
-    SkyboxAssets skybox;
-    skybox.images[CubeImage_Front] = LoadImageFile(dataDir + "/DebugSky/pz.png");
-    skybox.images[CubeImage_Back] = LoadImageFile(dataDir + "/DebugSky/pz.png");
-    skybox.images[CubeImage_Left] = LoadImageFile(dataDir + "/DebugSky/px.png");
-    skybox.images[CubeImage_Right] = LoadImageFile(dataDir + "/DebugSky/px.png");
-    skybox.images[CubeImage_Top] = LoadImageFile(dataDir + "/DebugSky/py.png");
-    skybox.images[CubeImage_Bottom] = LoadImageFile(dataDir + "/DebugSky/py.png");
-    // skybox.images[CubeImage_Front] = LoadImageFile(app.dataDir + "/ColorfulStudio/pz.png");
-    // skybox.images[CubeImage_Back] = LoadImageFile(app.dataDir + "/ColorfulStudio/nz.png");
-    // skybox.images[CubeImage_Left] = LoadImageFile(app.dataDir + "/ColorfulStudio/nx.png");
-    // skybox.images[CubeImage_Right] = LoadImageFile(app.dataDir + "/ColorfulStudio/px.png");
-    // skybox.images[CubeImage_Top] = LoadImageFile(app.dataDir + "/ColorfulStudio/py.png");
-    // skybox.images[CubeImage_Bottom] = LoadImageFile(app.dataDir + "/ColorfulStudio/ny.png");
-    // skybox.images[CubeImage_Front] = LoadImageFile(app.dataDir + "/skybox/front.png");
-    // skybox.images[CubeImage_Back] = LoadImageFile(app.dataDir + "/skybox/back.png");
-    // skybox.images[CubeImage_Left] = LoadImageFile(app.dataDir + "/skybox/left.png");
-    // skybox.images[CubeImage_Right] = LoadImageFile(app.dataDir + "/skybox/right.png");
-    // skybox.images[CubeImage_Top] = LoadImageFile(app.dataDir + "/skybox/top.png");
-    // skybox.images[CubeImage_Bottom] = LoadImageFile(app.dataDir + "/skybox/bottom.png");
-    assets.skybox = skybox;
-
-    return assets;
 }
 
 void CreateModelDescriptors(
@@ -172,8 +139,6 @@ void CreateModelMaterials(
 
     auto baseTextureDescriptor = outputModel.baseTextureDescriptor;
 
-    //startingMaterialIdx = app.materials.size();
-
     for (int i = 0; i < materialCount; i++) {
         auto& inputMaterial = inputModel.materials[i];
 
@@ -232,7 +197,7 @@ void CreateModelMaterials(
 
 // Generates mip maps for a range of textures. The `textures` must have their
 // MipLevels already set. Textures must also be UAV compatible.
-void GenerateMipMaps(App& app, const std::span<ComPtr<ID3D12Resource>>& textures, const std::vector<bool>& textureIsSRGB)
+void GenerateMipMaps(App& app, const std::span<ComPtr<ID3D12Resource>>& textures, const std::vector<bool>& textureIsSRGB, FenceEvent& initialUploadEvent)
 {
     if (textures.size() == 0) {
         return;
@@ -324,7 +289,6 @@ void GenerateMipMaps(App& app, const std::span<ComPtr<ID3D12Resource>>& textures
 
     for (size_t textureIdx = 0; textureIdx < textures.size(); textureIdx++) {
         auto resourceDesc = textures[textureIdx]->GetDesc();
-        std::vector<CD3DX12_RESOURCE_BARRIER> resourceBarriers;
         for (UINT16 srcMip = 0; srcMip < resourceDesc.MipLevels - 1u; ) {
             UINT64 srcWidth = resourceDesc.Width >> srcMip;
             UINT64 srcHeight = resourceDesc.Height >> srcMip;
@@ -384,7 +348,9 @@ void GenerateMipMaps(App& app, const std::span<ComPtr<ID3D12Resource>>& textures
     commandList->Close();
 
     ID3D12CommandList* ppCommandLists[] = { commandList.Get() };
+    app.copyFence.WaitQueue(app.computeQueue.Get(), initialUploadEvent);
     app.computeQueue->ExecuteCommandLists(_countof(ppCommandLists), ppCommandLists);
+    // FIXME: Don't wait here
     app.fence.SignalAndWait(app.computeQueue.Get());
 
     app.descriptorArena.PopDescriptorStack(descriptorCount);
@@ -395,7 +361,10 @@ void LoadModelTextures(
     Model& outputModel,
     tinygltf::Model& inputModel,
     std::vector<CD3DX12_RESOURCE_BARRIER>& resourceBarriers,
-    const std::vector<bool>& textureIsSRGB
+    const std::vector<bool>& textureIsSRGB,
+    ID3D12GraphicsCommandList* commandList,
+    ID3D12CommandAllocator* commandAllocator,
+    FenceEvent& fenceEvent
 )
 {
     // We generate mips on unordered access view textures, but these textures
@@ -435,15 +404,16 @@ void LoadModelTextures(
         stagingTexturesForMipMaps.push_back(buffer);
     }
 
-    uploadBatch.Finish();
+    FenceEvent uploadEvent = uploadBatch.Finish();
 
+    app.copyFence.WaitCPU(uploadEvent);
     // Now that the images are uploaded these can be free'd
     for (auto& image : inputModel.images) {
         image.image.clear();
         image.image.shrink_to_fit();
     }
 
-    GenerateMipMaps(app, stagingTexturesForMipMaps, textureIsSRGB);
+    GenerateMipMaps(app, stagingTexturesForMipMaps, textureIsSRGB, uploadEvent);
 
     D3D12MA::Budget localBudget;
     app.mainAllocator->GetBudget(&localBudget, nullptr);
@@ -451,13 +421,6 @@ void LoadModelTextures(
     // Only use up to 75% remaining memory on these uploads
     size_t maxUploadBytes = localBudget.BudgetBytes / 2;
     size_t pendingUploadBytes = 0;
-
-    ASSERT_HRESULT(
-        app.copyCommandList->Reset(
-            app.copyCommandAllocator.Get(),
-            nullptr
-        )
-    );
 
     // Copy mip map textures to non-UAV textures for the model.
     for (int textureIdx = 0; textureIdx < inputModel.images.size(); textureIdx++) {
@@ -470,8 +433,8 @@ void LoadModelTextures(
         auto allocInfo = app.device->GetResourceAllocationInfo(0, 1, &resourceDesc);
         if (pendingUploadBytes > 0 && allocInfo.SizeInBytes + pendingUploadBytes > maxUploadBytes) {
             // Flush the upload
-            ASSERT_HRESULT(app.copyCommandList->Close());
-            ID3D12CommandList* ppCommandLists[] = { app.copyCommandList.Get() };
+            ASSERT_HRESULT(commandList->Close());
+            ID3D12CommandList* ppCommandLists[] = { commandList };
             app.copyCommandQueue->ExecuteCommandLists(_countof(ppCommandLists), ppCommandLists);
             app.copyFence.SignalAndWait(app.copyCommandQueue.Get());
 
@@ -480,9 +443,10 @@ void LoadModelTextures(
                 stagingTexturesForMipMaps[stageIdx] = nullptr;
             }
 
+            ASSERT_HRESULT(commandAllocator->Reset());
             ASSERT_HRESULT(
-                app.copyCommandList->Reset(
-                    app.copyCommandAllocator.Get(),
+                commandList->Reset(
+                    commandAllocator,
                     nullptr
                 )
             );
@@ -503,7 +467,7 @@ void LoadModelTextures(
 
         pendingUploadBytes += allocInfo.SizeInBytes;
 
-        app.copyCommandList->CopyResource(destResource.Get(), stagingTexturesForMipMaps[textureIdx].Get());
+        commandList->CopyResource(destResource.Get(), stagingTexturesForMipMaps[textureIdx].Get());
         outputModel.buffers.push_back(destResource);
 
         resourceBarriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(
@@ -513,11 +477,14 @@ void LoadModelTextures(
         ));
     }
 
-    ASSERT_HRESULT(app.copyCommandList->Close());
-    if (pendingUploadBytes > 0) {
-        ID3D12CommandList* ppCommandLists[] = { app.copyCommandList.Get() };
-        app.copyCommandQueue->ExecuteCommandLists(_countof(ppCommandLists), ppCommandLists);
-        app.copyFence.SignalAndWait(app.copyCommandQueue.Get());
+    commandList->Close();
+    ID3D12CommandList* ppCommandLists[] = { commandList };
+    app.copyCommandQueue->ExecuteCommandLists(_countof(ppCommandLists), ppCommandLists);
+    app.copyFence.SignalQueue(app.copyCommandQueue.Get(), fenceEvent);
+    for (auto& texture : stagingTexturesForMipMaps) {
+        if (texture != nullptr) {
+            fenceEvent.TrackObject(texture.Get());
+        }
     }
 }
 
@@ -543,11 +510,19 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
     Model& outputModel,
     App& app,
     tinygltf::Model& inputModel,
+    ID3D12GraphicsCommandList* commandList,
+    ID3D12GraphicsCommandList* copyCommandList,
+    ID3D12CommandAllocator* copyCommandAllocator,
     const std::vector<UINT64>& uploadOffsets,
     std::span<ComPtr<ID3D12Resource>>& outGeometryResources,
-    std::span<ComPtr<ID3D12Resource>>& outTextureResources
+    std::span<ComPtr<ID3D12Resource>>& outTextureResources,
+    FenceEvent& fenceEvent,
+    AssetLoadProgress* progress
 )
 {
+    progress->currentTask = "Uploading model buffers";
+    progress->overallPercent = 0.15f;
+
     std::vector<bool> textureIsSRGB = DetermineSRGBTextures(inputModel);
 
     std::vector<ComPtr<ID3D12Resource>>& resourceBuffers = outputModel.buffers;
@@ -589,19 +564,34 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
 
     uploadBatch.Finish();
 
+    progress->currentTask = "Loading model textures";
+    progress->overallPercent = 0.30f;
+
     LoadModelTextures(
         app,
         outputModel,
         inputModel,
         resourceBarriers,
-        textureIsSRGB
+        textureIsSRGB,
+        copyCommandList,
+        copyCommandAllocator,
+        fenceEvent
     );
 
     auto endGeometryBuffer = resourceBuffers.begin() + inputModel.buffers.size();
     outGeometryResources = std::span(resourceBuffers.begin(), endGeometryBuffer);
     outTextureResources = std::span(endGeometryBuffer, resourceBuffers.end());
 
-    app.commandList->ResourceBarrier((UINT)resourceBarriers.size(), resourceBarriers.data());
+    // ASSERT_HRESULT(commandList->Close());
+    // ID3D12CommandList* ppCommandLists[] = { commandList };
+    // {
+    //     std::lock_guard<std::mutex> lock(app.commandQueueMutex);
+    //     app.copyFence.WaitQueue(app.commandQueue.Get(), fenceEvent);
+    //     app.commandQueue->ExecuteCommandLists(_countof(ppCommandLists), ppCommandLists);
+    //     app.fence.SignalQueue(app.commandQueue.Get(), fenceEvent);
+    // }
+
+    progress->overallPercent = 0.6f;
 
     return resourceBuffers;
 }
@@ -774,6 +764,7 @@ PoolItem<Primitive> CreateModelPrimitive(
             view.StrideInBytes = assert_cast<UINT>(byteStride);
 
             if (view.BufferLocation + view.SizeInBytes > buffer->GetGPUVirtualAddress() + buffer->GetDesc().Width) {
+                // The Sponza scene seems to have an oddity mesh that goes out of bounds.
                 std::cout << "NO!!\n";
                 std::cout << "Mesh " << inputMesh.name << "\n";
                 std::cout << "Input element desc.AlignedByteOffset: " << desc.AlignedByteOffset << "\n";
@@ -829,6 +820,7 @@ PoolItem<Primitive> CreateModelPrimitive(
     if (inputPrimitive.material != -1) {
         auto& material = modelMaterials[inputPrimitive.material];
         primitive->material = material;
+        // FIXME: NO! I should not be creating a PSO for every single Primitive
         if (material->materialType == MaterialType_PBR) {
             primitive->PSO = CreateMeshPBRPSO(
                 app.psoManager,
@@ -936,6 +928,10 @@ void FinalizeModel(
     }
 
     ResolveMeshTransforms(inputModel, outputModel.meshes);
+
+    for (auto& mesh : outputModel.meshes) {
+        mesh->isReadyForRender = true;
+    }
 }
 
 // For the time being we cannot handle GLTF meshes without normals, tangents and UVs.
@@ -950,7 +946,7 @@ bool ValidateGLTFModel(const tinygltf::Model& model)
             bool hasTangents = primitive.attributes.contains("TANGENT");
             bool hasTexcoords = primitive.attributes.contains("TEXCOORD") || primitive.attributes.contains("TEXCOORD_0");
             if (!hasNormals || !hasTangents || !hasTexcoords) {
-                std::cout << "Model with mesh " << mesh.name << " is missing required vertex attributes and will be skipped\n";
+                DebugLog() << "Model with mesh " << mesh.name << " is missing required vertex attributes and will be skipped\n";
                 return false;
             }
         }
@@ -964,7 +960,7 @@ bool ValidateSkyboxAssets(const SkyboxAssets& assets)
     auto resourceDesc = GetImageResourceDesc(assets.images[0]);
     for (int i = 1; i < assets.images.size(); i++) {
         if (GetImageResourceDesc(assets.images[i]) != resourceDesc) {
-            std::cout << "Error: all skybox images must have the same image format and dimensions\n";
+            DebugLog() << "Error: all skybox images must have the same image format and dimensions\n";
             return false;
         }
     }
@@ -972,9 +968,11 @@ bool ValidateSkyboxAssets(const SkyboxAssets& assets)
     return true;
 }
 
-void RenderSkyboxDiffuseIrradianceMap(App& app, const SkyboxAssets& assets)
+void RenderSkyboxDiffuseIrradianceMap(App& app, const SkyboxAssets& assets, FenceEvent& cubemapUploadEvent, AssetLoadProgress* progress)
 {
     ScopedPerformanceTracker perf(__func__, PerformancePrecision::Milliseconds);
+
+    progress->currentTask = "Rendering diffuse irradiance map";
 
     if (app.graphicsAnalysis) {
         app.graphicsAnalysis->BeginCapture();
@@ -1052,9 +1050,20 @@ void RenderSkyboxDiffuseIrradianceMap(App& app, const SkyboxAssets& assets)
 
     Primitive* primitive = app.Skybox.mesh->primitives[0].get();
 
+    float beginPercent = progress->overallPercent;
+    float endPercent = 1.0f;
+
+    // FIXME: These are very intense draw calls and I'm playing a bit of a guessing game
+    // with the shader's `sampleDelta` value to avoid TDR. This could probably benefit from tiled
+    // rendering.
     for (int i = 0; i < CubeImage_Count; i++)
     {
+        progress->currentTask = "Diffuse Irradiance Image " + std::to_string(i);
+        progress->overallPercent = beginPercent + (((endPercent - beginPercent) / (float)CubeImage_Count) * (float)i);
+
         ASSERT_HRESULT(commandList->Reset(commandAllocator.Get(), PSO->Get()));
+
+        PIXBeginEvent(commandList.Get(), 0, ("CubeImage#" + std::to_string(i)).c_str());
 
         primitive->constantData->MVP = projection * viewMatrices[i];
         primitive->constantData->MV = viewMatrices[i];
@@ -1096,12 +1105,17 @@ void RenderSkyboxDiffuseIrradianceMap(App& app, const SkyboxAssets& assets)
             commandList->ResourceBarrier(1, &barrier);
         }
 
+        PIXEndEvent(commandList.Get());
+
         // FIXME: It would be better to not block here, and create commands for every face at once.
         // However that would require creating constant buffers for each skybox face.
         commandList->Close();
-        ID3D12CommandList* ppCommandLists[] = { commandList.Get() };
-        app.commandQueue->ExecuteCommandLists(_countof(ppCommandLists), ppCommandLists);
-        app.fence.SignalAndWait(app.commandQueue.Get());
+        {
+            std::lock_guard<std::mutex> lock(app.commandQueueMutex);
+            ID3D12CommandList* ppCommandLists[] = { commandList.Get() };
+            app.commandQueue->ExecuteCommandLists(_countof(ppCommandLists), ppCommandLists);
+            app.fence.SignalAndWait(app.commandQueue.Get());
+        }
     }
 
     app.rtvDescriptorArena.PopDescriptorStack(CubeImage_Count);
@@ -1125,11 +1139,14 @@ void RenderSkyboxDiffuseIrradianceMap(App& app, const SkyboxAssets& assets)
     }
 }
 
-void CreateSkybox(App& app, const SkyboxAssets& asset)
+void CreateSkybox(App& app, const SkyboxAssets& asset, AssetLoadProgress* progress)
 {
     if (!ValidateSkyboxAssets(asset)) {
         return;
     }
+
+    progress->currentTask = "Uploading cubemap";
+    progress->overallPercent = 0.15f;
 
     ComPtr<D3D12MA::Allocation> cubemap;
     ComPtr<D3D12MA::Allocation> vertexBuffer;
@@ -1286,7 +1303,8 @@ void CreateSkybox(App& app, const SkyboxAssets& asset)
     uploadBatch.AddBuffer(vertexBuffer->GetResource(), 0, vertexData, sizeof(vertexData));
     uploadBatch.AddBuffer(indexBuffer->GetResource(), 0, reinterpret_cast<void*>(indices), sizeof(indices));
 
-    uploadBatch.Finish();
+    auto cubemapUpload = uploadBatch.Finish();
+    app.copyFence.WaitCPU(cubemapUpload);
 
     PoolItem<Primitive> primitive = app.primitivePool.AllocateUnique();
     primitive->indexBufferView.BufferLocation = indexBuffer->GetResource()->GetGPUVirtualAddress();
@@ -1326,75 +1344,225 @@ void CreateSkybox(App& app, const SkyboxAssets& asset)
     app.Skybox.vertexBuffer = vertexBuffer;
     app.Skybox.perPrimitiveConstantBuffer = perPrimitiveBuffer;
 
-    RenderSkyboxDiffuseIrradianceMap(app, asset);
+    RenderSkyboxDiffuseIrradianceMap(app, asset, cubemapUpload, progress);
 
-    app.Skybox.mesh->primitives[0]->miscDescriptorParameter = app.Skybox.texcubeSRV;
+    Sleep(200);
+
+    app.Skybox.mesh->isReadyForRender = true;
 }
 
-void ProcessAssets(App& app, AssetBundle& assets)
+void LoadGLTFThread(App& app, const std::string& gltfFile, AssetLoadProgress* progress)
 {
-    ASSERT_HRESULT(app.commandList->Close());
+    tinygltf::TinyGLTF loader;
+    tinygltf::Model gltfModel;
+    std::string err;
+    std::string warn;
 
-    ASSERT_HRESULT(
-        app.commandAllocator->Reset()
+    progress->assetName = gltfFile;
+
+    progress->currentTask = "Loading GLTF file";
+    progress->overallPercent = 0.0f;
+
+    if (!loader.LoadASCIIFromFile(&gltfModel, &err, &warn, gltfFile)) {
+        DebugLog() << "Failed to load GLTF file " << gltfFile << ":\n";
+        DebugLog() << err << "\n";
+        return;
+    }
+    std::cout << warn << "\n";
+
+    if (!ValidateGLTFModel(gltfModel)) {
+        return;
+    }
+
+    std::vector<UINT64> uploadOffsets;
+
+    std::span<ComPtr<ID3D12Resource>> geometryBuffers;
+    std::span<ComPtr<ID3D12Resource>> textureBuffers;
+
+    Model model;
+
+    // FIXME: command lists and command allocators should be reused
+    ComPtr<ID3D12CommandAllocator> commandAllocator;
+    ASSERT_HRESULT(app.device->CreateCommandAllocator(
+        D3D12_COMMAND_LIST_TYPE_DIRECT,
+        IID_PPV_ARGS(&commandAllocator)
+    ));
+
+    ComPtr<ID3D12CommandAllocator> copyCommandAllocator;
+    ASSERT_HRESULT(app.device->CreateCommandAllocator(
+        D3D12_COMMAND_LIST_TYPE_COPY,
+        IID_PPV_ARGS(&copyCommandAllocator)
+    ));
+
+    ComPtr<ID3D12GraphicsCommandList> commandList;
+    ASSERT_HRESULT(app.device->CreateCommandList(
+        0,
+        D3D12_COMMAND_LIST_TYPE_DIRECT,
+        commandAllocator.Get(),
+        nullptr,
+        IID_PPV_ARGS(&commandList)
+    ));
+
+    ComPtr<ID3D12GraphicsCommandList> copyCommandList;
+    ASSERT_HRESULT(app.device->CreateCommandList(
+        0,
+        D3D12_COMMAND_LIST_TYPE_COPY,
+        copyCommandAllocator.Get(),
+        nullptr,
+        IID_PPV_ARGS(&copyCommandList)
+    ));
+
+    FenceEvent fenceEvent;
+
+    // Can only call this ONCE before command list executed
+    // This will need to be adapted to handle N models.
+    auto resourceBuffers = UploadModelBuffers(
+        model,
+        app,
+        gltfModel,
+        commandList.Get(),
+        copyCommandList.Get(),
+        copyCommandAllocator.Get(),
+        uploadOffsets,
+        geometryBuffers,
+        textureBuffers,
+        fenceEvent,
+        progress
     );
 
-    ASSERT_HRESULT(
-        app.commandList->Reset(app.commandAllocator.Get(), app.pipelineState.Get())
-    );
+    std::vector<SharedPoolItem<Material>> modelMaterials;
 
-    // TODO: easy candidate for multithreading
-    for (auto& gltfModel : assets.models) {
-        if (!ValidateGLTFModel(gltfModel)) {
-            continue;
+    progress->currentTask = "Finalizing";
+    CreateModelDescriptors(app, gltfModel, model, textureBuffers);
+    CreateModelMaterials(app, gltfModel, model, modelMaterials);
+    FinalizeModel(model, app, gltfModel, modelMaterials);
+
+    progress->overallPercent = 1.0f;
+
+    app.models.push_back(std::move(model));
+
+    app.copyFence.WaitCPU(fenceEvent);
+
+    progress->isFinished = true;
+}
+
+std::mutex g_assetMutex;
+
+void StartAssetThread(App& app)
+{
+    app.AssetThread.thread = std::thread(AssetLoadThread, std::ref(app));
+}
+
+void NotifyAssetThread(App& app)
+{
+    std::lock_guard<std::mutex> lock(g_assetMutex);
+    app.AssetThread.workEvent.notify_one();
+}
+
+void EnqueueGLTF(App& app, const std::string& filePath)
+{
+    std::lock_guard<std::mutex> lock(app.AssetThread.mutex);
+    app.AssetThread.gltfFilesToLoad.push_front(filePath);
+    NotifyAssetThread(app);
+}
+
+void EnqueueSkybox(App& app, const SkyboxImagePaths& assetPaths)
+{
+    std::lock_guard<std::mutex> lock(app.AssetThread.mutex);
+    app.AssetThread.skyboxToLoad = assetPaths;
+    NotifyAssetThread(app);
+}
+
+void LoadSkyboxThread(App& app, const SkyboxImagePaths& paths, AssetLoadProgress* progress)
+{
+    progress->assetName = paths.paths[0];
+    progress->currentTask = "Loading skybox images";
+
+    SkyboxAssets assets;
+    assets.images[CubeImage_Front] = LoadImageFile(paths.paths[CubeImage_Front]);
+    assets.images[CubeImage_Back] = LoadImageFile(paths.paths[CubeImage_Back]);
+    assets.images[CubeImage_Left] = LoadImageFile(paths.paths[CubeImage_Left]);
+    assets.images[CubeImage_Right] = LoadImageFile(paths.paths[CubeImage_Right]);
+    assets.images[CubeImage_Top] = LoadImageFile(paths.paths[CubeImage_Top]);
+    assets.images[CubeImage_Bottom] = LoadImageFile(paths.paths[CubeImage_Bottom]);
+    CreateSkybox(app, assets, progress);
+
+    progress->isFinished = true;
+}
+
+bool AreAssetsPendingLoad(const App& app)
+{
+    return !app.AssetThread.gltfFilesToLoad.empty() || app.AssetThread.skyboxToLoad.has_value();
+}
+
+template<class... Args>
+void StartLoadThread(App& app, std::vector<std::thread>& loadThreads, Args... args)
+{
+    // If one of the previous load threads finished, use it
+    for (int i = 0; i < app.AssetThread.assetLoadInfo.size(); i++) {
+        if (app.AssetThread.assetLoadInfo[i]->isFinished) {
+            app.AssetThread.assetLoadInfo[i] = std::unique_ptr<AssetLoadProgress>(new AssetLoadProgress);
+            loadThreads[i].join();
+            loadThreads[i] = std::thread(
+                args...,
+                app.AssetThread.assetLoadInfo[i].get()
+            );
+            return;
+        }
+    }
+
+    // otherwise allocate a new thread
+    app.AssetThread.assetLoadInfo.emplace_back(new AssetLoadProgress);
+    AssetLoadProgress* progress = app.AssetThread.assetLoadInfo.back().get();
+    loadThreads.emplace_back(
+        args...,
+        progress
+    );
+}
+
+void AssetLoadThread(App& app)
+{
+    std::vector<std::thread> loadThreads;
+
+    while (app.running)
+    {
+        std::unique_lock<std::mutex> lock(g_assetMutex);
+        while (!AreAssetsPendingLoad(app) && app.running) { app.AssetThread.workEvent.wait(lock); };
+
+        // When the program quits the app will notify the asset thread
+        if (!app.running) {
+            for (auto& thread : loadThreads) {
+                thread.join();
+            }
+
+            break;
         }
 
-        std::vector<UINT64> uploadOffsets;
+        if (app.AssetThread.skyboxToLoad.has_value()) {
+            StartLoadThread(
+                app,
+                loadThreads,
+                // I have absolutely no idea why this God forsaken cast is necessary
+                static_cast<void(*)(App&, const SkyboxImagePaths&, AssetLoadProgress*)>(LoadSkyboxThread),
+                std::ref(app),
+                app.AssetThread.skyboxToLoad.value()
+            );
+        }
+        app.AssetThread.skyboxToLoad = {};
 
-        std::span<ComPtr<ID3D12Resource>> geometryBuffers;
-        std::span<ComPtr<ID3D12Resource>> textureBuffers;
+        while (!app.AssetThread.gltfFilesToLoad.empty()) {
+            auto gltfFile = app.AssetThread.gltfFilesToLoad.front();
+            app.AssetThread.gltfFilesToLoad.pop_front();
 
-        Model model;
+            StartLoadThread(
+                app,
+                loadThreads,
+                LoadGLTFThread,
+                std::ref(app),
+                gltfFile
+            );
+        }
 
-        // Can only call this ONCE before command list executed
-        // This will need to be adapted to handle N models.
-        auto resourceBuffers = UploadModelBuffers(
-            model,
-            app,
-            gltfModel,
-            uploadOffsets,
-            geometryBuffers,
-            textureBuffers
-        );
-
-        std::vector<SharedPoolItem<Material>> modelMaterials;
-
-        CreateModelDescriptors(app, gltfModel, model, textureBuffers);
-        CreateModelMaterials(app, gltfModel, model, modelMaterials);
-        FinalizeModel(model, app, gltfModel, modelMaterials);
-
-        app.models.push_back(std::move(model));
-
-        ASSERT_HRESULT(app.commandList->Close());
-
-        ID3D12CommandList* ppCommandLists[] = { app.commandList.Get() };
-        app.commandQueue->ExecuteCommandLists(1, ppCommandLists);
-        app.fence.SignalAndWait(app.commandQueue.Get());
-
-        ASSERT_HRESULT(
-            app.commandAllocator->Reset()
-        );
-
-        ASSERT_HRESULT(
-            app.commandList->Reset(app.commandAllocator.Get(), app.pipelineState.Get())
-        );
+        lock.unlock();
     }
-
-    if (assets.skybox.has_value()) {
-        CreateSkybox(app, assets.skybox.value());
-    }
-
-    ASSERT_HRESULT(
-        app.commandList->Close()
-    );
 }

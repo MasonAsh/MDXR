@@ -4,55 +4,108 @@
 
 using namespace Microsoft::WRL;
 
-struct IncrementalFence {
-    ComPtr<ID3D12Fence> fence;
-    UINT64 targetFenceValue;
-    UINT64 nextFenceValue;
-    HANDLE event;
+class FenceEvent
+{
+public:
+    friend class IncrementalFence;
 
+    FenceEvent()
+        : fenceValue(UINT64_MAX)
+    {
+    }
+
+    FenceEvent(UINT64 fenceValue)
+        : fenceValue(fenceValue)
+    {
+    }
+
+    void TrackObject(IUnknown* resource)
+    {
+        trackedObjects.push_back(resource);
+    }
+
+    UINT64 fenceValue;
+    std::vector<ComPtr<IUnknown>> trackedObjects;
+
+#if MDXR_DEBUG
+    // Used by IncrementalFence to assert that waits are done on the
+    // same fence that created the event
+    IncrementalFence* sourceFence;
+#endif
+};
+
+class IncrementalFence
+{
+public:
     void Initialize(ID3D12Device* device)
     {
-        targetFenceValue = 0;
         ASSERT_HRESULT(
             device->CreateFence(
-                targetFenceValue,
+                0,
                 D3D12_FENCE_FLAG_NONE,
                 IID_PPV_ARGS(&fence)
             )
         );
-        nextFenceValue = targetFenceValue + 1;
-
-        event = CreateEvent(nullptr, false, false, nullptr);
-        if (event == nullptr) {
-            ASSERT_HRESULT(
-                HRESULT_FROM_WIN32(
-                    GetLastError()
-                )
-            );
-        }
+        nextFenceValue = 1;
     }
 
-    void Signal(ID3D12CommandQueue* commandQueue)
+    void SignalQueue(ID3D12CommandQueue* commandQueue, FenceEvent& event)
     {
-        CHECK(IsFinished());
         // Signal and increment the fence value.
-        targetFenceValue = nextFenceValue;
+        UINT64 targetFenceValue = nextFenceValue;
         ASSERT_HRESULT(
             commandQueue->Signal(fence.Get(), targetFenceValue)
         );
         nextFenceValue++;
+
+        event.fenceValue = targetFenceValue;
+#if MDXR_DEBUG
+        event.sourceFence = this;
+#endif
     }
 
-    void Wait(ID3D12CommandQueue* commandQueue)
+    void WaitQueue(ID3D12CommandQueue* commandQueue, FenceEvent& event)
     {
+#if MDXR_DEBUG
+        assert(event.sourceFence == this);
+#endif
+
+        if (event.fenceValue == UINT64_MAX) {
+            return;
+        }
+
+        if (fence->GetCompletedValue() >= event.fenceValue) {
+            return;
+        }
+
+        commandQueue->Wait(fence.Get(), event.fenceValue);
+    }
+
+    void WaitCPU(FenceEvent& event)
+    {
+#if MDXR_DEBUG
+        assert(event.sourceFence == this);
+#endif
         // Wait until the previous frame is finished.
-        if (fence->GetCompletedValue() < targetFenceValue)
+        if (fence->GetCompletedValue() < event.fenceValue)
         {
+            // Not a fan of creating an event here, but probably not a big deal
+            HANDLE cpuWaitEvent = CreateEvent(nullptr, false, false, nullptr);
+            if (cpuWaitEvent == nullptr) {
+                ASSERT_HRESULT(
+                    HRESULT_FROM_WIN32(
+                        GetLastError()
+                    )
+                );
+            }
+
             ASSERT_HRESULT(
-                fence->SetEventOnCompletion(targetFenceValue, event)
+                fence->SetEventOnCompletion(event.fenceValue, cpuWaitEvent)
             );
 
-            WaitForSingleObject(event, INFINITE);
+            WaitForSingleObject(cpuWaitEvent, INFINITE);
+
+            CloseHandle(cpuWaitEvent);
         }
     }
 
@@ -63,7 +116,14 @@ struct IncrementalFence {
 
     void SignalAndWait(ID3D12CommandQueue* commandQueue)
     {
-        Signal(commandQueue);
-        Wait(commandQueue);
+        FenceEvent fenceEvent;
+        SignalQueue(commandQueue, fenceEvent);
+        WaitCPU(fenceEvent);
     }
+
+private:
+    ComPtr<ID3D12Fence> fence;
+    UINT64 targetFenceValue;
+    UINT64 nextFenceValue;
+    HANDLE cpuWaitEvent;
 };

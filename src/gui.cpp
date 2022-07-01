@@ -264,8 +264,7 @@ void DrawMenuBar(App& app)
                 if (gltfFile != nullptr) {
                     AssetBundle assets;
                     tinygltf::TinyGLTF loader;
-                    LoadModelAsset(assets, loader, gltfFile);
-                    ProcessAssets(app, assets);
+                    EnqueueGLTF(app, gltfFile);
                 }
             }
             ImGui::EndMenu();
@@ -285,6 +284,7 @@ void DrawMenuBar(App& app)
             ImGui::Checkbox("Meshes", &app.ImGui.meshesOpen);
             ImGui::Checkbox("Materials", &app.ImGui.materialsOpen);
             ImGui::Checkbox("Geek Menu", &app.ImGui.geekOpen);
+            ImGui::Checkbox("ImGui Demo Window", &app.ImGui.demoOpen);
             ImGui::Checkbox("Show stats", &app.ImGui.showStats);
             ImGui::EndMenu();
         }
@@ -301,13 +301,25 @@ void DrawGeekMenu(App& app)
     if (ImGui::Begin("Geek Menu", &app.ImGui.geekOpen)) {
         static bool debugSkybox = false;
         if (ImGui::Checkbox("Debug Diffuse IBL", &debugSkybox)) {
-            app.Skybox.mesh->primitives[0]->miscDescriptorParameter =
-                debugSkybox ? app.Skybox.irradianceCubeSRV : app.Skybox.texcubeSRV;
+            if (app.Skybox.mesh && app.Skybox.mesh->isReadyForRender) {
+                app.Skybox.mesh->primitives[0]->miscDescriptorParameter =
+                    debugSkybox ? app.Skybox.irradianceCubeSRV : app.Skybox.texcubeSRV;
+            }
         }
 
         float degreesFOV = glm::degrees(app.camera.fovY);
         ImGui::DragFloat("Camera FOVy Degrees", &degreesFOV, 0.05f, 0.01f, 180.0f);
         app.camera.fovY = glm::radians(degreesFOV);
+
+        for (const auto& loadInfo : app.AssetThread.assetLoadInfo) {
+            if (loadInfo->isFinished) {
+                continue;
+            }
+            ImGui::Text("Loading %s %c", loadInfo->assetName.c_str(), "|/-\\"[(int)(ImGui::GetTime() / 0.05f) & 3]);
+            ImGui::Indent();
+            ImGui::Text("%f%% %s", loadInfo->overallPercent * 100.0f, loadInfo->currentTask.c_str());
+            ImGui::Unindent();
+        }
     }
 
     ImGui::End();
@@ -325,4 +337,8 @@ void BeginGUI(App& app)
     DrawStats(app);
     DrawMenuBar(app);
     DrawGeekMenu(app);
+
+    if (app.ImGui.demoOpen) {
+        ImGui::ShowDemoWindow(&app.ImGui.demoOpen);
+    }
 }

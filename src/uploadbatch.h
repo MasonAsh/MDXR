@@ -81,6 +81,7 @@ public:
                 &allocation,
                 &offset))) {
                 Flush();
+                Wait();
 
                 // This *should* work 100%, as we've made sure we're not uploading >
                 // uploadBufferSize at once at this point.
@@ -125,6 +126,7 @@ public:
         // it will get split in recurse calls.
         if (numBytes > uploadBufferSize) {
             Flush();
+            Wait();
             UINT64 leftoverBytes = numBytes - uploadBufferSize;
             AddBuffer(destinationResource, destOffset, srcData, uploadBufferSize);
             AddBuffer(destinationResource, destOffset + uploadBufferSize, srcData, leftoverBytes);
@@ -141,6 +143,7 @@ public:
             &allocation,
             &offset))) {
             Flush();
+            Wait();
 
             // This *should* work 100%, as we've made sure we're not uploading >
             // uploadBufferSize at once at this point.
@@ -163,23 +166,34 @@ public:
         );
     }
 
-    void Finish()
+    FenceEvent Finish()
     {
         Flush();
 
         ASSERT_HRESULT(commandList->Close());
+
+        uploadFenceEvent.TrackObject(uploadBuffer->GetResource());
+        return uploadFenceEvent;
     }
 private:
     void Flush()
     {
         commandList->Close();
         ID3D12CommandList* ppCommandLists[] = { commandList.Get() };
+        fence->WaitQueue(commandQueue, uploadFenceEvent);
         commandQueue->ExecuteCommandLists(1, ppCommandLists);
-        this->fence->SignalAndWait(commandQueue);
+        fence->SignalQueue(commandQueue, uploadFenceEvent);
         virtualBlock->Clear();
 
         ASSERT_HRESULT(commandList->Reset(commandAllocator.Get(), nullptr));
     }
+
+    void Wait()
+    {
+        fence->WaitCPU(uploadFenceEvent);
+    }
+
+    FenceEvent uploadFenceEvent;
 
     ID3D12CommandQueue* commandQueue;
     ComPtr<ID3D12CommandAllocator> commandAllocator;

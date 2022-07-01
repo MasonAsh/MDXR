@@ -2,8 +2,10 @@
 
 #include <memory>
 #include <vector>
+#include <mutex>
 
-namespace internal {
+namespace internal
+{
     template<typename T>
     struct PoolItemDeleter;
 
@@ -12,6 +14,7 @@ namespace internal {
         T* items;
         bool* liveItems;
         size_t* firstFreeIndex;
+        std::mutex* mutex;
     };
 };
 
@@ -23,12 +26,14 @@ template<typename T>
 using SharedPoolItem = std::shared_ptr<T>;
 
 template<typename T, size_t N>
-class PoolBlock {
+class PoolBlock
+{
 public:
     PoolBlock() : liveItems{ false }, deleterContext(new internal::PoolItemDeleterContext<T>) {
         deleterContext->items = items;
         deleterContext->liveItems = liveItems.data();
         deleterContext->firstFreeIndex = &firstFreeIndex;
+        deleterContext->mutex = &mutex;
     }
 
     ~PoolBlock() {
@@ -85,6 +90,8 @@ private:
     template<typename... Args>
     T* Allocate(Args... constructorArgs)
     {
+        std::lock_guard<std::mutex> lock(mutex);
+
         assert(firstFreeIndex == SIZE_MAX || !liveItems[firstFreeIndex]);
         if (firstFreeIndex == SIZE_MAX) {
             return nullptr;
@@ -115,6 +122,8 @@ private:
     size_t firstFreeIndex = 0;
 
     std::shared_ptr<internal::PoolItemDeleterContext<T>> deleterContext;
+
+    std::mutex mutex;
 };
 
 namespace internal {
@@ -132,6 +141,8 @@ namespace internal {
 
         void operator()(T* item) {
             if (auto lock = context.lock()) {
+                std::lock_guard<std::mutex> guard(*(lock->mutex));
+
                 size_t index = item - lock->items;
                 if (!lock->liveItems[index]) {
                     return;

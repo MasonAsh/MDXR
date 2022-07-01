@@ -32,7 +32,7 @@ float4 PSMain(PSInput input) : SV_TARGET0
 {
     TextureCube skybox = GetSkyboxTexture();
 
-    float sampleDelta = 0.02;
+    float sampleDelta = 0.05;
 
     float sampleCount = 0;
 

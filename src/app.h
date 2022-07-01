@@ -22,6 +22,7 @@
 
 #include <span>
 #include <string>
+#include <deque>
 
 const UINT FrameBufferCount = 2;
 const UINT MaxLightCount = 64;
@@ -29,13 +30,30 @@ const UINT MaxMaterialCount = 2048;
 const UINT MaxDescriptors = 4096;
 const DXGI_FORMAT DepthFormat = DXGI_FORMAT_D32_FLOAT;
 
-enum ConstantIndex {
+enum ConstantIndex
+{
     ConstantIndex_PrimitiveData,
     ConstantIndex_MaterialData,
     ConstantIndex_Light,
     ConstantIndex_LightPassData,
     ConstantIndex_MiscParameter,
     ConstantIndex_Count
+};
+
+enum CubeImageIndex
+{
+    CubeImage_Right,
+    CubeImage_Left,
+    CubeImage_Top,
+    CubeImage_Bottom,
+    CubeImage_Front,
+    CubeImage_Back,
+    CubeImage_Count, // The amount of faces in a cube may fluctuate in the future
+};
+
+struct SkyboxImagePaths
+{
+    std::array<std::string, CubeImage_Count> paths;
 };
 
 struct PerPrimitiveConstantData
@@ -184,6 +202,8 @@ struct Mesh
     glm::vec3 scale = glm::vec3(1.0f);
 
     std::string name;
+
+    bool isReadyForRender = false;
 };
 
 struct Model
@@ -222,6 +242,7 @@ struct DescriptorArena
     UINT descriptorIncrementSize;
     std::string debugName;
     DescriptorRef stackPtr;
+    std::mutex mutex;
 
     // Temporary descriptors can be allocated from the right side of the heap
     UINT stack;
@@ -250,8 +271,10 @@ struct DescriptorArena
 
     DescriptorRef AllocateDescriptors(UINT count, const char* debugName)
     {
+        std::lock_guard<std::mutex> lock(mutex);
+
         if (debugName != nullptr) {
-            std::cout << this->debugName << " allocation info: " <<
+            DebugLog() << this->debugName << " allocation info: " <<
                 "\n\tIndex: " << this->size <<
                 "\n\tCount: " << count <<
                 "\n\tReason: " << debugName << "\n";
@@ -259,7 +282,7 @@ struct DescriptorArena
         DescriptorRef reference(descriptorHeap.Get(), size, descriptorIncrementSize);
         size += count;
         if (size + stack > capacity) {
-            std::cerr << "Error: descriptor heap is not large enough\n";
+            DebugLog() << "Error: descriptor heap is not large enough\n";
             abort();
         }
         return reference;
@@ -269,6 +292,8 @@ struct DescriptorArena
     // These descriptors are allocated from the opposite side of the heap.
     DescriptorRef PushDescriptorStack(UINT count)
     {
+        std::lock_guard<std::mutex> lock(mutex);
+
         if (size + (capacity - stackPtr.index) + count > capacity) {
             std::cerr << "Error: descriptor heap is not large enough\n";
             abort();
@@ -282,6 +307,8 @@ struct DescriptorArena
     // Pops temporary descriptors from stack
     void PopDescriptorStack(UINT count)
     {
+        std::lock_guard<std::mutex> lock(mutex);
+
         stackPtr.index += count;
     }
 };
@@ -461,6 +488,14 @@ struct Light
     }
 };
 
+struct AssetLoadProgress {
+    std::string assetName;
+    std::string currentTask;
+    float overallPercent;
+
+    std::atomic<bool> isFinished{ false };
+};
+
 struct App
 {
     std::string dataDir;
@@ -495,6 +530,7 @@ struct App
 
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12CommandQueue> commandQueue;
+    std::mutex commandQueueMutex;
     ComPtr<ID3D12CommandAllocator> commandAllocator;
     ComPtr<IDXGISwapChain3> swapChain;
     ComPtr<ID3D12Resource> renderTargets[FrameBufferCount];
@@ -508,6 +544,7 @@ struct App
 
     ComPtr<ID3D12CommandQueue> computeQueue;
     ComPtr<ID3D12CommandAllocator> computeCommandAllocator;
+    IncrementalFence computeFence;
 
     ComPtr<ID3D12Resource> depthStencilBuffer;
     ComPtr<ID3D12DescriptorHeap> dsHeap;
@@ -538,6 +575,7 @@ struct App
         bool meshesOpen = true;
         bool materialsOpen = false;
         bool geekOpen = true;
+        bool demoOpen = false;
         bool showStats = true;
     } ImGui;
 
@@ -601,4 +639,16 @@ struct App
     } MipMapGenerator;
 
     ComPtr<IDXGraphicsAnalysis> graphicsAnalysis;
+
+    struct
+    {
+        std::deque<std::string> gltfFilesToLoad;
+        std::optional<SkyboxImagePaths> skyboxToLoad;
+
+        std::vector<std::unique_ptr<AssetLoadProgress>> assetLoadInfo;
+
+        std::mutex mutex;
+        std::thread thread;
+        std::condition_variable workEvent;
+    } AssetThread;
 };

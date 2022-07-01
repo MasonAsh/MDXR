@@ -5,6 +5,7 @@
 #include "d3dutils.h"
 
 #include <directx/d3dx12.h>
+#include <pix3.h>
 
 void SetupCubemapData(App& app)
 {
@@ -61,21 +62,28 @@ void SetupDepthStencil(App& app, bool isResize)
     );
 }
 
-void SetupRenderTargets(App& app)
+void SetupRenderTargets(App& app, bool isResize)
 {
-    auto frameBufferDescriptor = app.rtvDescriptorArena.AllocateDescriptors(FrameBufferCount, "FrameBuffer RTVs");
+    DescriptorRef frameBufferDescriptor;
+    if (!isResize) {
+        frameBufferDescriptor = app.rtvDescriptorArena.AllocateDescriptors(FrameBufferCount, "FrameBuffer RTVs");
+    }
+
     for (int i = 0; i < FrameBufferCount; i++) {
         ASSERT_HRESULT(
             app.swapChain->GetBuffer(i, IID_PPV_ARGS(&app.renderTargets[i]))
         );
 
-        app.frameBufferRTVs[i] = (frameBufferDescriptor + i);
+        if (!isResize) {
+            app.frameBufferRTVs[i] = (frameBufferDescriptor + i);
+        }
         app.device->CreateRenderTargetView(app.renderTargets[i].Get(), nullptr, app.frameBufferRTVs[i].CPUHandle());
     }
 }
 
 void SetupGBuffer(App& app, bool isResize)
 {
+    DescriptorRef rtvs;
     if (!isResize) {
         // Create SRV heap for the render targets
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
@@ -84,14 +92,16 @@ void SetupGBuffer(App& app, bool isResize)
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         //app.lightingPassDescriptorArena.Initialize(app.device.Get(), heapDesc, "LightPassArena");
         app.GBuffer.baseSrvReference = app.descriptorArena.AllocateDescriptors(GBuffer_Count, "GBuffer SRVs");
+        rtvs = app.rtvDescriptorArena.AllocateDescriptors(GBuffer_RTVCount, "GBuffer RTVs");
     } else {
         // If we're resizing then we need to release existing gbuffer
         for (auto& renderTarget : app.GBuffer.renderTargets) {
             renderTarget = nullptr;
         }
+
+        rtvs = app.GBuffer.rtvs[0];
     }
 
-    DescriptorRef rtvs = app.rtvDescriptorArena.AllocateDescriptors(GBuffer_RTVCount, "GBuffer RTVs");
     auto rtvHandle = rtvs.CPUHandle();
     CD3DX12_CPU_DESCRIPTOR_HANDLE srvHandle = app.GBuffer.baseSrvReference.CPUHandle();
     for (int i = 0; i < GBuffer_Depth; i++) {
@@ -156,7 +166,7 @@ void HandleResize(App& app, int newWidth, int newHeight)
     app.windowHeight = newHeight;
     app.scissorRect = CD3DX12_RECT(0, 0, static_cast<LONG>(newWidth), static_cast<LONG>(newHeight));
 
-    SetupRenderTargets(app);
+    SetupRenderTargets(app, true);
     SetupDepthStencil(app, true);
     SetupGBuffer(app, true);
 
@@ -392,8 +402,8 @@ void InitD3D(App& app)
         ComPtr<ID3D12Debug> debugController;
         if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debugController)))) {
             debugController->EnableDebugLayer();
-			ComPtr<ID3D12Debug1> debugController1;
-			ASSERT_HRESULT(debugController->QueryInterface(IID_PPV_ARGS(&debugController1)));
+            ComPtr<ID3D12Debug1> debugController1;
+            ASSERT_HRESULT(debugController->QueryInterface(IID_PPV_ARGS(&debugController1)));
             if (debugController1) {
                 debugController1->SetEnableGPUBasedValidation(true);
             }
@@ -404,10 +414,9 @@ void InitD3D(App& app)
         ComPtr<ID3D12DeviceRemovedExtendedDataSettings> pDredSettings;
         D3D12GetDebugInterface(IID_PPV_ARGS(&pDredSettings));
         if (pDredSettings) {
-			pDredSettings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-			pDredSettings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-        }
-        else {
+            pDredSettings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            pDredSettings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+        } else {
             std::cout << "Failed to load DRED\n";
         }
 
@@ -433,11 +442,10 @@ void InitD3D(App& app)
         ComPtr<ID3D12InfoQueue> infoQueue;
         app.device->QueryInterface(IID_PPV_ARGS(&infoQueue));
         if (infoQueue) {
-			infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, true);
-			infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, true);
-			infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, false);
-        }
-        else {
+            infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, true);
+            infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, true);
+            infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, false);
+        } else {
             std::cout << "Failed to set info queue breakpoints\n";
         }
     }
@@ -525,7 +533,7 @@ void InitD3D(App& app)
     G_IncrementSizes.CbvSrvUav = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     G_IncrementSizes.Rtv = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
-    SetupRenderTargets(app);
+    SetupRenderTargets(app, false);
     SetupDepthStencil(app, false);
 
     SetupGBufferPass(app);
@@ -580,12 +588,14 @@ void InitD3D(App& app)
             )
         );
 
+        ASSERT_HRESULT(app.commandList->Close());
         ASSERT_HRESULT(app.copyCommandList->Close());
     }
 
     {
         app.fence.Initialize(app.device.Get());
         app.copyFence.Initialize(app.device.Get());
+        app.computeFence.Initialize(app.device.Get());
     }
 
     SetupCubemapData(app);
@@ -638,6 +648,11 @@ void UpdatePerPrimitiveConstantBuffers(App& app, const glm::mat4& projection, co
     auto meshIter = app.meshPool.Begin();
 
     while (meshIter) {
+        // Diffuse irradiance uses the primitive constant buffer before its ready to render
+        if (!meshIter->isReadyForRender) {
+            continue;
+        }
+
         auto& mesh = meshIter.item;
 
         auto modelMatrix = ApplyStandardTransforms(
@@ -678,6 +693,11 @@ void DrawMeshesGBuffer(App& app, ID3D12GraphicsCommandList* commandList)
     auto meshIter = app.meshPool.Begin();
 
     while (meshIter) {
+        if (!meshIter->isReadyForRender) {
+            meshIter = app.meshPool.Next(meshIter);
+            continue;
+        }
+
         for (const auto& primitive : meshIter->primitives) {
             const auto& material = primitive->material.get();
             // FIXME: if I am not lazy I will SORT by material type
@@ -712,6 +732,11 @@ void DrawAlphaBlendedMeshes(App& app, ID3D12GraphicsCommandList* commandList)
     // FIXME: This seems like a bad looping order..
     while (meshIter) {
         auto& mesh = meshIter.item;
+        if (!mesh->isReadyForRender) {
+            meshIter = app.meshPool.Next(meshIter);
+            continue;
+        }
+
         for (const auto& primitive : mesh->primitives) {
             auto material = primitive->material.get();
             // FIXME: if I am not lazy I will SORT by material type
@@ -927,9 +952,11 @@ void RenderFrame(App& app)
     bool tdrOccurred = false;
     BuildCommandList(app);
 
-    ID3D12CommandList* ppCommandLists[] = { app.commandList.Get() };
-    app.commandQueue->ExecuteCommandLists(_countof(ppCommandLists), ppCommandLists);
-
+    {
+        std::lock_guard<std::mutex> lock(app.commandQueueMutex);
+        ID3D12CommandList* ppCommandLists[] = { app.commandList.Get() };
+        app.commandQueue->ExecuteCommandLists(_countof(ppCommandLists), ppCommandLists);
+    }
 
     HRESULT hr = app.swapChain->Present(0, DXGI_PRESENT_ALLOW_TEARING);
     if (!SUCCEEDED(hr)) {
