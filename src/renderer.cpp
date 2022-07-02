@@ -459,38 +459,9 @@ void InitD3D(App& app)
 
     PrintCapabilities(device, adapter.Get());
 
-    // Graphics command queue
-    {
-        D3D12_COMMAND_QUEUE_DESC queueDesc = {};
-        queueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
-        queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-
-        ASSERT_HRESULT(
-            device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&app.commandQueue))
-        );
-    }
-
-    // Copy command queue
-    {
-        D3D12_COMMAND_QUEUE_DESC queueDesc = {};
-        queueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
-        queueDesc.Type = D3D12_COMMAND_LIST_TYPE_COPY;
-
-        ASSERT_HRESULT(
-            device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&app.copyCommandQueue))
-        );
-    }
-
-    // Compute command queue
-    {
-        D3D12_COMMAND_QUEUE_DESC queueDesc = {};
-        queueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
-        queueDesc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
-
-        ASSERT_HRESULT(
-            device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&app.computeQueue))
-        );
-    }
+    app.graphicsQueue.Initialize(device, D3D12_COMMAND_LIST_TYPE_DIRECT);
+    app.copyQueue.Initialize(device, D3D12_COMMAND_LIST_TYPE_COPY);
+    app.computeQueue.Initialize(device, D3D12_COMMAND_LIST_TYPE_COMPUTE);
 
     {
         DXGI_SWAP_CHAIN_DESC swapChainDesc = {};
@@ -508,7 +479,7 @@ void InitD3D(App& app)
         ComPtr<IDXGISwapChain> swapChain;
         ASSERT_HRESULT(
             dxgiFactory->CreateSwapChain(
-                app.commandQueue.Get(),
+                app.graphicsQueue.GetInternal(),
                 &swapChainDesc,
                 &swapChain
             )
@@ -592,12 +563,6 @@ void InitD3D(App& app)
         ASSERT_HRESULT(app.copyCommandList->Close());
     }
 
-    {
-        app.fence.Initialize(app.device.Get());
-        app.copyFence.Initialize(app.device.Get());
-        app.computeFence.Initialize(app.device.Get());
-    }
-
     SetupCubemapData(app);
 }
 
@@ -628,18 +593,6 @@ void CreateGPUBufferWithData(
 
     memcpy(dataPtr, inData, dataSize);
 }
-
-void WaitForPreviousFrame(App& app)
-{
-    // WAITING FOR THE FRAME TO COMPLETE BEFORE CONTINUING IS NOT BEST PRACTICE.
-    // This is code implemented as such for simplicity. More advanced samples 
-    // illustrate how to use fences for efficient resource usage.
-
-    app.fence.SignalAndWait(app.commandQueue.Get());
-
-    app.frameIdx = app.swapChain->GetCurrentBackBufferIndex();
-}
-
 
 void UpdatePerPrimitiveConstantBuffers(App& app, const glm::mat4& projection, const glm::mat4& view)
 {
@@ -952,18 +905,23 @@ void RenderFrame(App& app)
     bool tdrOccurred = false;
     BuildCommandList(app);
 
-    {
-        std::lock_guard<std::mutex> lock(app.commandQueueMutex);
-        ID3D12CommandList* ppCommandLists[] = { app.commandList.Get() };
-        app.commandQueue->ExecuteCommandLists(_countof(ppCommandLists), ppCommandLists);
-    }
+    FenceEvent renderEvent;
 
-    HRESULT hr = app.swapChain->Present(0, DXGI_PRESENT_ALLOW_TEARING);
-    if (!SUCCEEDED(hr)) {
-        tdrOccurred = true;
-        app.running = false;
-        std::cout << "TDR occurred\n";
-    }
+    // FIXME: multithreading
+    app.graphicsQueue.ExecuteCommandListsAndPresentBlocking({ app.commandList.Get() }, app.swapChain.Get(), 0, DXGI_PRESENT_ALLOW_TEARING);
 
-    WaitForPreviousFrame(app);
+    // HRESULT hr = app.swapChain->Present(0, DXGI_PRESENT_ALLOW_TEARING);
+    // if (!SUCCEEDED(hr)) {
+    //     tdrOccurred = true;
+    //     app.running = false;
+    //     std::cout << "TDR occurred\n";
+    // }
+
+    app.graphicsQueue.WaitForEventCPU(renderEvent);
+
+    app.frameIdx = app.swapChain->GetCurrentBackBufferIndex();
+}
+
+void EnsureRenderingFinished(App& app)
+{
 }

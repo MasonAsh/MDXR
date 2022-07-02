@@ -57,6 +57,7 @@ add_executable(mdxr WIN32
     src/gui.cpp
     src/renderer.h
     src/renderer.cpp
+    src/commandqueue.h
 
     # third party
     thirdparty/tiny_gltf_impl.cpp

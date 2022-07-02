@@ -1,6 +1,8 @@
 #pragma once
 
 #include "util.h"
+#include "commandqueue.h"
+
 #include <D3D12MemAlloc.h>
 #include <directx/d3dx12.h>
 
@@ -11,13 +13,12 @@ public:
 
     // Begins an upload batch.
     // The batch has full control of the command queue during this time.
-    void Begin(D3D12MA::Allocator* allocator, ID3D12CommandQueue* commandQueue, IncrementalFence* fence)
+    void Begin(D3D12MA::Allocator* allocator, CommandQueue* commandQueue)
     {
         this->allocator = allocator;
-        this->fence = fence;
         this->commandQueue = commandQueue;
 
-        commandQueue->GetDevice(IID_PPV_ARGS(&device));
+        commandQueue->GetInternal()->GetDevice(IID_PPV_ARGS(&device));
         device->Release();
 
         device->CreateCommandAllocator(
@@ -179,10 +180,7 @@ private:
     void Flush()
     {
         commandList->Close();
-        ID3D12CommandList* ppCommandLists[] = { commandList.Get() };
-        fence->WaitQueue(commandQueue, uploadFenceEvent);
-        commandQueue->ExecuteCommandLists(1, ppCommandLists);
-        fence->SignalQueue(commandQueue, uploadFenceEvent);
+        commandQueue->ExecuteCommandLists({ commandList.Get() }, uploadFenceEvent, uploadFenceEvent);
         virtualBlock->Clear();
 
         ASSERT_HRESULT(commandList->Reset(commandAllocator.Get(), nullptr));
@@ -190,16 +188,15 @@ private:
 
     void Wait()
     {
-        fence->WaitCPU(uploadFenceEvent);
+        commandQueue->WaitForEventCPU(uploadFenceEvent);
     }
 
     FenceEvent uploadFenceEvent;
 
-    ID3D12CommandQueue* commandQueue;
+    CommandQueue* commandQueue;
     ComPtr<ID3D12CommandAllocator> commandAllocator;
 
     ComPtr<ID3D12GraphicsCommandList> commandList;
-    IncrementalFence* fence;
 
     ComPtr<D3D12MA::Allocation> uploadBuffer;
     UINT64 uploadBufferSize;

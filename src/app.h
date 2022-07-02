@@ -4,6 +4,7 @@
 #include "pso.h"
 #include "pool.h"
 #include "incrementalfence.h"
+#include "commandqueue.h"
 
 #include <SDL.h>
 
@@ -537,8 +538,7 @@ struct App
     ConstantBufferArena<MaterialConstantData> materialConstantBuffer;
 
     ComPtr<ID3D12Device> device;
-    ComPtr<ID3D12CommandQueue> commandQueue;
-    std::mutex commandQueueMutex;
+    CommandQueue graphicsQueue;
     ComPtr<ID3D12CommandAllocator> commandAllocator;
     ComPtr<IDXGISwapChain3> swapChain;
     ComPtr<ID3D12Resource> renderTargets[FrameBufferCount];
@@ -550,21 +550,17 @@ struct App
 
     DescriptorArena rtvDescriptorArena;
 
-    ComPtr<ID3D12CommandQueue> computeQueue;
+    CommandQueue computeQueue;
     ComPtr<ID3D12CommandAllocator> computeCommandAllocator;
-    IncrementalFence computeFence;
 
     ComPtr<ID3D12Resource> depthStencilBuffer;
     ComPtr<ID3D12DescriptorHeap> dsHeap;
 
-    IncrementalFence fence;
-
     tinygltf::TinyGLTF loader;
 
-    ComPtr<ID3D12CommandQueue> copyCommandQueue;
+    CommandQueue copyQueue;
     ComPtr<ID3D12CommandAllocator> copyCommandAllocator;
     ComPtr<ID3D12GraphicsCommandList> copyCommandList;
-    IncrementalFence copyFence;
 
     std::vector<Model> models;
 

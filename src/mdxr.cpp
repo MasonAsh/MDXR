@@ -326,8 +326,6 @@ int RunApp(int argc, char** argv)
         app.lastFrameTick = frameTick;
     }
 
-    WaitForPreviousFrame(app);
-
     NotifyAssetThread(app);
     app.AssetThread.thread.join();
 
@@ -357,4 +355,4 @@ int RunMDXR(int argc, char** argv)
 #endif
 
     return status;
-}
+    }

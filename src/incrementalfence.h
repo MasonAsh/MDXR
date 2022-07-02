@@ -4,11 +4,11 @@
 
 using namespace Microsoft::WRL;
 
+class IncrementalFence;
+
 class FenceEvent
 {
 public:
-    friend class IncrementalFence;
-
     FenceEvent()
         : fenceValue(UINT64_MAX)
     {
@@ -27,11 +27,9 @@ public:
     UINT64 fenceValue;
     std::vector<ComPtr<IUnknown>> trackedObjects;
 
-#if MDXR_DEBUG
     // Used by IncrementalFence to assert that waits are done on the
     // same fence that created the event
     IncrementalFence* sourceFence;
-#endif
 };
 
 class IncrementalFence
@@ -59,16 +57,12 @@ public:
         nextFenceValue++;
 
         event.fenceValue = targetFenceValue;
-#if MDXR_DEBUG
         event.sourceFence = this;
-#endif
     }
 
     void WaitQueue(ID3D12CommandQueue* commandQueue, FenceEvent& event)
     {
-#if MDXR_DEBUG
         CHECK(event.sourceFence == this || event.fenceValue == UINT64_MAX);
-#endif
 
         if (event.fenceValue == UINT64_MAX) {
             return;
@@ -83,9 +77,8 @@ public:
 
     void WaitCPU(FenceEvent& event)
     {
-#if MDXR_DEBUG
         CHECK(event.sourceFence == this || event.fenceValue == UINT64_MAX);
-#endif
+
         if (event.fenceValue == UINT64_MAX) {
             return;
         }
@@ -124,7 +117,6 @@ public:
         SignalQueue(commandQueue, fenceEvent);
         WaitCPU(fenceEvent);
     }
-
 private:
     ComPtr<ID3D12Fence> fence;
     UINT64 targetFenceValue;
