@@ -2,7 +2,13 @@
 
 #define NOMINMAX
 
+
+#ifdef NDEBUG
+#undef NDEBUG
 #include <assert.h>
+#define NDEBUG
+#endif
+
 #include <comdef.h> 
 #include <iostream>
 #include <format>
@@ -83,8 +89,17 @@ inline std::ostream& operator<< (std::ostream& out, const glm::mat4& matrix) {
 #define DEBUG_VAR(vec) DebugLog() << #vec << ": " << vec << "\n";
 
 // Like assert, but the code still gets executed in release mode
-#ifdef _DEBUG
+#ifdef MDXR_DEBUG
+
+#ifdef NDEBUG
+
+// RelWithDebInfo. No access to assert, so use this instead
+#define CHECK(code) { if (!(code)) { DbgRaiseAssertionFailure(); } }
+
+#else
 #define CHECK(code) assert(code)
+#endif
+
 #else
 #define CHECK(code) code
 #endif

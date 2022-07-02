@@ -8,7 +8,7 @@ extern "C" { __declspec(dllexport) extern const char* D3D12SDKPath = ".\\D3D12\\
 
 int main(int argc, char** argv)
 {
-    if (SDL_Init(SDL_INIT_VIDEO) < 0)
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) < 0)
     {
         std::cout << "Failed to initialize the SDL2 library\n";
         std::cout << "SDL2 Error: " << SDL_GetError() << "\n";

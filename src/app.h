@@ -337,6 +337,14 @@ struct MouseState
     float scrollDelta;
 };
 
+struct ControllerState {
+    glm::vec2 leftStick;
+    glm::vec2 rightStick;
+
+    // X is left trigger and Y is right trigger
+    glm::vec2 triggerState;
+};
+
 struct LightPassConstantData
 {
     glm::mat4 inverseProjectionMatrix;
@@ -567,6 +575,8 @@ struct App
     Camera camera;
     const UINT8* keyState;
     MouseState mouseState;
+    ControllerState controllerState;
+    SDL_GameController* controller;
 
     struct
     {

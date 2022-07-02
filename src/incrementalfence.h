@@ -67,7 +67,7 @@ public:
     void WaitQueue(ID3D12CommandQueue* commandQueue, FenceEvent& event)
     {
 #if MDXR_DEBUG
-        assert(event.sourceFence == this);
+        CHECK(event.sourceFence == this || event.fenceValue == UINT64_MAX);
 #endif
 
         if (event.fenceValue == UINT64_MAX) {
@@ -84,8 +84,12 @@ public:
     void WaitCPU(FenceEvent& event)
     {
 #if MDXR_DEBUG
-        assert(event.sourceFence == this);
+        CHECK(event.sourceFence == this || event.fenceValue == UINT64_MAX);
 #endif
+        if (event.fenceValue == UINT64_MAX) {
+            return;
+        }
+
         // Wait until the previous frame is finished.
         if (fence->GetCompletedValue() < event.fenceValue)
         {

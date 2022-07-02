@@ -52,6 +52,16 @@ void InitWindow(App& app)
     app.keyState = SDL_GetKeyboardState(nullptr);
 }
 
+void InitController(App& app)
+{
+    app.controller = nullptr;
+    for (int i = 0; i < SDL_NumJoysticks(); i++) {
+        if (SDL_IsGameController(i)) {
+            app.controller = SDL_GameControllerOpen(i);
+        }
+    }
+}
+
 void CreateDataDirWatchHandle(App& app)
 {
     app.shaderWatchHandle = FindFirstChangeNotificationW(app.wDataDir.c_str(), FALSE, FILE_NOTIFY_CHANGE_LAST_WRITE);
@@ -92,14 +102,25 @@ glm::mat4 UpdateFlyCamera(App& app, float deltaSeconds)
 {
     glm::vec3 cameraMovement(0.0f);
 
+    const float RADIANS_PER_PIXEL = glm::radians(0.1f);
+    const float CONTROLLER_RADIANS_PER_SECOND = glm::radians(200.0f);
     if (!app.camera.locked) {
         app.camera.targetSpeed += app.mouseState.scrollDelta * 1.0f;
         app.camera.targetSpeed = glm::clamp(app.camera.targetSpeed, app.camera.minSpeed, app.camera.maxSpeed);
-        const float RADIANS_PER_PIXEL = glm::radians(0.1f);
         app.camera.yaw -= (float)app.mouseState.xrel * RADIANS_PER_PIXEL;
         app.camera.pitch -= (float)app.mouseState.yrel * RADIANS_PER_PIXEL;
-        app.camera.pitch = glm::clamp(app.camera.pitch, -app.camera.maxPitch, app.camera.maxPitch);
+    } else {
+        // Square the input for a parabolic sensitivity curve
+        float rightX = app.controllerState.rightStick.x;
+        rightX = glm::sign(rightX) * rightX * rightX;
+        float rightY = app.controllerState.rightStick.y;
+        rightY = glm::sign(rightY) * rightY * rightY;
+
+        app.camera.yaw -= rightX * CONTROLLER_RADIANS_PER_SECOND * deltaSeconds;
+        app.camera.pitch -= rightY * CONTROLLER_RADIANS_PER_SECOND * deltaSeconds;
     }
+
+    app.camera.pitch = glm::clamp(app.camera.pitch, -app.camera.maxPitch, app.camera.maxPitch);
 
     float yaw = app.camera.yaw;
     float pitch = app.camera.pitch;
@@ -117,21 +138,25 @@ glm::mat4 UpdateFlyCamera(App& app, float deltaSeconds)
     float up = app.keyState[SDL_SCANCODE_E] ? 1.0f : 0.0f;
     float down = app.keyState[SDL_SCANCODE_Q] ? -1.0f : 0.0f;
 
-    glm::vec3 inputVector = glm::vec3(right + left, up + down, forward + backward);
+    if (app.camera.locked) {
+        up = down = left = right = forward = backward = 0.0f;
+    }
 
+    glm::vec3 inputVector = glm::vec3(right + left, up + down, forward + backward);
+    inputVector.x += app.controllerState.leftStick.x;
+    inputVector.y += app.controllerState.triggerState.y - app.controllerState.triggerState.x;
+    inputVector.z -= app.controllerState.leftStick.y;
 
     glm::vec3 upVector = glm::vec3(0.0f, 1.0f, 0.0f);
 
     float speed = app.camera.targetSpeed * deltaSeconds;
 
-    if (!app.camera.locked) {
-        glm::vec3 vecUp(0.0f, 1.0f, 0.0f);
-        cameraMovement += inputVector.z * cameraForward;
-        cameraMovement += inputVector.x * glm::normalize(glm::cross(cameraForward, vecUp));
-        cameraMovement.y += inputVector.y;
-        cameraMovement *= speed;
-        app.camera.translation += cameraMovement;
-    }
+    glm::vec3 vecUp(0.0f, 1.0f, 0.0f);
+    cameraMovement += inputVector.z * cameraForward;
+    cameraMovement += inputVector.x * glm::normalize(glm::cross(cameraForward, vecUp));
+    cameraMovement.y += inputVector.y;
+    cameraMovement *= speed;
+    app.camera.translation += cameraMovement;
 
     return glm::lookAt(app.camera.translation, app.camera.translation + cameraForward, glm::vec3(0, 1, 0));
 }
@@ -167,6 +192,41 @@ void ReloadIfShaderChanged(App& app)
     }
 }
 
+void UpdateControllerState(App& app)
+{
+    app.controllerState.leftStick = glm::vec2(0);
+    app.controllerState.rightStick = glm::vec2(0);
+
+    if (!app.controller) {
+        return;
+    }
+
+    Sint16 leftX = SDL_GameControllerGetAxis(app.controller, SDL_CONTROLLER_AXIS_LEFTX);
+    Sint16 leftY = SDL_GameControllerGetAxis(app.controller, SDL_CONTROLLER_AXIS_LEFTY);
+    Sint16 rightX = SDL_GameControllerGetAxis(app.controller, SDL_CONTROLLER_AXIS_RIGHTX);
+    Sint16 rightY = SDL_GameControllerGetAxis(app.controller, SDL_CONTROLLER_AXIS_RIGHTY);
+    Sint16 leftTrigger = SDL_GameControllerGetAxis(app.controller, SDL_CONTROLLER_AXIS_TRIGGERLEFT);
+    Sint16 rightTrigger = SDL_GameControllerGetAxis(app.controller, SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
+
+    app.controllerState.leftStick = { (float)leftX / (float)SHORT_MAX, (float)leftY / (float)SHORT_MAX };
+    app.controllerState.rightStick = { (float)rightX / (float)SHORT_MAX, (float)rightY / (float)SHORT_MAX };
+    app.controllerState.triggerState = { (float)leftTrigger / (float)SHORT_MAX, (float)rightTrigger / (float)SHORT_MAX };
+
+    // Apply deadzones
+    if (glm::length(app.controllerState.leftStick) < 0.1f) {
+        app.controllerState.leftStick = glm::vec2(0.0f);
+    }
+    if (glm::length(app.controllerState.rightStick) < 0.1f) {
+        app.controllerState.rightStick = glm::vec2(0.0f);
+    }
+    if (app.controllerState.triggerState.x < 0.1f) {
+        app.controllerState.triggerState.x = 0.0f;
+    }
+    if (app.controllerState.triggerState.y < 0.1f) {
+        app.controllerState.triggerState.y = 0.0f;
+    }
+}
+
 void ToggleBorderlessWindow(App& app)
 {
     int flags = !app.borderlessFullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0;
@@ -187,6 +247,7 @@ int RunApp(int argc, char** argv)
 
     InitApp(app, argc, argv);
     InitWindow(app);
+    InitController(app);
     InitD3D(app);
     InitImGui(app);
 
@@ -238,6 +299,7 @@ int RunApp(int argc, char** argv)
         ReloadIfShaderChanged(app);
 
         buttonState = SDL_GetMouseState(&mouseX, &mouseY);
+        UpdateControllerState(app);
 
         app.camera.locked = (buttonState & SDL_BUTTON_RMASK) == 0;
         if (!app.camera.locked) {
@@ -270,6 +332,11 @@ int RunApp(int argc, char** argv)
     app.AssetThread.thread.join();
 
     CleanImGui();
+
+    if (app.controller) {
+        SDL_GameControllerClose(app.controller);
+    }
+
     SDL_DestroyWindow(app.window);
 
     return 0;
