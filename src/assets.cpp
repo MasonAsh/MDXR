@@ -13,6 +13,25 @@
 
 #include <fstream>
 
+struct alignas(16) GenerateMipsConstantData
+{
+    UINT srcMipLevel;
+    UINT numMipLevels;
+    UINT srcDimension;
+    UINT isSRGB;
+    glm::vec2 texelSize;
+    float padding[58];
+};
+static_assert((sizeof(GenerateMipsConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
+
+struct alignas(16) ComputeSkyboxMapsConstantData
+{
+    glm::vec2 texelSize;
+    UINT faceIndex;
+    float padding[61];
+};
+static_assert((sizeof(ComputeSkyboxMapsConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
+
 void LoadModelAsset(AssetBundle& assets, tinygltf::TinyGLTF& loader, const std::string& filePath)
 {
     tinygltf::Model model;
@@ -101,7 +120,7 @@ void CreateModelDescriptors(
     }
 
     // Create SRVs
-    {
+    if (textureResources.size() > 0) {
         auto descriptorRef = app.descriptorArena.AllocateDescriptors((UINT)textureResources.size(), "MeshTextures");
         auto cpuHandle = descriptorRef.CPUHandle();
         //CD3DX12_CPU_DESCRIPTOR_HANDLE cpuHandle(mainDescriptorHeap->GetCPUDescriptorHandleForHeapStart(), (int)inputModel.meshes.size(), incrementSize);
@@ -132,6 +151,11 @@ void CreateModelMaterials(
 {
     // Allocate material constant buffers and create views
     int materialCount = (int)inputModel.materials.size();
+
+    if (materialCount == 0) {
+        return;
+    }
+
     auto descriptorReference = app.descriptorArena.AllocateDescriptors(materialCount, "model materials");
     auto constantBufferSlice = app.materialConstantBuffer.Allocate(materialCount);
     app.materialConstantBuffer.CreateViews(app.device.Get(), constantBufferSlice, descriptorReference.CPUHandle());
@@ -504,7 +528,6 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
     Model& outputModel,
     App& app,
     tinygltf::Model& inputModel,
-    ID3D12GraphicsCommandList* commandList,
     ID3D12GraphicsCommandList* copyCommandList,
     ID3D12CommandAllocator* copyCommandAllocator,
     const std::vector<UINT64>& uploadOffsets,
@@ -575,15 +598,6 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
     auto endGeometryBuffer = resourceBuffers.begin() + inputModel.buffers.size();
     outGeometryResources = std::span(resourceBuffers.begin(), endGeometryBuffer);
     outTextureResources = std::span(endGeometryBuffer, resourceBuffers.end());
-
-    // ASSERT_HRESULT(commandList->Close());
-    // ID3D12CommandList* ppCommandLists[] = { commandList };
-    // {
-    //     std::lock_guard<std::mutex> lock(app.commandQueueMutex);
-    //     app.copyFence.WaitQueue(app.commandQueue.Get(), fenceEvent);
-    //     app.commandQueue->ExecuteCommandLists(_countof(ppCommandLists), ppCommandLists);
-    //     app.fence.SignalQueue(app.commandQueue.Get(), fenceEvent);
-    // }
 
     progress->overallPercent = 0.6f;
 
@@ -962,8 +976,13 @@ bool ValidateSkyboxAssets(const SkyboxAssets& assets)
     return true;
 }
 
+// Renders all the lighting maps for the skybox, including diffuse irradiance,
+// prefilter map, and the BRDF lut.
 void RenderSkyboxEnvironmentLightMaps(App& app, const SkyboxAssets& assets, FenceEvent& cubemapUploadEvent, AssetLoadProgress* progress)
 {
+    // IMPORTANT: If this gets changed, PREFILTER_MAP_MIPCOUNT in common.hlsli must also be changed
+    const UINT PrefilterMipCount = 5;
+
     ScopedPerformanceTracker perf(__func__, PerformancePrecision::Milliseconds);
 
     progress->currentTask = "Rendering diffuse irradiance map";
@@ -975,7 +994,7 @@ void RenderSkyboxEnvironmentLightMaps(App& app, const SkyboxAssets& assets, Fenc
     ComPtr<ID3D12CommandAllocator> commandAllocator;
     ASSERT_HRESULT(
         app.device->CreateCommandAllocator(
-            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            D3D12_COMMAND_LIST_TYPE_COMPUTE,
             IID_PPV_ARGS(&commandAllocator)
         )
     );
@@ -984,136 +1003,140 @@ void RenderSkyboxEnvironmentLightMaps(App& app, const SkyboxAssets& assets, Fenc
     ASSERT_HRESULT(
         app.device->CreateCommandList(
             0,
-            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            D3D12_COMMAND_LIST_TYPE_COMPUTE,
             commandAllocator.Get(),
             nullptr,
             IID_PPV_ARGS(&commandList)
         )
     );
-    ASSERT_HRESULT(commandList->Close());
 
     // Create a new cubemap matching the skybox's cubemap resource.
     auto cubemapDesc = app.Skybox.cubemap->GetResource()->GetDesc();
-    cubemapDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-    D3D12MA::ALLOCATION_DESC allocDesc{};
-    allocDesc.HeapType = D3D12_HEAP_TYPE_DEFAULT;
-    ASSERT_HRESULT(
-        app.mainAllocator->CreateResource(
-            &allocDesc,
-            &cubemapDesc,
-            D3D12_RESOURCE_STATE_RENDER_TARGET,
-            nullptr,
-            &app.Skybox.irradianceCubeMap,
-            IID_NULL, nullptr
-        )
-    );
-
-    auto diffuseIrradianceRTVs = app.rtvDescriptorArena.PushDescriptorStack(CubeImage_Count);
-
-    for (int i = 0; i < CubeImage_Count; i++)
+    cubemapDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     {
-        D3D12_RENDER_TARGET_VIEW_DESC rtvDesc{};
-        rtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
-        rtvDesc.Texture2DArray.FirstArraySlice = i;
-        rtvDesc.Texture2DArray.ArraySize = 1;
-        app.device->CreateRenderTargetView(app.Skybox.irradianceCubeMap->GetResource(), &rtvDesc, diffuseIrradianceRTVs.CPUHandle(i));
+        D3D12MA::ALLOCATION_DESC allocDesc{};
+        allocDesc.HeapType = D3D12_HEAP_TYPE_DEFAULT;
+        ASSERT_HRESULT(
+            app.mainAllocator->CreateResource(
+                &allocDesc,
+                &cubemapDesc,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                nullptr,
+                &app.Skybox.irradianceCubeMap,
+                IID_NULL, nullptr
+            )
+        );
+
+
+        auto prefilterMapDesc = cubemapDesc;
+        prefilterMapDesc.MipLevels = PrefilterMipCount;
+        ASSERT_HRESULT(
+            app.mainAllocator->CreateResource(
+                &allocDesc,
+                &prefilterMapDesc,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                nullptr,
+                &app.Skybox.prefilterMap,
+                IID_NULL, nullptr
+            )
+        );
     }
 
-    ManagedPSORef PSO = CreateSkyboxDiffuseIrradiancePSO(
+
+    auto diffuseIrradianceUAV = app.descriptorArena.PushDescriptorStack(1);
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+    uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+    uavDesc.Texture2DArray.FirstArraySlice = 0;
+    uavDesc.Texture2DArray.ArraySize = CubeImage_Count;
+    app.device->CreateUnorderedAccessView(app.Skybox.irradianceCubeMap->GetResource(), nullptr, &uavDesc, diffuseIrradianceUAV.CPUHandle());
+
+
+    // Create UAVs for each mip on the prefilter map
+    auto prefilterMapUAVs = app.descriptorArena.PushDescriptorStack(PrefilterMipCount);
+    for (UINT i = 0; i < PrefilterMipCount; i++) {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+        uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+        uavDesc.Texture2DArray.FirstArraySlice = 0;
+        uavDesc.Texture2DArray.MipSlice = i;
+        uavDesc.Texture2DArray.ArraySize = CubeImage_Count;
+        app.device->CreateUnorderedAccessView(app.Skybox.prefilterMap->GetResource(), nullptr, &uavDesc, prefilterMapUAVs.CPUHandle(i));
+    }
+
+    ManagedPSORef PSO = CreateSkyboxComputeLightMapsPSO(
         app.psoManager,
         app.device.Get(),
         app.dataDir,
-        app.rootSignature.Get(),
+        app.MipMapGenerator.rootSignature.Get(),
         app.Skybox.inputLayout
     );
 
-    // glm::mat4 projection = glm::ortho(0.0f, (float)cubemapDesc.Width, 0.0f, (float)cubemapDesc.Height);
-    glm::mat4 projection = glm::perspective(glm::radians(90.0f), 1.0f, 0.1f, 1.0f);
-    glm::mat4 viewMatrices[] =
-    {
-        // Left/Right
-        glm::lookAt(glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(-1.0f,  0.0f,  0.0f), glm::vec3(0.0f, -1.0f,  0.0f)),
-        glm::lookAt(glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(1.0f,  0.0f,  0.0f), glm::vec3(0.0f,  -1.0f,  0.0f)),
-        // Top/Bottom
-        glm::lookAt(glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, -1.0f,  0.0f), glm::vec3(0.0f,  0.0f,  1.0f)),
-        glm::lookAt(glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f,  1.0f,  0.0f), glm::vec3(0.0f,  0.0f, -1.0f)),
-        // Front/Back
-        glm::lookAt(glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f,  0.0f, -1.0f), glm::vec3(0.0f,  -1.0f,  0.0f)),
-        glm::lookAt(glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f,  0.0f,  1.0f), glm::vec3(0.0f,  -1.0f,  0.0f)),
-    };
+    glm::vec2 texelSize = glm::vec2(1.0f / (float)cubemapDesc.Width, 1.0f / (float)cubemapDesc.Height);
 
     Primitive* primitive = app.Skybox.mesh->primitives[0].get();
 
-    float beginPercent = progress->overallPercent;
-    float endPercent = 1.0f;
+    CD3DX12_VIEWPORT viewport(0.0f, 0.0f, static_cast<float>(cubemapDesc.Width), static_cast<float>(cubemapDesc.Height));
+    CD3DX12_RECT scissorRect(0, 0, static_cast<LONG>(cubemapDesc.Width), static_cast<LONG>(cubemapDesc.Height));
 
-    // FIXME: These are very intense draw calls and I'm playing a bit of a guessing game
-    // with the shader's `sampleDelta` value to avoid TDR. This could probably benefit from tiled
-    // rendering.
-    for (int i = 0; i < CubeImage_Count; i++)
+    ID3D12DescriptorHeap* ppHeaps[] = { app.descriptorArena.Heap() };
+    commandList->SetDescriptorHeaps(1, ppHeaps);
+    commandList->SetComputeRootSignature(app.MipMapGenerator.rootSignature.Get());
+    commandList->SetPipelineState(PSO->Get());
+
+    for (UINT i = 0; i < CubeImage_Count; i++)
     {
         progress->currentTask = "Diffuse Irradiance Image " + std::to_string(i);
-        progress->overallPercent = beginPercent + (((endPercent - beginPercent) / (float)CubeImage_Count) * (float)i);
 
-        ASSERT_HRESULT(commandList->Reset(commandAllocator.Get(), PSO->Get()));
+        PIXScopedEvent(commandList.Get(), 0, ("CubeImage#" + std::to_string(i)).c_str());
 
-        PIXBeginEvent(commandList.Get(), 0, ("CubeImage#" + std::to_string(i)).c_str());
+        float roughness = 1.0f;
 
-        primitive->constantData->MVP = projection * viewMatrices[i];
-        primitive->constantData->MV = viewMatrices[i];
-
-        DEBUG_VAR(primitive->constantData->MVP);
-        DEBUG_VAR(viewMatrices[i]);
-
-        CD3DX12_VIEWPORT viewport(0.0f, 0.0f, static_cast<float>(cubemapDesc.Width), static_cast<float>(cubemapDesc.Height));
-        CD3DX12_RECT scissorRect(0, 0, static_cast<LONG>(cubemapDesc.Width), static_cast<LONG>(cubemapDesc.Height));
-
-        commandList->RSSetViewports(1, &viewport);
-        commandList->RSSetScissorRects(1, &scissorRect);
-
-        ID3D12DescriptorHeap* ppHeaps[] = { app.descriptorArena.Heap() };
-        commandList->SetDescriptorHeaps(1, ppHeaps);
-        commandList->SetGraphicsRootSignature(app.rootSignature.Get());
-        commandList->SetPipelineState(PSO->Get());
-
-        UINT constantValues[5] = {
-            primitive->perPrimitiveDescriptor.index,
-            UINT_MAX,
-            UINT_MAX,
-            UINT_MAX,
+        UINT constantValues[6] = {
             app.Skybox.texcubeSRV.index,
+            diffuseIrradianceUAV.index,
+            i,
+            *reinterpret_cast<UINT*>(&roughness),
+            *reinterpret_cast<UINT*>(&texelSize[0]),
+            *reinterpret_cast<UINT*>(&texelSize[1])
         };
-        commandList->SetGraphicsRoot32BitConstants(0, _countof(constantValues), constantValues, 0);
+        commandList->SetComputeRoot32BitConstants(0, _countof(constantValues), constantValues, 0);
+        commandList->Dispatch(static_cast<UINT>(cubemapDesc.Width) / 8, static_cast<UINT>(cubemapDesc.Height) / 8, 1);
 
-        auto rtvHandle = diffuseIrradianceRTVs.CPUHandle(i);
-        commandList->OMSetRenderTargets(1, &rtvHandle, false, nullptr);
-
-        commandList->IASetPrimitiveTopology(primitive->primitiveTopology);
-        commandList->IASetVertexBuffers(0, (UINT)primitive->vertexBufferViews.size(), primitive->vertexBufferViews.data());
-        commandList->IASetIndexBuffer(&primitive->indexBufferView);
-        commandList->DrawIndexedInstanced(primitive->indexCount, 1, 0, 0, 0);
-
-        if (i == CubeImage_Count - 1) {
-            // On the last cubemap face we can transition the cubemap to being a shader resource view.
-            auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(
-                app.Skybox.irradianceCubeMap->GetResource(),
-                D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
-            );
-
-            commandList->ResourceBarrier(1, &barrier);
-        }
-
-        PIXEndEvent(commandList.Get());
-
-        // FIXME: It would be better to not block here, and create commands for every face at once.
-        // However that would require creating constant buffers for each skybox face.
-        commandList->Close();
+        UINT mipWidth = static_cast<UINT>(cubemapDesc.Width);
+        UINT mipHeight = static_cast<UINT>(cubemapDesc.Height);
+        for (UINT mip = 0; mip < PrefilterMipCount; mip++)
         {
-            app.graphicsQueue.ExecuteCommandListsBlocking({ commandList.Get() });
+            glm::vec2 texelSize = glm::vec2(1.0f / mipWidth, 1.0f / mipHeight);
+            float roughness = static_cast<float>(mip) / static_cast<float>(PrefilterMipCount - 1);
+            UINT constantValues[6] = {
+                app.Skybox.texcubeSRV.index,
+                prefilterMapUAVs.index + mip,
+                i,
+                *reinterpret_cast<UINT*>(&roughness),
+                *reinterpret_cast<UINT*>(&texelSize[0]),
+                *reinterpret_cast<UINT*>(&texelSize[1])
+            };
+            commandList->SetComputeRoot32BitConstants(0, _countof(constantValues), constantValues, 0);
+            commandList->Dispatch(mipWidth / 8, mipHeight / 8, 1);
+
+            mipWidth /= 2;
+            mipHeight /= 2;
         }
     }
 
-    app.rtvDescriptorArena.PopDescriptorStack(CubeImage_Count);
+    // FIXME: this barrier would need to be done on the graphics queue.
+    // Also need to research if the UAVs should be copied to a new resource without the UAV flag...
+    auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+        app.Skybox.irradianceCubeMap->GetResource(),
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+    );
+
+    commandList->Close();
+    app.computeQueue.ExecuteCommandListsBlocking({ commandList.Get() });
+
+    // Pop 2D SRV and the constant buffer
+    app.descriptorArena.PopDescriptorStack(1);
+    app.descriptorArena.PopDescriptorStack(PrefilterMipCount);
 
 
     D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
@@ -1129,9 +1152,68 @@ void RenderSkyboxEnvironmentLightMaps(App& app, const SkyboxAssets& assets, Fenc
         app.Skybox.irradianceCubeSRV.CPUHandle()
     );
 
+    app.Skybox.prefilterMapSRV = app.descriptorArena.AllocateDescriptors(1, "Prefilter Map SRV");
+    srvDesc.TextureCube.MipLevels = PrefilterMipCount;
+    app.device->CreateShaderResourceView(
+        app.Skybox.prefilterMap->GetResource(),
+        &srvDesc,
+        app.Skybox.prefilterMapSRV.CPUHandle()
+    );
+
     if (app.graphicsAnalysis) {
         app.graphicsAnalysis->EndCapture();
     }
+}
+
+void LoadBRDFLUT(App& app, UploadBatch& uploadBatch)
+{
+    if (app.Skybox.brdfLUT != nullptr) {
+        // LUT is same for all skyboxes, no need to load twice
+        return;
+    }
+
+    auto image = LoadImageFile(app.dataDir + "/brdfLUT.png");
+    auto resourceDesc = GetImageResourceDesc(image);
+    resourceDesc.MipLevels = 1;
+    D3D12MA::ALLOCATION_DESC allocDesc{};
+    allocDesc.HeapType = D3D12_HEAP_TYPE_DEFAULT;
+
+    ASSERT_HRESULT(
+        app.mainAllocator->CreateResource(
+            &allocDesc,
+            &resourceDesc,
+            D3D12_RESOURCE_STATE_COMMON,
+            nullptr,
+            &app.Skybox.brdfLUT,
+            IID_NULL, nullptr
+        )
+    );
+
+    D3D12_SUBRESOURCE_DATA subresourceData{};
+    subresourceData.pData = image.image.data();
+    subresourceData.RowPitch = image.width * image.component;
+    subresourceData.SlicePitch = image.height * subresourceData.RowPitch;
+
+    uploadBatch.AddTexture(
+        app.Skybox.brdfLUT->GetResource(),
+        &subresourceData,
+        0,
+        1
+    );
+
+    app.Skybox.brdfLUTDescriptor = app.descriptorArena.AllocateDescriptors(1, "Skybox BRDF LUT");
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDesc.Format = resourceDesc.Format;
+    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Texture2D.MipLevels = resourceDesc.MipLevels;
+
+    app.device->CreateShaderResourceView(
+        app.Skybox.brdfLUT->GetResource(),
+        &srvDesc,
+        app.Skybox.brdfLUTDescriptor.CPUHandle()
+    );
 }
 
 void CreateSkybox(App& app, const SkyboxAssets& asset, AssetLoadProgress* progress)
@@ -1200,6 +1282,8 @@ void CreateSkybox(App& app, const SkyboxAssets& asset, AssetLoadProgress* progre
     uploadBatch.Begin(app.mainAllocator.Get(), &app.copyQueue);
     uploadBatch.AddTexture(cubemap->GetResource(), cubemapSubresourceData, 0, CubeImage_Count);
 
+    LoadBRDFLUT(app, uploadBatch);
+
     DescriptorRef texcubeSRV = app.descriptorArena.AllocateDescriptors(1, "Skybox SRV");
 
     D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
@@ -1228,7 +1312,8 @@ void CreateSkybox(App& app, const SkyboxAssets& asset, AssetLoadProgress* progre
         },
     };
 
-    float vertexData[] = {
+    float vertexData[] =
+    {
         // front
         -1.0, -1.0,  1.0,
          1.0, -1.0,  1.0,
@@ -1341,8 +1426,6 @@ void CreateSkybox(App& app, const SkyboxAssets& asset, AssetLoadProgress* progre
 
     RenderSkyboxEnvironmentLightMaps(app, asset, cubemapUpload, progress);
 
-    Sleep(200);
-
     app.Skybox.mesh->isReadyForRender = true;
 }
 
@@ -1415,7 +1498,6 @@ void LoadGLTFThread(App& app, const std::string& gltfFile, AssetLoadProgress* pr
         model,
         app,
         gltfModel,
-        commandList.Get(),
         copyCommandList.Get(),
         copyCommandAllocator.Get(),
         uploadOffsets,
@@ -1472,6 +1554,7 @@ void LoadSkyboxThread(App& app, const SkyboxImagePaths& paths, AssetLoadProgress
 {
     progress->assetName = paths.paths[0];
     progress->currentTask = "Loading skybox images";
+    progress->overallPercent = 0.0f;
 
     SkyboxAssets assets;
     assets.images[CubeImage_Front] = LoadImageFile(paths.paths[CubeImage_Front]);

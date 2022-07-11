@@ -433,3 +433,46 @@ ManagedPSORef CreateSkyboxDiffuseIrradiancePSO(
         psoDesc
     );
 }
+
+ManagedPSORef CreateSkyboxLightMapsPSO(
+    PSOManager& manager,
+    ID3D12Device* device,
+    const std::string& dataDir,
+    ID3D12RootSignature* rootSignature,
+    const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
+)
+{
+    auto psoDesc = DefaultGraphicsPSODesc();
+    CD3DX12_RASTERIZER_DESC rasterizerState(D3D12_DEFAULT);
+    rasterizerState.FrontCounterClockwise = FALSE;
+    psoDesc.RasterizerState = rasterizerState;
+    psoDesc.DepthStencilState.DepthEnable = false;
+    psoDesc.DepthStencilState.StencilEnable = false;
+
+    return SimpleCreateGraphicsPSO(
+        manager,
+        device,
+        dataDir + "skybox_light_maps",
+        rootSignature,
+        inputLayout,
+        psoDesc
+    );
+}
+
+ManagedPSORef CreateSkyboxComputeLightMapsPSO(
+    PSOManager& manager,
+    ID3D12Device* device,
+    const std::string& dataDir,
+    ID3D12RootSignature* rootSignature,
+    const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
+)
+{
+    D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
+    return CreateComputePSO(
+        manager,
+        device,
+        dataDir + "skybox_compute_maps",
+        rootSignature,
+        desc
+    );
+}

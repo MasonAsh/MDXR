@@ -146,3 +146,19 @@ ManagedPSORef CreateSkyboxDiffuseIrradiancePSO(
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
 );
+
+ManagedPSORef CreateSkyboxLightMapsPSO(
+    PSOManager& manager,
+    ID3D12Device* device,
+    const std::string& dataDir,
+    ID3D12RootSignature* rootSignature,
+    const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
+);
+
+ManagedPSORef CreateSkyboxComputeLightMapsPSO(
+    PSOManager& manager,
+    ID3D12Device* device,
+    const std::string& dataDir,
+    ID3D12RootSignature* rootSignature,
+    const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
+);

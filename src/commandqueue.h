@@ -71,7 +71,7 @@ public:
     }
 
     // This is necessary because Present must happen before signaling the queue.
-    void ExecuteCommandListsAndPresentBlocking(
+    HRESULT ExecuteCommandListsAndPresentBlocking(
         std::initializer_list<ID3D12CommandList* const> commandLists,
         IDXGISwapChain* swapChain,
         UINT syncInterval,
@@ -86,7 +86,7 @@ public:
 #endif
 
         FenceEvent fenceEvent;
-
+        HRESULT hr;
         {
             // We must synchronize the calls to the queue, but don't want to keep the lock for
             // the CPU wait.
@@ -94,11 +94,16 @@ public:
 
             waitEvent.sourceFence->WaitQueue(commandQueue.Get(), waitEvent);
             commandQueue->ExecuteCommandLists(assert_cast<UINT>(commandLists.size()), commandLists.begin());
-            swapChain->Present(syncInterval, presentFlags);
+            hr = swapChain->Present(syncInterval, presentFlags);
+            if (!SUCCEEDED(hr)) {
+                return hr;
+            }
             fence.SignalQueue(commandQueue.Get(), fenceEvent);
         }
 
         WaitForEventCPU(fenceEvent);
+
+        return hr;
     }
 
     void WaitForEventCPU(FenceEvent& fenceEvent)

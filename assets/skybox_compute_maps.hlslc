@@ -1,0 +1,129 @@
+#define NO_COMMON_RESOURCES
+#include "common.hlsli"
+
+cbuffer Constants : register(b0) {
+    uint g_SkyboxSrvIdx;
+    uint g_OutTextureUavIdx;
+    uint g_FaceIndex;
+    float g_Roughness;
+    float2 g_TexelSize;
+};
+
+#define BLOCK_SIZE 8
+
+struct ComputeShaderInput {
+    uint3 groupID : SV_GroupID;
+    uint3 groupThreadID : SV_GroupThreadID;
+    uint3 dispatchThreadID : SV_DispatchThreadID;
+    uint groupIndex : SV_GroupIndex;
+};
+
+#define THREADS_PER_PIXEL 16
+#define SAMPLES_PER_PIXEL 1000
+#define SAMPLES_PER_THREAD (SAMPLES_PER_PIXEL / THREADS_PER_PIXEL)
+
+#define SAMPLE_DELTA sqrt((4.0f*PI) / (float)SAMPLES_PER_PIXEL)
+
+TextureCube GetSkyboxTexture()
+{
+    return ResourceDescriptorHeap[g_SkyboxSrvIdx];
+}
+
+RWTexture2DArray<float4> GetOutTexture()
+{
+    return ResourceDescriptorHeap[g_OutTextureUavIdx];
+}
+
+float3 ConvertCubeUVToXYZ(uint index, float2 uv)
+{
+    float uc = 2.0f * uv.x - 1.0f;
+    float vc = 2.0f * uv.y - 1.0f;
+    switch (index)
+    {
+    case 0: // Left
+        return float3(1.0f, -vc, -uc);
+    case 1: // Right
+        return float3(-1.0f, -vc, uc);
+    case 2: // Top
+        return float3(uc, 1.0f, vc);
+    case 3: // Bottom
+        return float3(uc, -1.0f, -vc);
+    case 4: // Front
+        return float3(uc, -vc, 1.0f);
+    case 5: // Back
+    default: 
+        return float3(-uc, -vc, -1.0f);
+    };
+}
+
+// http://holger.dammertz.org/stuff/notes_HammersleyOnHemisphere.html
+float2 Hammersley(uint i, uint N) 
+{
+    float ri = reversebits(i) * 2.3283064365386963e-10f;
+    return float2(float(i) / float(N), ri);
+}
+
+groupshared float3 g_IrradianceAccumulators[BLOCK_SIZE * BLOCK_SIZE * THREADS_PER_PIXEL];
+
+float3 ImportanceSampleGGX(float2 Xi, float3 N, float roughness, float3 tangentX, float3 tangentY)
+{
+    float a = roughness * roughness;
+
+    float cosTheta = sqrt((1 - Xi.y) / (1.0f + (a*a - 1.0f) * Xi.y));
+    float sinTheta = sqrt(1 - cosTheta * cosTheta);
+    float phi = 2*PI*Xi.x;
+
+    float3 tangentSample = float3(sinTheta * cos(phi),  sinTheta * sin(phi), cosTheta);
+
+    return tangentSample.x * tangentX + tangentSample.y * tangentY + tangentSample.z * N; 
+}
+
+[numthreads(BLOCK_SIZE, BLOCK_SIZE, THREADS_PER_PIXEL)]
+void CSMain(ComputeShaderInput input)
+{
+    TextureCube skybox = GetSkyboxTexture();
+    RWTexture2DArray<float4> outTexture = GetOutTexture();
+
+    float2 texelSize = g_TexelSize;
+    float2 outUV = texelSize * input.dispatchThreadID.xy;
+    uint3 groupThreadID = input.groupThreadID;
+
+    float3 N = normalize(ConvertCubeUVToXYZ(g_FaceIndex, outUV));
+
+
+    float3 up = abs(N.z) < 0.999 ? float3(0,0,1) : float3(1,0,0);
+    float3 tangentX = normalize(cross(up, N));
+    float3 tangentY = cross(N, tangentX);
+
+    float3 irradiance = (float3)0.0f;
+    uint startSample = groupThreadID.z * SAMPLES_PER_THREAD;
+    uint endSample = (groupThreadID.z + 1) * SAMPLES_PER_THREAD;
+
+    float sampleCount = 0;
+
+    for (uint i = startSample; i < endSample; i += 1) {
+        float2 Xi = Hammersley(i, SAMPLES_PER_PIXEL);
+        float3 H = ImportanceSampleGGX(Xi, N, g_Roughness, tangentX, tangentY);
+        float3 L = normalize(2 * dot( N, H ) * H - N);
+        float NoL = saturate(dot( N, L ));
+        if (NoL > 0.0f) {
+            irradiance += skybox.Sample(g_sampler, H).rgb;
+            sampleCount += 1;
+        }
+    }
+
+    g_IrradianceAccumulators[input.groupIndex] = irradiance / sampleCount;
+
+    GroupMemoryBarrierWithGroupSync();
+
+    if (groupThreadID.z == 0) {
+        float4 finalColor = float4(0, 0, 0, 1);
+        for (float i = 0; i < THREADS_PER_PIXEL; i += 1) {
+            finalColor.xyz += g_IrradianceAccumulators[input.groupIndex + (i * BLOCK_SIZE * BLOCK_SIZE)];
+        }
+        finalColor = finalColor / THREADS_PER_PIXEL;
+
+        float3 uv = float3(input.dispatchThreadID.xy, (float)g_FaceIndex);
+        outTexture[uv] = finalColor;
+    }
+}

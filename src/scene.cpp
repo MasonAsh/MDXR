@@ -48,22 +48,17 @@ void StartSceneAssetLoad(App& app)
 
     const std::string& dataDir = app.dataDir;
 
-    EnqueueGLTF(app, dataDir + "/floor/floor.gltf");
+    // EnqueueGLTF(app, dataDir + "/floor/floor.gltf");
     EnqueueGLTF(app, dataDir + "/metallicsphere.gltf");
 
     SkyboxImagePaths images;
-    images.paths[CubeImage_Front] = dataDir + "/ColorfulStudio/pz.png";
-    images.paths[CubeImage_Back] = dataDir + "/ColorfulStudio/nz.png";
-    images.paths[CubeImage_Right] = dataDir + "/ColorfulStudio/px.png";
-    images.paths[CubeImage_Left] = dataDir + "/ColorfulStudio/nx.png";
-    images.paths[CubeImage_Top] = dataDir + "/ColorfulStudio/py.png";
-    images.paths[CubeImage_Bottom] = dataDir + "/ColorfulStudio/ny.png";
-    // images.paths[CubeImage_Front] = dataDir + "/DebugSky/pz.png";
-    // images.paths[CubeImage_Back] = dataDir + "/DebugSky/pz.png";
-    // images.paths[CubeImage_Left] = dataDir + "/DebugSky/px.png";
-    // images.paths[CubeImage_Right] = dataDir + "/DebugSky/px.png";
-    // images.paths[CubeImage_Top] = dataDir + "/DebugSky/py.png";
-    // images.paths[CubeImage_Bottom] = dataDir + "/DebugSky/py.png";
+    const std::string skyboxDir = "/ColorfulStudio/";
+    images.paths[CubeImage_Front] = dataDir + skyboxDir + "pz.png";
+    images.paths[CubeImage_Back] = dataDir + skyboxDir + "nz.png";
+    images.paths[CubeImage_Right] = dataDir + skyboxDir + "px.png";
+    images.paths[CubeImage_Left] = dataDir + skyboxDir + "nx.png";
+    images.paths[CubeImage_Top] = dataDir + skyboxDir + "py.png";
+    images.paths[CubeImage_Bottom] = dataDir + skyboxDir + "ny.png";
 
     EnqueueSkybox(app, images);
 }

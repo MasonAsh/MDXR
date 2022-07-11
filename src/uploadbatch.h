@@ -109,7 +109,7 @@ public:
             );
 
             for (UINT y = 0; y < footprint.Footprint.Height; y++) {
-                UINT8* pSrcPtr = (UINT8*)subresourceData[i].pData + y * footprint.Footprint.RowPitch;
+                UINT8* pSrcPtr = (UINT8*)subresourceData[i].pData + y * subresourceData[i].RowPitch;
                 UINT8* pDestPtr = uploadDataPtr + footprint.Offset + y * footprint.Footprint.RowPitch;
                 memcpy(pDestPtr, pSrcPtr, subresourceData[i].RowPitch);
             }

@@ -66,17 +66,6 @@ struct PerPrimitiveConstantData
 };
 static_assert((sizeof(PerPrimitiveConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
 
-struct alignas(16) GenerateMipsConstantData
-{
-    UINT srcMipLevel;
-    UINT numMipLevels;
-    UINT srcDimension;
-    UINT isSRGB;
-    glm::vec2 texelSize;
-    float padding[58];
-};
-static_assert((sizeof(GenerateMipsConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
-
 struct DescriptorRef
 {
     ID3D12DescriptorHeap* heap;
@@ -97,17 +86,35 @@ struct DescriptorRef
     {
     }
 
-    CD3DX12_CPU_DESCRIPTOR_HANDLE CPUHandle(int offset = 0) const {
+    CD3DX12_CPU_DESCRIPTOR_HANDLE CPUHandle(int offset = 0) const
+    {
         return CD3DX12_CPU_DESCRIPTOR_HANDLE(heap->GetCPUDescriptorHandleForHeapStart(), index + offset, incrementSize);
     }
 
-    CD3DX12_GPU_DESCRIPTOR_HANDLE GPUHandle() const {
+    CD3DX12_GPU_DESCRIPTOR_HANDLE GPUHandle() const
+    {
         return CD3DX12_GPU_DESCRIPTOR_HANDLE(heap->GetGPUDescriptorHandleForHeapStart(), index, incrementSize);
     }
 
     DescriptorRef operator+(int offset) const
     {
         return DescriptorRef(heap, index + offset, incrementSize);
+    }
+
+    void AssignConstantBufferView(ID3D12Device* device, ID3D12Resource* constantBuffer, UINT64 byteOffset, UINT size)
+    {
+        D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
+        cbvDesc.BufferLocation = constantBuffer->GetGPUVirtualAddress() + byteOffset;
+        cbvDesc.SizeInBytes = size;
+        device->CreateConstantBufferView(
+            &cbvDesc,
+            CPUHandle()
+        );
+    }
+
+    bool IsValid() const
+    {
+        return index != -1;
     }
 };
 
@@ -272,6 +279,8 @@ struct DescriptorArena
 
     DescriptorRef AllocateDescriptors(UINT count, const char* debugName)
     {
+        CHECK(count > 0);
+
         std::lock_guard<std::mutex> lock(mutex);
 
         if (debugName != nullptr) {
@@ -631,9 +640,15 @@ struct App
         ComPtr<D3D12MA::Allocation> indexBuffer;
         ComPtr<D3D12MA::Allocation> perPrimitiveConstantBuffer;
         ComPtr<D3D12MA::Allocation> irradianceCubeMap;
+        ComPtr<D3D12MA::Allocation> prefilterMap;
         DescriptorRef texcubeSRV;
         DescriptorRef irradianceCubeSRV;
+        DescriptorRef prefilterMapSRV;
         PoolItem<Mesh> mesh;
+
+        // LUT texture for environment BRDF split sum calculation.
+        ComPtr<D3D12MA::Allocation> brdfLUT;
+        DescriptorRef brdfLUTDescriptor;
 
         std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout;
     } Skybox;

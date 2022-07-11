@@ -54,6 +54,8 @@ float3 ExpandNormal(float3 n)
     return n * 2.0f - 1.0f;
 }
 
+#define PREFILTER_MAP_MIPCOUNT 5
+
 #ifndef NO_DEFAULT_RESOURCES
 
 cbuffer Indices : register(b0) {

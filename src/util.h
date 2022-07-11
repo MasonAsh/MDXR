@@ -31,8 +31,8 @@
     if (!SUCCEEDED(val)) { \
         _com_error err(val); \
         LPCTSTR errMsg = err.ErrorMessage(); \
-        std::cout << "Failed HRESULT(" << val << "): " << errMsg << "\n"; \
-        std::cout << #hr << "\n";\
+        DebugLog() << "Failed HRESULT(" << val << "): " << errMsg << "\n"; \
+        DebugLog() << #hr << "\n";\
         abort(); \
     }\
     }
@@ -113,6 +113,23 @@ enum class PerformancePrecision
     Nanoseconds,
 };
 
+class DebugLog {
+public:
+    ~DebugLog()
+    {
+        OutputDebugStringA(ss.str().c_str());
+    }
+
+    template<class T>
+    DebugLog& operator <<(const T& arg)
+    {
+        ss << arg;
+        return *this;
+    }
+private:
+    std::stringstream ss;
+};
+
 class ScopedPerformanceTracker
 {
 public:
@@ -121,7 +138,7 @@ public:
         , precision(precision)
         , numberFormat(numberFormat)
     {
-        std::cout << "Beginning " << name << "\n";
+        DebugLog() << "Beginning " << name << "\n";
         startNS = std::chrono::steady_clock::now().time_since_epoch().count();
     }
 
@@ -130,23 +147,23 @@ public:
         unsigned long long now = std::chrono::steady_clock::now().time_since_epoch().count();
         unsigned long long delta = now - startNS;
 
-        std::cout << name << " finished: ";
+        DebugLog() << name << " finished: ";
 
         switch (precision) {
         case PerformancePrecision::Seconds:
         {
             float seconds = (float)delta / (float)1e+9;
-            std::cout << std::format(numberFormat, seconds) << " seconds elapsed\n";
+            DebugLog() << std::format(numberFormat, seconds) << " seconds elapsed\n";
         }
         break;
         case PerformancePrecision::Milliseconds:
         {
             float millis = (float)delta / 1000000.0f;
-            std::cout << std::format(numberFormat, millis) << " milliseconds elapsed\n";
+            DebugLog() << std::format(numberFormat, millis) << " milliseconds elapsed\n";
         }
         break;
         case PerformancePrecision::Nanoseconds:
-            std::cout << delta << " nanoseconds elapsed\n";
+            DebugLog() << delta << " nanoseconds elapsed\n";
             break;
         }
     }
@@ -175,20 +192,3 @@ inline glm::mat4 ApplyStandardTransforms(const glm::mat4& base, glm::vec3 transl
 
     return transform;
 }
-
-class DebugLog {
-public:
-    ~DebugLog()
-    {
-        OutputDebugStringA(ss.str().c_str());
-    }
-
-    template<class T>
-    DebugLog& operator <<(const T& arg)
-    {
-        ss << arg;
-        return *this;
-    }
-private:
-    std::stringstream ss;
-};

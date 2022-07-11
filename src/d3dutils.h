@@ -15,17 +15,17 @@ inline void PrintCapabilities(ID3D12Device* device, IDXGIAdapter1* adapter)
     switch (featureSupport.ResourceBindingTier)
     {
     case D3D12_RESOURCE_BINDING_TIER_1:
-        std::cout << "Hardware is tier 1\n";
+        DebugLog() << "Hardware is tier 1\n";
         break;
 
     case D3D12_RESOURCE_BINDING_TIER_2:
         // Tiers 1 and 2 are supported.
-        std::cout << "Hardware is tier 2\n";
+        DebugLog() << "Hardware is tier 2\n";
         break;
 
     case D3D12_RESOURCE_BINDING_TIER_3:
         // Tiers 1, 2, and 3 are supported.
-        std::cout << "Hardware is tier 3\n";
+        DebugLog() << "Hardware is tier 3\n";
         break;
     }
 
@@ -35,31 +35,31 @@ inline void PrintCapabilities(ID3D12Device* device, IDXGIAdapter1* adapter)
 
     switch (shaderModel.HighestShaderModel) {
     case D3D_SHADER_MODEL_5_1:
-        std::cout << "Shader model 5_1 is supported\n";
+        DebugLog() << "Shader model 5_1 is supported\n";
         break;
     case D3D_SHADER_MODEL_6_0:
-        std::cout << "Shader model 6_0 is supported\n";
+        DebugLog() << "Shader model 6_0 is supported\n";
         break;
     case D3D_SHADER_MODEL_6_1:
-        std::cout << "Shader model 6_1 is supported\n";
+        DebugLog() << "Shader model 6_1 is supported\n";
         break;
     case D3D_SHADER_MODEL_6_2:
-        std::cout << "Shader model 6_2 is supported\n";
+        DebugLog() << "Shader model 6_2 is supported\n";
         break;
     case D3D_SHADER_MODEL_6_3:
-        std::cout << "Shader model 6_3 is supported\n";
+        DebugLog() << "Shader model 6_3 is supported\n";
         break;
     case D3D_SHADER_MODEL_6_4:
-        std::cout << "Shader model 6_4 is supported\n";
+        DebugLog() << "Shader model 6_4 is supported\n";
         break;
     case D3D_SHADER_MODEL_6_5:
-        std::cout << "Shader model 6_5 is supported\n";
+        DebugLog() << "Shader model 6_5 is supported\n";
         break;
     case D3D_SHADER_MODEL_6_6:
-        std::cout << "Shader model 6_6 is supported\n";
+        DebugLog() << "Shader model 6_6 is supported\n";
         break;
     case D3D_SHADER_MODEL_6_7:
-        std::cout << "Shader model 6_7 is supported\n";
+        DebugLog() << "Shader model 6_7 is supported\n";
         break;
     }
 
@@ -72,11 +72,11 @@ inline void PrintCapabilities(ID3D12Device* device, IDXGIAdapter1* adapter)
                 DXGI_MEMORY_SEGMENT_GROUP_LOCAL,
                 &info
             ))) {
-                std::cout << "\nVideo memory information:\n";
-                std::cout << "\tBudget: " << info.Budget << " bytes\n";
-                std::cout << "\tAvailable for reservation: " << info.AvailableForReservation << " bytes\n";
-                std::cout << "\tCurrent usage: " << info.CurrentUsage << " bytes\n";
-                std::cout << "\tCurrent reservation: " << info.CurrentReservation << " bytes\n\n";
+                DebugLog() << "\nVideo memory information:\n";
+                DebugLog() << "\tBudget: " << info.Budget << " bytes\n";
+                DebugLog() << "\tAvailable for reservation: " << info.AvailableForReservation << " bytes\n";
+                DebugLog() << "\tCurrent usage: " << info.CurrentUsage << " bytes\n";
+                DebugLog() << "\tCurrent reservation: " << info.CurrentReservation << " bytes\n\n";
             }
         }
     }
@@ -168,4 +168,33 @@ inline void DeviceRemovedHandler(ID3D12Device* device)
         std::cout << "\tBreadcrumbCount: " << breadcrumb->BreadcrumbCount << "\n";
         breadcrumb = breadcrumb->pNext;
     }
+}
+
+inline ComPtr<D3D12MA::Allocation> CreateUploadBufferWithData(D3D12MA::Allocator* allocator, void* srcData, size_t dataSize, UINT64 bufferSize = SIZE_MAX, void** mappedPtr = nullptr)
+{
+    if (bufferSize == SIZE_MAX) {
+        bufferSize = dataSize;
+    }
+
+    ComPtr<D3D12MA::Allocation> uploadBuffer;
+    auto resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(bufferSize);
+    D3D12MA::ALLOCATION_DESC allocDesc{};
+    allocDesc.HeapType = D3D12_HEAP_TYPE_UPLOAD;
+    ASSERT_HRESULT(
+        allocator->CreateResource(&allocDesc,
+            &resourceDesc,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            nullptr,
+            &uploadBuffer,
+            IID_NULL, nullptr
+        )
+    );
+
+    void* dest;
+    void** mapped = mappedPtr ? mappedPtr : &dest;
+    uploadBuffer->GetResource()->Map(0, nullptr, mapped);
+
+    memcpy(*mapped, srcData, dataSize);
+
+    return uploadBuffer;
 }

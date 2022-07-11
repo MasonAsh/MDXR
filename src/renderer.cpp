@@ -324,7 +324,7 @@ void SetupLightBuffer(App& app)
     app.LightBuffer.cbvHandle = descriptorHandle;
 
     app.LightBuffer.passData->baseGBufferIndex = app.GBuffer.baseSrvReference.index;
-    app.LightBuffer.passData->environmentIntensity = glm::vec4(5.0f);
+    app.LightBuffer.passData->environmentIntensity = glm::vec4(1.0f);
 
     for (int i = 0; i < MaxLightCount; i++) {
         // Link convenient light structures back to the constant buffer
@@ -832,16 +832,18 @@ void LightPass(App& app, ID3D12GraphicsCommandList* commandList)
         }
 
         // Environment cubemap
-        commandList->SetPipelineState(app.LightPass.environentCubemapLightPso->Get());
-        UINT constantValues[5] = {
-            UINT_MAX,
-            UINT_MAX,
-            UINT_MAX,
-            app.LightBuffer.cbvHandle.index,
-            app.Skybox.irradianceCubeSRV.index,
-        };
-        commandList->SetGraphicsRoot32BitConstants(0, _countof(constantValues), constantValues, 0);
-        DrawFullscreenQuad(app, commandList);
+        if (app.Skybox.prefilterMapSRV.IsValid()) {
+            commandList->SetPipelineState(app.LightPass.environentCubemapLightPso->Get());
+            UINT constantValues[5] = {
+                UINT_MAX,
+                app.Skybox.brdfLUTDescriptor.index,
+                UINT_MAX,
+                app.LightBuffer.cbvHandle.index,
+                app.Skybox.prefilterMapSRV.index,
+            };
+            commandList->SetGraphicsRoot32BitConstants(0, _countof(constantValues), constantValues, 0);
+            DrawFullscreenQuad(app, commandList);
+        }
     }
 }
 
@@ -908,14 +910,12 @@ void RenderFrame(App& app)
     FenceEvent renderEvent;
 
     // FIXME: multithreading
-    app.graphicsQueue.ExecuteCommandListsAndPresentBlocking({ app.commandList.Get() }, app.swapChain.Get(), 0, DXGI_PRESENT_ALLOW_TEARING);
-
-    // HRESULT hr = app.swapChain->Present(0, DXGI_PRESENT_ALLOW_TEARING);
-    // if (!SUCCEEDED(hr)) {
-    //     tdrOccurred = true;
-    //     app.running = false;
-    //     std::cout << "TDR occurred\n";
-    // }
+    HRESULT hr = app.graphicsQueue.ExecuteCommandListsAndPresentBlocking({ app.commandList.Get() }, app.swapChain.Get(), 0, DXGI_PRESENT_ALLOW_TEARING);
+    if (!SUCCEEDED(hr)) {
+        tdrOccurred = true;
+        app.running = false;
+        DebugLog() << "TDR occurred\n";
+    }
 
     app.graphicsQueue.WaitForEventCPU(renderEvent);
 
