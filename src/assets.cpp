@@ -630,7 +630,7 @@ glm::mat4 GetNodeTransfomMatrix(const tinygltf::Node& node)
         glm::mat4 T = glm::translate(glm::mat4(1.0f), translate);
         glm::mat4 S = glm::scale(glm::mat4(1.0f), scale);
         glm::mat4 R = glm::toMat4(rotation);
-        return S * R * T;
+        return T * R * S;
     }
 }
 
