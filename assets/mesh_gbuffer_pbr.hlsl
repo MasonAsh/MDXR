@@ -3,7 +3,7 @@
 struct VSInput {
     float3 position : POSITION;
     float3 normal : NORMAL;
-    float3 tangent : TANGENT;
+    float4 tangent : TANGENT;
     float2 uv : TEXCOORD;
 };
 
@@ -30,12 +30,12 @@ PSInput VSMain(VSInput input)
 
     result.position = mul(primitive.MVP, float4(input.position, 1.0f));
 
-    float3 binormal = cross(input.normal, input.tangent);
+    float3 binormal = cross(input.normal, input.tangent.xyz) * input.tangent.w;
 
     float3x3 MV3 = (float3x3)primitive.MV;
 
     result.normalVS = mul(MV3, input.normal);
-    result.tangentVS = mul(MV3, input.tangent);
+    result.tangentVS = mul(MV3, input.tangent.xyz);
     result.binormalVS = mul(MV3, binormal);
 
     result.uv = input.uv;
