@@ -64,9 +64,10 @@ void SetupDepthStencil(App& app, bool isResize)
 
 void SetupRenderTargets(App& app, bool isResize)
 {
-    DescriptorRef frameBufferDescriptor;
+    // Allocate descriptors. These remain for the lifetime of the app so no need to manage lifetimes.
+    DescriptorAlloc frameBufferDescriptor;
     if (!isResize) {
-        frameBufferDescriptor = app.rtvDescriptorArena.AllocateDescriptors(FrameBufferCount, "FrameBuffer RTVs");
+        frameBufferDescriptor = app.rtvDescriptorPool.AllocateDescriptors(FrameBufferCount, "FrameBuffer RTVs");
     }
 
     for (int i = 0; i < FrameBufferCount; i++) {
@@ -75,8 +76,9 @@ void SetupRenderTargets(App& app, bool isResize)
         );
 
         if (!isResize) {
-            app.frameBufferRTVs[i] = (frameBufferDescriptor + i);
+            app.frameBufferRTVs[i] = frameBufferDescriptor.Ref(i);
         }
+
         app.device->CreateRenderTargetView(app.renderTargets[i].Get(), nullptr, app.frameBufferRTVs[i].CPUHandle());
     }
 }
@@ -91,8 +93,8 @@ void SetupGBuffer(App& app, bool isResize)
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         //app.lightingPassDescriptorArena.Initialize(app.device.Get(), heapDesc, "LightPassArena");
-        app.GBuffer.baseSrvReference = app.descriptorArena.AllocateDescriptors(GBuffer_Count, "GBuffer SRVs");
-        rtvs = app.rtvDescriptorArena.AllocateDescriptors(GBuffer_RTVCount, "GBuffer RTVs");
+        app.GBuffer.baseSrvReference = AllocateDescriptorsUnique(app.descriptorPool, GBuffer_Count, "GBuffer SRVs");
+        rtvs = app.rtvDescriptorPool.AllocateDescriptors(GBuffer_RTVCount, "GBuffer RTVs").Ref();
     } else {
         // If we're resizing then we need to release existing gbuffer
         for (auto& renderTarget : app.GBuffer.renderTargets) {
@@ -105,7 +107,9 @@ void SetupGBuffer(App& app, bool isResize)
     auto rtvHandle = rtvs.CPUHandle();
     CD3DX12_CPU_DESCRIPTOR_HANDLE srvHandle = app.GBuffer.baseSrvReference.CPUHandle();
     for (int i = 0; i < GBuffer_Depth; i++) {
-        app.GBuffer.rtvs[i] = rtvs + i;
+        if (!isResize) {
+            app.GBuffer.rtvs[i] = rtvs + i;
+        }
 
         CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
         auto resourceDesc = GBufferResourceDesc(static_cast<GBufferTarget>(i), app.windowWidth, app.windowHeight);
@@ -308,7 +312,7 @@ void SetupMipMapGenerator(App& app)
 
 void SetupLightBuffer(App& app)
 {
-    auto descriptorHandle = app.descriptorArena.AllocateDescriptors(MaxLightCount + 1, "light pass and light buffer");
+    auto descriptorHandle = AllocateDescriptorsUnique(app.descriptorPool, MaxLightCount + 1, "light pass and light buffer");
 
     CreateConstantBufferAndViews(
         app.device.Get(),
@@ -321,9 +325,9 @@ void SetupLightBuffer(App& app)
     app.LightBuffer.constantBuffer->Map(0, nullptr, (void**)&app.LightBuffer.passData);
     // Lights are stored immediately after the pass data
     app.LightBuffer.lightConstantData = reinterpret_cast<LightConstantData*>(app.LightBuffer.passData + 1);
-    app.LightBuffer.cbvHandle = descriptorHandle;
+    app.LightBuffer.cbvHandle = std::move(descriptorHandle);
 
-    app.LightBuffer.passData->baseGBufferIndex = app.GBuffer.baseSrvReference.index;
+    app.LightBuffer.passData->baseGBufferIndex = app.GBuffer.baseSrvReference.Index();
     app.LightBuffer.passData->environmentIntensity = glm::vec4(1.0f);
 
     for (int i = 0; i < MaxLightCount; i++) {
@@ -358,7 +362,7 @@ void SetupGBufferPass(App& app)
     heapDesc.NumDescriptors = MaxDescriptors;
     heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    app.descriptorArena.Initialize(app.device.Get(), heapDesc, "GBufferPassArena");
+    app.descriptorPool.Initialize(app.device.Get(), heapDesc, "GBufferPassArena");
 
     SetupMaterialBuffer(app);
 }
@@ -498,7 +502,7 @@ void InitD3D(App& app)
         rtvHeapDesc.NumDescriptors = FrameBufferCount + GBuffer_RTVCount + 16;
         rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
         rtvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
-        app.rtvDescriptorArena.Initialize(app.device.Get(), rtvHeapDesc, "RTV Heap Arena");
+        app.rtvDescriptorPool.Initialize(app.device.Get(), rtvHeapDesc, "RTV Heap Arena");
     }
 
     G_IncrementSizes.CbvSrvUav = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -661,7 +665,7 @@ void DrawMeshesGBuffer(App& app, ID3D12GraphicsCommandList* commandList)
                 if (material->materialType == MaterialType_AlphaBlendPBR) {
                     continue;
                 }
-                materialDescriptor = material->cbvDescriptor;
+                materialDescriptor = material->cbvDescriptor.Ref();
             }
 
             // Set the per-primitive constant buffer
@@ -697,12 +701,12 @@ void DrawAlphaBlendedMeshes(App& app, ID3D12GraphicsCommandList* commandList)
             if (!material || material->materialType != MaterialType_AlphaBlendPBR) {
                 continue;
             }
-            auto materialDescriptor = material->cbvDescriptor;
+            auto materialDescriptor = material->cbvDescriptor.Ref();
 
             for (UINT lightIdx = 0; lightIdx < app.LightBuffer.count; lightIdx++) {
-                UINT lightDescriptorIndex = app.LightBuffer.cbvHandle.index + lightIdx + 1u;
+                UINT lightDescriptorIndex = app.LightBuffer.cbvHandle.Index() + lightIdx + 1u;
                 // Set the per-primitive constant buffer
-                UINT constantValues[5] = { primitive->perPrimitiveDescriptor.index, materialDescriptor.index, lightDescriptorIndex, 0, primitive->miscDescriptorParameter.index };
+                UINT constantValues[5] = { primitive->perPrimitiveDescriptor.index, materialDescriptor.Index(), lightDescriptorIndex, 0, primitive->miscDescriptorParameter.index };
                 commandList->SetGraphicsRoot32BitConstants(0, _countof(constantValues), constantValues, 0);
                 commandList->IASetPrimitiveTopology(primitive->primitiveTopology);
                 commandList->SetPipelineState(primitive->PSO->Get());
@@ -781,7 +785,7 @@ void GBufferPass(App& app, ID3D12GraphicsCommandList* commandList)
 
     BindAndClearGBufferRTVs(app, commandList);
 
-    ID3D12DescriptorHeap* mainDescriptorHeap = app.descriptorArena.Heap();
+    ID3D12DescriptorHeap* mainDescriptorHeap = app.descriptorPool.Heap();
     ID3D12DescriptorHeap* ppHeaps[] = { mainDescriptorHeap };
     commandList->SetDescriptorHeaps(1, ppHeaps);
     commandList->SetGraphicsRootSignature(app.rootSignature.Get());
@@ -797,8 +801,8 @@ void LightPass(App& app, ID3D12GraphicsCommandList* commandList)
     commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
 
     {
-        auto descriptorHeap = app.descriptorArena.descriptorHeap;
-        ID3D12DescriptorHeap* ppHeaps[] = { descriptorHeap.Get() };
+        auto descriptorHeap = app.descriptorPool.Heap();
+        ID3D12DescriptorHeap* ppHeaps[] = { descriptorHeap };
         commandList->SetDescriptorHeaps(_countof(ppHeaps), ppHeaps);
         // Root signature must be set AFTER heaps are set when CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED is set.
         commandList->SetGraphicsRootSignature(app.rootSignature.Get());
@@ -810,8 +814,8 @@ void LightPass(App& app, ID3D12GraphicsCommandList* commandList)
         for (UINT i = 0; i < app.LightBuffer.count; i++) {
             if (app.lights[i].lightType == LightType_Point) {
                 UINT constantValues[2] = {
-                    app.LightBuffer.cbvHandle.index + i + 1,
-                    app.LightBuffer.cbvHandle.index
+                    app.LightBuffer.cbvHandle.Index() + i + 1,
+                    app.LightBuffer.cbvHandle.Index()
                 };
                 commandList->SetGraphicsRoot32BitConstants(0, 2, constantValues, 2);
                 DrawFullscreenQuad(app, commandList);
@@ -823,8 +827,8 @@ void LightPass(App& app, ID3D12GraphicsCommandList* commandList)
         for (UINT i = 0; i < app.LightBuffer.count; i++) {
             if (app.lights[i].lightType == LightType_Directional) {
                 UINT constantValues[2] = {
-                    app.LightBuffer.cbvHandle.index + i + 1,
-                    app.LightBuffer.cbvHandle.index
+                    app.LightBuffer.cbvHandle.Index() + i + 1,
+                    app.LightBuffer.cbvHandle.Index()
                 };
                 commandList->SetGraphicsRoot32BitConstants(0, 2, constantValues, 2);
                 DrawFullscreenQuad(app, commandList);
@@ -836,10 +840,10 @@ void LightPass(App& app, ID3D12GraphicsCommandList* commandList)
             commandList->SetPipelineState(app.LightPass.environentCubemapLightPso->Get());
             UINT constantValues[5] = {
                 UINT_MAX,
-                app.Skybox.brdfLUTDescriptor.index,
+                app.Skybox.brdfLUTDescriptor.Index(),
                 UINT_MAX,
-                app.LightBuffer.cbvHandle.index,
-                app.Skybox.prefilterMapSRV.index,
+                app.LightBuffer.cbvHandle.Index(),
+                app.Skybox.prefilterMapSRV.Index(),
             };
             commandList->SetGraphicsRoot32BitConstants(0, _countof(constantValues), constantValues, 0);
             DrawFullscreenQuad(app, commandList);
@@ -858,7 +862,7 @@ void AlphaBlendPass(App& app, ID3D12GraphicsCommandList* commandList)
     CD3DX12_CPU_DESCRIPTOR_HANDLE dsvHandle(app.dsHeap->GetCPUDescriptorHandleForHeapStart());
     commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, &dsvHandle);
 
-    ID3D12DescriptorHeap* mainDescriptorHeap = app.descriptorArena.Heap();
+    ID3D12DescriptorHeap* mainDescriptorHeap = app.descriptorPool.Heap();
     ID3D12DescriptorHeap* ppHeaps[] = { mainDescriptorHeap };
     commandList->SetDescriptorHeaps(1, ppHeaps);
     commandList->SetGraphicsRootSignature(app.rootSignature.Get());

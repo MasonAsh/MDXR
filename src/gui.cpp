@@ -303,7 +303,7 @@ void DrawGeekMenu(App& app)
         if (ImGui::Checkbox("Debug Diffuse IBL", &debugSkybox)) {
             if (app.Skybox.mesh && app.Skybox.mesh->isReadyForRender) {
                 app.Skybox.mesh->primitives[0]->miscDescriptorParameter =
-                    debugSkybox ? app.Skybox.irradianceCubeSRV : app.Skybox.texcubeSRV;
+                    debugSkybox ? app.Skybox.irradianceCubeSRV.Ref() : app.Skybox.texcubeSRV.Ref();
             }
         }
 

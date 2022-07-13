@@ -352,8 +352,8 @@ int RunMDXR(int argc, char** argv)
         {
             dxgiDebug->ReportLiveObjects(DXGI_DEBUG_ALL, DXGI_DEBUG_RLO_FLAGS(DXGI_DEBUG_RLO_SUMMARY | DXGI_DEBUG_RLO_IGNORE_INTERNAL));
         }
-}
+    }
 #endif
 
     return status;
-    }
+}

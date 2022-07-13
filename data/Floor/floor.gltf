@@ -75,18 +75,18 @@
     "images" : [
         {
             "mimeType" : "image/png",
-            "name" : "TexturesCom_Tiles_CementHexagonal_1K_normal",
-            "uri" : "TexturesCom_Tiles_CementHexagonal_1K_normal.png"
+            "name" : "wood_table_001_nor_gl_4k",
+            "uri" : "textures/wood_table_001_nor_gl_4k.png"
+        },
+        {
+            "mimeType" : "image/jpeg",
+            "name" : "wood_table_001_diff_4k",
+            "uri" : "textures/wood_table_001_diff_4k.jpg"
         },
         {
             "mimeType" : "image/png",
-            "name" : "TexturesCom_Tiles_CementHexagonal_1K_albedo",
-            "uri" : "TexturesCom_Tiles_CementHexagonal_1K_albedo.png"
-        },
-        {
-            "mimeType" : "image/png",
-            "name" : "TexturesCom_Tiles_CementHexagonal_1K_roughness",
-            "uri" : "TexturesCom_Tiles_CementHexagonal_1K_roughness.png"
+            "name" : "wood_table_001_rough_4k",
+            "uri" : "textures/wood_table_001_rough_4k.png"
         }
     ],
     "accessors" : [

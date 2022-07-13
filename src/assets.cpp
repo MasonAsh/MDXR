@@ -107,8 +107,8 @@ void CreateModelDescriptors(
     // Create per-primitive constant buffer
     ComPtr<ID3D12Resource> perPrimitiveConstantBuffer;
     {
-        auto descriptorRef = app.descriptorArena.AllocateDescriptors(numConstantBuffers, "PerPrimitiveConstantBuffer");
-        auto cpuHandle = descriptorRef.CPUHandle();
+        outputModel.primitiveDataDescriptors = AllocateDescriptorsUnique(app.descriptorPool, numConstantBuffers, "PerPrimitiveConstantBuffer");
+        auto cpuHandle = outputModel.primitiveDataDescriptors.CPUHandle();
         CreateConstantBufferAndViews(
             app.device.Get(),
             perPrimitiveConstantBuffer,
@@ -116,14 +116,12 @@ void CreateModelDescriptors(
             numConstantBuffers,
             cpuHandle
         );
-        outputModel.primitiveDataDescriptors = descriptorRef;
     }
 
     // Create SRVs
     if (textureResources.size() > 0) {
-        auto descriptorRef = app.descriptorArena.AllocateDescriptors((UINT)textureResources.size(), "MeshTextures");
+        auto descriptorRef = AllocateDescriptorsUnique(app.descriptorPool, (UINT)textureResources.size(), "MeshTextures");
         auto cpuHandle = descriptorRef.CPUHandle();
-        //CD3DX12_CPU_DESCRIPTOR_HANDLE cpuHandle(mainDescriptorHeap->GetCPUDescriptorHandleForHeapStart(), (int)inputModel.meshes.size(), incrementSize);
         for (const auto& textureResource : textureResources) {
             auto textureDesc = textureResource->GetDesc();
             D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
@@ -134,7 +132,7 @@ void CreateModelDescriptors(
             app.device->CreateShaderResourceView(textureResource.Get(), &srvDesc, cpuHandle);
             cpuHandle.Offset(1, incrementSize);
         }
-        outputModel.baseTextureDescriptor = descriptorRef;
+        outputModel.baseTextureDescriptor = std::move(descriptorRef);
     }
 
     outputModel.perPrimitiveConstantBuffer = perPrimitiveConstantBuffer;
@@ -156,12 +154,12 @@ void CreateModelMaterials(
         return;
     }
 
-    auto descriptorReference = app.descriptorArena.AllocateDescriptors(materialCount, "model materials");
+    auto descriptorReference = AllocateDescriptorsUnique(app.descriptorPool, materialCount, "model materials");
     auto constantBufferSlice = app.materialConstantBuffer.Allocate(materialCount);
-    app.materialConstantBuffer.CreateViews(app.device.Get(), constantBufferSlice, descriptorReference.CPUHandle());
-    outputModel.baseMaterialDescriptor = descriptorReference;
+    //app.materialConstantBuffer.CreateViews(app.device.Get(), constantBufferSlice, descriptorReference.CPUHandle());
+    outputModel.baseMaterialDescriptor = descriptorReference.Ref();
 
-    auto baseTextureDescriptor = outputModel.baseTextureDescriptor;
+    auto baseTextureDescriptor = outputModel.baseTextureDescriptor.Ref();
 
     for (int i = 0; i < materialCount; i++) {
         auto& inputMaterial = inputModel.materials[i];
@@ -198,9 +196,13 @@ void CreateModelMaterials(
             }
         }
 
+        auto constantBufferSlice = app.materialConstantBuffer.Allocate(1);
+        auto descriptor = AllocateDescriptorsUnique(app.descriptorPool, 1, inputMaterial.name.c_str());
+        app.materialConstantBuffer.CreateViews(app.device.Get(), constantBufferSlice, descriptor.CPUHandle());
+
         auto material = app.materials.AllocateShared();
         // Material material;
-        material->constantData = &constantBufferSlice.data[i];
+        material->constantData = constantBufferSlice.data.data();
         material->materialType = materialType;
         material->textureDescriptors.baseColor = baseColorTextureDescriptor;
         material->textureDescriptors.normal = normalTextureDescriptor;
@@ -211,7 +213,7 @@ void CreateModelMaterials(
         material->baseColorFactor.a = static_cast<float>(inputMaterial.pbrMetallicRoughness.baseColorFactor[3]);
         material->metalRoughnessFactor.g = static_cast<float>(inputMaterial.pbrMetallicRoughness.roughnessFactor);
         material->metalRoughnessFactor.b = static_cast<float>(inputMaterial.pbrMetallicRoughness.metallicFactor);
-        material->cbvDescriptor = descriptorReference + i;
+        material->cbvDescriptor = std::move(descriptor);
         material->name = inputMaterial.name;
         material->UpdateConstantData();
 
@@ -223,6 +225,10 @@ void CreateModelMaterials(
 // MipLevels already set. Textures must also be UAV compatible.
 void GenerateMipMaps(App& app, const std::span<ComPtr<ID3D12Resource>>& textures, const std::vector<bool>& textureIsSRGB, FenceEvent& initialUploadEvent)
 {
+    if (app.graphicsAnalysis) {
+        app.graphicsAnalysis->BeginCapture();
+    }
+
     if (textures.size() == 0) {
         return;
     }
@@ -233,8 +239,7 @@ void GenerateMipMaps(App& app, const std::span<ComPtr<ID3D12Resource>>& textures
     UINT numTextures = static_cast<UINT>(textures.size());
 
     // Create SRVs for the base mip
-    auto baseTextureDescriptor = app.descriptorArena.PushDescriptorStack(numTextures);
-    descriptorCount += numTextures;
+    auto baseTextureDescriptor = AllocateDescriptorsUnique(app.descriptorPool, numTextures, "MipGenerationSourceSRVs");
     for (UINT i = 0; i < numTextures; i++) {
         auto textureDesc = textures[i]->GetDesc();
         D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
@@ -242,7 +247,7 @@ void GenerateMipMaps(App& app, const std::span<ComPtr<ID3D12Resource>>& textures
         srvDesc.Format = textureDesc.Format;
         srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         srvDesc.Texture2D.MipLevels = textureDesc.MipLevels;
-        app.device->CreateShaderResourceView(textures[i].Get(), &srvDesc, (baseTextureDescriptor + i).CPUHandle());
+        app.device->CreateShaderResourceView(textures[i].Get(), &srvDesc, baseTextureDescriptor.CPUHandle(i));
     }
 
     ComPtr<D3D12MA::Allocation> constantBuffer;
@@ -275,9 +280,10 @@ void GenerateMipMaps(App& app, const std::span<ComPtr<ID3D12Resource>>& textures
     commandList->SetPipelineState(app.MipMapGenerator.PSO->Get());
     commandList->SetComputeRootSignature(app.MipMapGenerator.rootSignature.Get());
 
-    ID3D12DescriptorHeap* ppHeaps[] = { app.descriptorArena.Heap() };
+    ID3D12DescriptorHeap* ppHeaps[] = { app.descriptorPool.Heap() };
     commandList->SetDescriptorHeaps(_countof(ppHeaps), ppHeaps);
 
+    UINT uavCount = 0;
     UINT cbvCount = 0;
     // Dry run to find the total number of constant buffers to allocate
     for (size_t textureIdx = 0; textureIdx < textures.size(); textureIdx++) {
@@ -294,6 +300,8 @@ void GenerateMipMaps(App& app, const std::span<ComPtr<ID3D12Resource>>& textures
             mipCount = std::min<DWORD>(4, mipCount + 1);
             mipCount = (srcMip + mipCount) >= resourceDesc.MipLevels ? resourceDesc.MipLevels - srcMip - 1 : mipCount;
 
+            uavCount += mipCount;
+
             srcMip += assert_cast<UINT16>(mipCount);
             cbvCount++;
         }
@@ -303,13 +311,14 @@ void GenerateMipMaps(App& app, const std::span<ComPtr<ID3D12Resource>>& textures
     constantBufferArena.InitializeWithCapacity(app.mainAllocator.Get(), cbvCount);
     auto constantBuffers = constantBufferArena.Allocate(cbvCount);
 
-    auto cbvs = app.descriptorArena.PushDescriptorStack(cbvCount);
-    descriptorCount += cbvCount;
+    auto cbvs = AllocateDescriptorsUnique(app.descriptorPool, cbvCount, "MipMapGenerator constant buffers");
+    auto uavDescriptors = AllocateDescriptorsUnique(app.descriptorPool, uavCount, "MipMapGenerator UAVs");
 
     constantBufferArena.CreateViews(app.device.Get(), constantBuffers, cbvs.CPUHandle());
 
     UINT totalUAVs = 0;
     UINT cbvIndex = 0;
+    UINT uavIndex = 0;
 
     for (size_t textureIdx = 0; textureIdx < textures.size(); textureIdx++) {
         auto resourceDesc = textures[textureIdx]->GetDesc();
@@ -328,8 +337,7 @@ void GenerateMipMaps(App& app, const std::span<ComPtr<ID3D12Resource>>& textures
             dstWidth = std::max<UINT64>(dstWidth, 1);
             dstHeight = std::max<UINT64>(dstHeight, 1);
 
-            auto uavs = app.descriptorArena.PushDescriptorStack(mipCount);
-            descriptorCount += mipCount;
+            auto uavs = uavDescriptors.Ref(uavIndex);
             for (UINT mip = 0; mip < mipCount; mip++) {
                 D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
                 uavDesc.Format = resourceDesc.Format;
@@ -351,8 +359,8 @@ void GenerateMipMaps(App& app, const std::span<ComPtr<ID3D12Resource>>& textures
                 uavs.index + 1,
                 uavs.index + 2,
                 uavs.index + 3,
-                cbvs.index + cbvIndex,
-                (baseTextureDescriptor + (int)textureIdx).index
+                cbvs.Index() + cbvIndex,
+                baseTextureDescriptor.Ref((int)textureIdx).index
             };
 
             commandList->SetComputeRoot32BitConstants(0, _countof(constantValues), constantValues, 0);
@@ -364,6 +372,7 @@ void GenerateMipMaps(App& app, const std::span<ComPtr<ID3D12Resource>>& textures
             CD3DX12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::UAV(textures[textureIdx].Get());
             commandList->ResourceBarrier(1, &barrier);
 
+            uavIndex += mipCount;
             cbvIndex++;
             srcMip += assert_cast<UINT16>(mipCount);
         }
@@ -373,7 +382,9 @@ void GenerateMipMaps(App& app, const std::span<ComPtr<ID3D12Resource>>& textures
 
     app.computeQueue.ExecuteCommandListsBlocking({ commandList.Get() }, initialUploadEvent);
 
-    app.descriptorArena.PopDescriptorStack(descriptorCount);
+    if (app.graphicsAnalysis) {
+        app.graphicsAnalysis->EndCapture();
+    }
 }
 
 void LoadModelTextures(
@@ -698,7 +709,7 @@ PoolItem<Primitive> CreateModelPrimitive(
 
     auto primitive = app.primitivePool.AllocateUnique();
 
-    primitive->perPrimitiveDescriptor = outputModel.primitiveDataDescriptors + perPrimitiveDescriptorIdx;
+    primitive->perPrimitiveDescriptor = outputModel.primitiveDataDescriptors.Ref(perPrimitiveDescriptorIdx);
     primitive->constantData = &outputModel.perPrimitiveBufferPtr[perPrimitiveDescriptorIdx];
     perPrimitiveDescriptorIdx++;
 
@@ -1043,7 +1054,7 @@ void RenderSkyboxEnvironmentLightMaps(App& app, const SkyboxAssets& assets, Fenc
     }
 
 
-    auto diffuseIrradianceUAV = app.descriptorArena.PushDescriptorStack(1);
+    auto diffuseIrradianceUAV = AllocateDescriptorsUnique(app.descriptorPool, 1, "Diffuse radiance UAV");
 
     D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
     uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
@@ -1053,7 +1064,7 @@ void RenderSkyboxEnvironmentLightMaps(App& app, const SkyboxAssets& assets, Fenc
 
 
     // Create UAVs for each mip on the prefilter map
-    auto prefilterMapUAVs = app.descriptorArena.PushDescriptorStack(PrefilterMipCount);
+    auto prefilterMapUAVs = AllocateDescriptorsUnique(app.descriptorPool, PrefilterMipCount, "Prefilter map UAVs");
     for (UINT i = 0; i < PrefilterMipCount; i++) {
         D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
         uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
@@ -1078,7 +1089,7 @@ void RenderSkyboxEnvironmentLightMaps(App& app, const SkyboxAssets& assets, Fenc
     CD3DX12_VIEWPORT viewport(0.0f, 0.0f, static_cast<float>(cubemapDesc.Width), static_cast<float>(cubemapDesc.Height));
     CD3DX12_RECT scissorRect(0, 0, static_cast<LONG>(cubemapDesc.Width), static_cast<LONG>(cubemapDesc.Height));
 
-    ID3D12DescriptorHeap* ppHeaps[] = { app.descriptorArena.Heap() };
+    ID3D12DescriptorHeap* ppHeaps[] = { app.descriptorPool.Heap() };
     commandList->SetDescriptorHeaps(1, ppHeaps);
     commandList->SetComputeRootSignature(app.MipMapGenerator.rootSignature.Get());
     commandList->SetPipelineState(PSO->Get());
@@ -1092,8 +1103,8 @@ void RenderSkyboxEnvironmentLightMaps(App& app, const SkyboxAssets& assets, Fenc
         float roughness = 1.0f;
 
         UINT constantValues[6] = {
-            app.Skybox.texcubeSRV.index,
-            diffuseIrradianceUAV.index,
+            app.Skybox.texcubeSRV.Index(),
+            diffuseIrradianceUAV.Index(),
             i,
             *reinterpret_cast<UINT*>(&roughness),
             *reinterpret_cast<UINT*>(&texelSize[0]),
@@ -1109,8 +1120,8 @@ void RenderSkyboxEnvironmentLightMaps(App& app, const SkyboxAssets& assets, Fenc
             glm::vec2 texelSize = glm::vec2(1.0f / mipWidth, 1.0f / mipHeight);
             float roughness = static_cast<float>(mip) / static_cast<float>(PrefilterMipCount - 1);
             UINT constantValues[6] = {
-                app.Skybox.texcubeSRV.index,
-                prefilterMapUAVs.index + mip,
+                app.Skybox.texcubeSRV.Index(),
+                prefilterMapUAVs.Index() + mip,
                 i,
                 *reinterpret_cast<UINT*>(&roughness),
                 *reinterpret_cast<UINT*>(&texelSize[0]),
@@ -1134,25 +1145,20 @@ void RenderSkyboxEnvironmentLightMaps(App& app, const SkyboxAssets& assets, Fenc
     commandList->Close();
     app.computeQueue.ExecuteCommandListsBlocking({ commandList.Get() });
 
-    // Pop 2D SRV and the constant buffer
-    app.descriptorArena.PopDescriptorStack(1);
-    app.descriptorArena.PopDescriptorStack(PrefilterMipCount);
-
-
     D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
     srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srvDesc.Format = cubemapDesc.Format;
     srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
     srvDesc.TextureCube.MipLevels = 1;
 
-    app.Skybox.irradianceCubeSRV = app.descriptorArena.AllocateDescriptors(1, "Diffuse Irradiance Cubemap SRV");
+    app.Skybox.irradianceCubeSRV = AllocateDescriptorsUnique(app.descriptorPool, 1, "Diffuse Irradiance Cubemap SRV");
     app.device->CreateShaderResourceView(
         app.Skybox.irradianceCubeMap->GetResource(),
         &srvDesc,
         app.Skybox.irradianceCubeSRV.CPUHandle()
     );
 
-    app.Skybox.prefilterMapSRV = app.descriptorArena.AllocateDescriptors(1, "Prefilter Map SRV");
+    app.Skybox.prefilterMapSRV = AllocateDescriptorsUnique(app.descriptorPool, 1, "Prefilter Map SRV");
     srvDesc.TextureCube.MipLevels = PrefilterMipCount;
     app.device->CreateShaderResourceView(
         app.Skybox.prefilterMap->GetResource(),
@@ -1201,7 +1207,7 @@ void LoadBRDFLUT(App& app, UploadBatch& uploadBatch)
         1
     );
 
-    app.Skybox.brdfLUTDescriptor = app.descriptorArena.AllocateDescriptors(1, "Skybox BRDF LUT");
+    app.Skybox.brdfLUTDescriptor = AllocateDescriptorsUnique(app.descriptorPool, 1, "Skybox BRDF LUT");
 
     D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
     srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -1265,11 +1271,11 @@ void CreateSkybox(App& app, const SkyboxAssets& asset, AssetLoadProgress* progre
         );
     }
 
-    DescriptorRef perPrimitiveCbv = app.descriptorArena.AllocateDescriptors(1, "Skybox PerPrimitive CBV");
+    UniqueDescriptors perPrimitiveCBV = AllocateDescriptorsUnique(app.descriptorPool, 1, "Skybox PerPrimitive CBV");
     D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
     cbvDesc.BufferLocation = perPrimitiveBuffer->GetResource()->GetGPUVirtualAddress();
     cbvDesc.SizeInBytes = sizeof(PerPrimitiveConstantData);
-    app.device->CreateConstantBufferView(&cbvDesc, perPrimitiveCbv.CPUHandle());
+    app.device->CreateConstantBufferView(&cbvDesc, perPrimitiveCBV.CPUHandle());
 
     D3D12_SUBRESOURCE_DATA cubemapSubresourceData[CubeImage_Count] = {};
     for (int i = 0; i < CubeImage_Count; i++) {
@@ -1284,21 +1290,24 @@ void CreateSkybox(App& app, const SkyboxAssets& asset, AssetLoadProgress* progre
 
     LoadBRDFLUT(app, uploadBatch);
 
-    DescriptorRef texcubeSRV = app.descriptorArena.AllocateDescriptors(1, "Skybox SRV");
-
-    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
-    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    srvDesc.Format = cubemapDesc.Format;
-    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
-    srvDesc.TextureCube.MipLevels = 1;
-    app.device->CreateShaderResourceView(
-        cubemap->GetResource(),
-        &srvDesc,
-        texcubeSRV.CPUHandle()
-    );
-
     app.Skybox.cubemap = cubemap;
-    app.Skybox.texcubeSRV = texcubeSRV;
+
+    {
+        UniqueDescriptors texcubeSRV = AllocateDescriptorsUnique(app.descriptorPool, 1, "Skybox SRV");
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvDesc.Format = cubemapDesc.Format;
+        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+        srvDesc.TextureCube.MipLevels = 1;
+        app.device->CreateShaderResourceView(
+            cubemap->GetResource(),
+            &srvDesc,
+            texcubeSRV.CPUHandle()
+        );
+
+        app.Skybox.texcubeSRV = std::move(texcubeSRV);
+    }
 
     app.Skybox.inputLayout = {
         {
@@ -1405,12 +1414,12 @@ void CreateSkybox(App& app, const SkyboxAssets& asset, AssetLoadProgress* progre
         app.Skybox.inputLayout
     );
 
-    primitive->perPrimitiveDescriptor = perPrimitiveCbv;
+    primitive->perPrimitiveDescriptor = perPrimitiveCBV.Ref();
 
     primitive->primitiveTopology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     primitive->indexCount = _countof(indices);
 
-    primitive->miscDescriptorParameter = texcubeSRV;
+    primitive->miscDescriptorParameter = app.Skybox.texcubeSRV.Ref();
 
     perPrimitiveBuffer->GetResource()->Map(0, nullptr, reinterpret_cast<void**>(&primitive->constantData));
 
@@ -1423,10 +1432,11 @@ void CreateSkybox(App& app, const SkyboxAssets& asset, AssetLoadProgress* progre
     app.Skybox.indexBuffer = indexBuffer;
     app.Skybox.vertexBuffer = vertexBuffer;
     app.Skybox.perPrimitiveConstantBuffer = perPrimitiveBuffer;
-
-    RenderSkyboxEnvironmentLightMaps(app, asset, cubemapUpload, progress);
+    app.Skybox.perPrimitiveCBV = std::move(perPrimitiveCBV);
 
     app.Skybox.mesh->isReadyForRender = true;
+
+    RenderSkyboxEnvironmentLightMaps(app, asset, cubemapUpload, progress);
 }
 
 void LoadGLTFThread(App& app, const std::string& gltfFile, AssetLoadProgress* progress)

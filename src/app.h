@@ -5,6 +5,7 @@
 #include "pool.h"
 #include "incrementalfence.h"
 #include "commandqueue.h"
+#include "descriptorpool.h"
 
 #include <SDL.h>
 
@@ -66,58 +67,6 @@ struct PerPrimitiveConstantData
 };
 static_assert((sizeof(PerPrimitiveConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
 
-struct DescriptorRef
-{
-    ID3D12DescriptorHeap* heap;
-    UINT incrementSize;
-    UINT index;
-
-    DescriptorRef()
-        : heap(nullptr)
-        , incrementSize(0)
-        , index(-1)
-    {
-    }
-
-    DescriptorRef(ID3D12DescriptorHeap* heap, UINT index, int incrementSize)
-        : heap(heap)
-        , index(index)
-        , incrementSize(incrementSize)
-    {
-    }
-
-    CD3DX12_CPU_DESCRIPTOR_HANDLE CPUHandle(int offset = 0) const
-    {
-        return CD3DX12_CPU_DESCRIPTOR_HANDLE(heap->GetCPUDescriptorHandleForHeapStart(), index + offset, incrementSize);
-    }
-
-    CD3DX12_GPU_DESCRIPTOR_HANDLE GPUHandle() const
-    {
-        return CD3DX12_GPU_DESCRIPTOR_HANDLE(heap->GetGPUDescriptorHandleForHeapStart(), index, incrementSize);
-    }
-
-    DescriptorRef operator+(int offset) const
-    {
-        return DescriptorRef(heap, index + offset, incrementSize);
-    }
-
-    void AssignConstantBufferView(ID3D12Device* device, ID3D12Resource* constantBuffer, UINT64 byteOffset, UINT size)
-    {
-        D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
-        cbvDesc.BufferLocation = constantBuffer->GetGPUVirtualAddress() + byteOffset;
-        cbvDesc.SizeInBytes = size;
-        device->CreateConstantBufferView(
-            &cbvDesc,
-            CPUHandle()
-        );
-    }
-
-    bool IsValid() const
-    {
-        return index != -1;
-    }
-};
-
 enum MaterialType
 {
     MaterialType_Unlit,
@@ -151,7 +100,7 @@ struct Material
 {
     MaterialConstantData* constantData;
     MaterialTextureDescriptors textureDescriptors;
-    DescriptorRef cbvDescriptor;
+    UniqueDescriptors cbvDescriptor;
 
     glm::vec4 baseColorFactor = glm::vec4(1.0f);
     glm::vec4 metalRoughnessFactor = glm::vec4(0.0f, 1.0f, 0.0f, 1.0f);
@@ -223,8 +172,8 @@ struct Model
     std::vector<ComPtr<ID3D12Resource>> buffers;
     std::vector<PoolItem<Mesh>> meshes;
 
-    DescriptorRef primitiveDataDescriptors;
-    DescriptorRef baseTextureDescriptor;
+    UniqueDescriptors primitiveDataDescriptors;
+    UniqueDescriptors baseTextureDescriptor;
     DescriptorRef baseMaterialDescriptor;
 
     // All of the child mesh constant buffers stored in this constant buffer
@@ -240,88 +189,88 @@ struct Model
 // 
 // Static descriptors grow from the left side of the heap while the stack grows
 // from the right.
-struct DescriptorArena
-{
-    // Left side of descriptor heap is permanent descriptors
-    // Right side is a stack for temporary allocations
-    ComPtr<ID3D12DescriptorHeap> descriptorHeap;
-    UINT capacity;
-    UINT size;
-    UINT descriptorIncrementSize;
-    std::string debugName;
-    DescriptorRef stackPtr;
-    std::mutex mutex;
+// struct DescriptorArena
+// {
+//     // Left side of descriptor heap is permanent descriptors
+//     // Right side is a stack for temporary allocations
+//     ComPtr<ID3D12DescriptorHeap> descriptorHeap;
+//     UINT capacity;
+//     UINT size;
+//     UINT descriptorIncrementSize;
+//     std::string debugName;
+//     DescriptorRef stackPtr;
+//     std::mutex mutex;
 
-    // Temporary descriptors can be allocated from the right side of the heap
-    UINT stack;
+//     // Temporary descriptors can be allocated from the right side of the heap
+//     UINT stack;
 
-    ID3D12DescriptorHeap* Heap()
-    {
-        return descriptorHeap.Get();
-    }
+//     ID3D12DescriptorHeap* Heap()
+//     {
+//         return descriptorHeap.Get();
+//     }
 
-    void Initialize(ID3D12Device* device, D3D12_DESCRIPTOR_HEAP_DESC heapDesc, const std::string& debugName)
-    {
-        this->debugName = debugName;
-        descriptorIncrementSize = device->GetDescriptorHandleIncrementSize(heapDesc.Type);
-        ASSERT_HRESULT(
-            device->CreateDescriptorHeap(
-                &heapDesc,
-                IID_PPV_ARGS(&descriptorHeap)
-            )
-        );
-        capacity = heapDesc.NumDescriptors;
-        size = 0;
-        stack = 0;
+//     void Initialize(ID3D12Device* device, D3D12_DESCRIPTOR_HEAP_DESC heapDesc, const std::string& debugName)
+//     {
+//         this->debugName = debugName;
+//         descriptorIncrementSize = device->GetDescriptorHandleIncrementSize(heapDesc.Type);
+//         ASSERT_HRESULT(
+//             device->CreateDescriptorHeap(
+//                 &heapDesc,
+//                 IID_PPV_ARGS(&descriptorHeap)
+//             )
+//         );
+//         capacity = heapDesc.NumDescriptors;
+//         size = 0;
+//         stack = 0;
 
-        stackPtr = DescriptorRef(descriptorHeap.Get(), capacity - 1, descriptorIncrementSize);
-    }
+//         stackPtr = DescriptorRef(descriptorHeap.Get(), capacity - 1, descriptorIncrementSize);
+//     }
 
-    DescriptorRef AllocateDescriptors(UINT count, const char* debugName)
-    {
-        CHECK(count > 0);
+//     DescriptorRef AllocateDescriptors(UINT count, const char* debugName)
+//     {
+//         CHECK(count > 0);
 
-        std::lock_guard<std::mutex> lock(mutex);
+//         std::lock_guard<std::mutex> lock(mutex);
 
-        if (debugName != nullptr) {
-            DebugLog() << this->debugName << " allocation info: " <<
-                "\n\tIndex: " << this->size <<
-                "\n\tCount: " << count <<
-                "\n\tReason: " << debugName << "\n";
-        }
-        DescriptorRef reference(descriptorHeap.Get(), size, descriptorIncrementSize);
-        size += count;
-        if (size + stack > capacity) {
-            DebugLog() << "Error: descriptor heap is not large enough\n";
-            abort();
-        }
-        return reference;
-    }
+//         if (debugName != nullptr) {
+//             DebugLog() << this->debugName << " allocation info: " <<
+//                 "\n\tIndex: " << this->size <<
+//                 "\n\tCount: " << count <<
+//                 "\n\tReason: " << debugName << "\n";
+//         }
+//         DescriptorRef reference(descriptorHeap.Get(), size, descriptorIncrementSize);
+//         size += count;
+//         if (size + stack > capacity) {
+//             DebugLog() << "Error: descriptor heap is not large enough\n";
+//             abort();
+//         }
+//         return reference;
+//     }
 
-    // Allocate some temporary descriptors.
-    // These descriptors are allocated from the opposite side of the heap.
-    DescriptorRef PushDescriptorStack(UINT count)
-    {
-        std::lock_guard<std::mutex> lock(mutex);
+//     // Allocate some temporary descriptors.
+//     // These descriptors are allocated from the opposite side of the heap.
+//     DescriptorRef PushDescriptorStack(UINT count)
+//     {
+//         std::lock_guard<std::mutex> lock(mutex);
 
-        if (size + (capacity - stackPtr.index) + count > capacity) {
-            std::cerr << "Error: descriptor heap is not large enough\n";
-            abort();
-        }
+//         if (size + (capacity - stackPtr.index) + count > capacity) {
+//             std::cerr << "Error: descriptor heap is not large enough\n";
+//             abort();
+//         }
 
-        stackPtr.index -= count;
+//         stackPtr.index -= count;
 
-        return stackPtr;
-    }
+//         return stackPtr;
+//     }
 
-    // Pops temporary descriptors from stack
-    void PopDescriptorStack(UINT count)
-    {
-        std::lock_guard<std::mutex> lock(mutex);
+//     // Pops temporary descriptors from stack
+//     void PopDescriptorStack(UINT count)
+//     {
+//         std::lock_guard<std::mutex> lock(mutex);
 
-        stackPtr.index += count;
-    }
-};
+//         stackPtr.index += count;
+//     }
+// };
 
 struct Camera
 {
@@ -516,6 +465,10 @@ struct AssetLoadProgress {
 
 struct App
 {
+    // NOTE: DESTRUCTOR ORDER IS IMPORTANT ON THESE. LEAVE AT TOP.
+    DescriptorPool descriptorPool;
+    DescriptorPool rtvDescriptorPool;
+
     std::string dataDir;
     std::wstring wDataDir;
 
@@ -557,8 +510,6 @@ struct App
     CD3DX12_VIEWPORT viewport;
     CD3DX12_RECT scissorRect;
 
-    DescriptorArena rtvDescriptorArena;
-
     CommandQueue computeQueue;
     ComPtr<ID3D12CommandAllocator> computeCommandAllocator;
 
@@ -594,14 +545,13 @@ struct App
         bool showStats = true;
     } ImGui;
 
-    DescriptorArena descriptorArena;
 
     ComPtr<D3D12MA::Allocator> mainAllocator;
 
     struct
     {
         std::array<ComPtr<ID3D12Resource>, GBuffer_Count - 1> renderTargets;
-        DescriptorRef baseSrvReference;
+        UniqueDescriptors baseSrvReference;
         DescriptorRef rtvs[GBuffer_RTVCount];
     } GBuffer;
 
@@ -621,7 +571,7 @@ struct App
         LightPassConstantData* passData;
         LightConstantData* lightConstantData;
 
-        DescriptorRef cbvHandle;
+        UniqueDescriptors cbvHandle;
 
         UINT count;
     } LightBuffer;
@@ -641,14 +591,15 @@ struct App
         ComPtr<D3D12MA::Allocation> perPrimitiveConstantBuffer;
         ComPtr<D3D12MA::Allocation> irradianceCubeMap;
         ComPtr<D3D12MA::Allocation> prefilterMap;
-        DescriptorRef texcubeSRV;
-        DescriptorRef irradianceCubeSRV;
-        DescriptorRef prefilterMapSRV;
+        UniqueDescriptors perPrimitiveCBV;
+        UniqueDescriptors texcubeSRV;
+        UniqueDescriptors irradianceCubeSRV;
+        UniqueDescriptors prefilterMapSRV;
         PoolItem<Mesh> mesh;
 
         // LUT texture for environment BRDF split sum calculation.
         ComPtr<D3D12MA::Allocation> brdfLUT;
-        DescriptorRef brdfLUTDescriptor;
+        UniqueDescriptors brdfLUTDescriptor;
 
         std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout;
     } Skybox;
