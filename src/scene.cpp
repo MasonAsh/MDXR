@@ -51,10 +51,10 @@ void StartSceneAssetLoad(App& app)
     EnqueueGLTF(app, dataDir + "/floor/floor.gltf");
     EnqueueGLTF(app, dataDir + "/FlightHelmet/FlightHelmet.gltf");
     // EnqueueGLTF(app, dataDir + "/metallicsphere.gltf");
-    // EnqueueGLTF(app, "C:\\Users\\mason\\dev\\glTF-Sample-Models\\Main\\tangified\\sponza_tangents.gltf");
+    //EnqueueGLTF(app, "C:\\Users\\mason\\dev\\glTF-Sample-Models\\Main\\tangified\\sponza_tangents.gltf");
 
     SkyboxImagePaths images;
-    const std::string skyboxDir = "/Skybox/";
+    const std::string skyboxDir = "/ColorfulStudio/";
     images.paths[CubeImage_Front] = dataDir + skyboxDir + "pz.png";
     images.paths[CubeImage_Back] = dataDir + skyboxDir + "nz.png";
     images.paths[CubeImage_Right] = dataDir + skyboxDir + "px.png";
