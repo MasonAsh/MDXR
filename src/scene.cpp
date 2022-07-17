@@ -11,7 +11,7 @@ void InitializeCamera(App& app)
 
 void InitializeLights(App& app)
 {
-    app.LightBuffer.count = 1;
+    app.LightBuffer.count = 0;
 
     app.lights[0].lightType = LightType_Directional;
     app.lights[0].color = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f);
@@ -47,10 +47,11 @@ void StartSceneAssetLoad(App& app)
 
     const std::string& dataDir = app.dataDir;
 
-    EnqueueGLTF(app, dataDir + "/floor/floor.gltf");
-    EnqueueGLTF(app, dataDir + "/FlightHelmet/FlightHelmet.gltf");
+    // EnqueueGLTF(app, dataDir + "/floor/floor.gltf");
+    // EnqueueGLTF(app, dataDir + "/FlightHelmet/FlightHelmet.gltf");
+    // EnqueueGLTF(app, dataDir + "/LightTest/LightTest.gltf");
     // EnqueueGLTF(app, dataDir + "/metallicsphere.gltf");
-    // EnqueueGLTF(app, "C:\\Users\\mason\\dev\\glTF-Sample-Models\\Main\\tang2\\Sponza.gltf");
+    EnqueueGLTF(app, "C:\\Users\\mason\\dev\\glTF-Sample-Models\\Main\\tang2\\Sponza.gltf");
 
     SkyboxImagePaths images;
     const std::string skyboxDir = "/Forest/";

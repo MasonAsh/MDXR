@@ -616,15 +616,18 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
     return resourceBuffers;
 }
 
-glm::mat4 GetNodeTransfomMatrix(const tinygltf::Node& node)
+glm::mat4 GetNodeTransfomMatrix(const tinygltf::Node& node, glm::vec3& translate, glm::quat& rotation, glm::vec3& scale, bool& hasTRS)
 {
+    translate = glm::vec3(0.0f);
+    rotation = glm::quat_identity<float, glm::defaultp>();
+    scale = glm::vec3(1.0f);
+
     if (node.matrix.size() > 0) {
+        hasTRS = false;
         CHECK(node.matrix.size() == 16);
         return glm::make_mat4(node.matrix.data());;
     } else {
-        glm::vec3 translate(0.0f);
-        glm::quat rotation = glm::quat_identity<float, glm::defaultp>();
-        glm::vec3 scale(1.0f);
+        hasTRS = true;
         if (node.translation.size() > 0) {
             auto translationData = node.translation.data();
             translate = glm::make_vec3(translationData);
@@ -646,21 +649,48 @@ glm::mat4 GetNodeTransfomMatrix(const tinygltf::Node& node)
     }
 }
 
-void TraverseNode(const tinygltf::Model& model, const tinygltf::Node& node, std::vector<PoolItem<Mesh>>& meshes, const glm::mat4& accumulator)
+struct GLTFLightTransform {
+    int lightIndex;
+    glm::vec3 position;
+    glm::quat rotation;
+};
+
+void TraverseNode(const tinygltf::Model& model, const tinygltf::Node& node, std::vector<PoolItem<Mesh>>& meshes, std::vector<GLTFLightTransform>& lights, const glm::mat4& accumulator, const glm::vec3& translateAccum, const glm::quat& rotAccum, const glm::vec3& scaleAccum)
 {
-    glm::mat4 transform = accumulator * GetNodeTransfomMatrix(node);
+    glm::vec3 translate;
+    glm::quat rotate;
+    glm::vec3 scale;
+    bool hasTRS;
+    glm::mat4 transform = accumulator * GetNodeTransfomMatrix(node, translate, rotate, scale, hasTRS);
+    translate = translate + translateAccum;
+    rotate = rotAccum * rotate;
+    scale = scaleAccum * scale;
+
     if (node.mesh != -1) {
         meshes[node.mesh]->baseModelTransform = transform;
+    } else if (node.extensions.contains("KHR_lights_punctual")) {
+        if (hasTRS) {
+            GLTFLightTransform transform;
+            transform.lightIndex = node.extensions.at("KHR_lights_punctual").Get("light").GetNumberAsInt();
+            transform.position = translate;
+            transform.rotation = rotate;
+            lights.push_back(transform);
+        } else {
+            // I'm not going to bother with trying to decompose transform matrices for this
+            DebugLog() << "Punctual light with matrix transform will be ignored";
+        }
     }
+
     for (const auto& child : node.children) {
-        TraverseNode(model, model.nodes[child], meshes, transform);
+        TraverseNode(model, model.nodes[child], meshes, lights, transform, translate, rotate, scale);
     }
 }
 
 // Traverse the GLTF scene to get the correct model matrix for each mesh.
-void ResolveMeshTransforms(
+void ResolveModelTransforms(
     const tinygltf::Model& model,
-    std::vector<PoolItem<Mesh>>& meshes
+    std::vector<PoolItem<Mesh>>& meshes,
+    std::vector<GLTFLightTransform>& lightTransforms
 )
 {
     if (model.scenes.size() == 0) {
@@ -669,7 +699,7 @@ void ResolveMeshTransforms(
 
     int scene = model.defaultScene != 0 ? model.defaultScene : 0;
     for (const auto& node : model.scenes[scene].nodes) {
-        TraverseNode(model, model.nodes[node], meshes, glm::mat4(1.0f));
+        TraverseNode(model, model.nodes[node], meshes, lightTransforms, glm::mat4(1.0f), glm::vec3(0.0f), glm::quat_identity<float, glm::defaultp>(), glm::vec3(1.0f));
     }
 }
 
@@ -917,6 +947,47 @@ PoolItem<Primitive> CreateModelPrimitive(
     return primitive;
 }
 
+std::mutex g_punctualLightLock;
+void AddPunctualLights(App& app, const tinygltf::Model& inputModel, std::vector<GLTFLightTransform> lightTransforms)
+{
+    std::scoped_lock<std::mutex> lock(g_punctualLightLock);
+
+    for (size_t i = 0; i < inputModel.lights.size(); i++) {
+        const auto& inputLight = inputModel.lights[i];
+        LightType lightType;
+        if (inputLight.type == "directional") {
+            lightType = LightType_Directional;
+        } else if (inputLight.type == "point") {
+            lightType = LightType_Point;
+        } else {
+            DebugLog() << "Light '" << inputLight.name << "' has unsupported type '" << inputLight.type << "' will be ignored";
+            continue;
+        }
+
+        glm::vec3 color(1.0f);
+        if (inputLight.color.size() >= 3) {
+            color.r = inputLight.color[0];
+            color.g = inputLight.color[1];
+            color.b = inputLight.color[2];
+        }
+
+        for (const auto& lightTransform : lightTransforms) {
+            if (lightTransform.lightIndex == i) {
+                glm::vec3 position = lightTransform.position;
+                glm::vec3 direction = lightTransform.rotation * glm::vec3(0.0f, 0.0f, -1.0f);
+
+                app.lights[app.LightBuffer.count].color = color;
+                app.lights[app.LightBuffer.count].direction = direction;
+                app.lights[app.LightBuffer.count].position = position;
+                app.lights[app.LightBuffer.count].range = inputLight.range;
+                app.lights[app.LightBuffer.count].intensity = inputLight.intensity;
+                app.lights[app.LightBuffer.count].lightType = lightType;
+                app.LightBuffer.count++;
+            }
+        }
+    }
+}
+
 void FinalizeModel(
     Model& outputModel,
     App& app,
@@ -955,7 +1026,9 @@ void FinalizeModel(
         }
     }
 
-    ResolveMeshTransforms(inputModel, outputModel.meshes);
+    std::vector<GLTFLightTransform> lightTransforms;
+    ResolveModelTransforms(inputModel, outputModel.meshes, lightTransforms);
+    AddPunctualLights(app, inputModel, lightTransforms);
 
     for (auto& mesh : outputModel.meshes) {
         mesh->isReadyForRender = true;

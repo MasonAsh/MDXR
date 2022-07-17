@@ -855,11 +855,13 @@ void TransitionResourcesForGBufferPass(const App& app, ID3D12GraphicsCommandList
     // Transition any directional light shadow maps to being depth write state
     for (UINT i = 0; i < app.LightBuffer.count; i++) {
         if (app.lights[i].lightType == LightType_Directional) {
-            barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(
-                app.lights[i].directionalShadowMap->GetResource(),
-                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                D3D12_RESOURCE_STATE_DEPTH_WRITE
-            ));
+            if (app.lights[i].directionalShadowMap != nullptr) {
+                barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(
+                    app.lights[i].directionalShadowMap->GetResource(),
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_DEPTH_WRITE
+                ));
+            }
         }
     }
 
@@ -880,7 +882,7 @@ void TransitionResourcesForLightPass(const App& app, ID3D12GraphicsCommandList* 
 
     // Transition any directional light shadow maps to being pixel resources
     for (UINT i = 0; i < app.LightBuffer.count; i++) {
-        if (app.lights[i].lightType == LightType_Directional) {
+        if (app.lights[i].lightType == LightType_Directional && app.lights[i].directionalShadowMap != nullptr) {
             barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(
                 app.lights[i].directionalShadowMap->GetResource(),
                 D3D12_RESOURCE_STATE_DEPTH_WRITE,
@@ -911,7 +913,7 @@ void ShadowPass(App& app, ID3D12GraphicsCommandList* commandList)
 {
     for (UINT i = 0; i < app.LightBuffer.count; i++) {
         auto& light = app.lights[i];
-        if (light.lightType == LightType_Directional) {
+        if (light.lightType == LightType_Directional && light.directionalShadowMap != nullptr) {
             auto dsvHandle = light.directionalShadowMapDSV.CPUHandle();
             commandList->OMSetRenderTargets(0, nullptr, FALSE, &dsvHandle);
             commandList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
