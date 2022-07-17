@@ -170,6 +170,7 @@ void UpdateScene(App& app)
     float deltaSeconds = (float)deltaTicks / (float)1e9;
 
     glm::mat4 projection = glm::perspective(app.camera.fovY, (float)app.windowWidth / (float)app.windowHeight, 0.1f, 1000.0f);
+    //glm::mat4 projection = glm::ortho(-3.0f, 3.0f, -3.0f, 3.0f, 0.1f, 100.0f);
     glm::mat4 view = UpdateFlyCamera(app, deltaSeconds);
 
     static std::once_flag onceFlag;

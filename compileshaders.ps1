@@ -4,8 +4,12 @@ Get-ChildItem "assets/" -Filter *.hlsl |
 Foreach-Object {
     dxc.exe -HV 2021 -E VSMain -T vs_6_6 $_.FullName -Od -Fo "data/$($_.BaseName).cvert" -Zi -Qembed_debug
     $ExitStatus += $LASTEXITCODE
-    dxc.exe -HV 2021 -E PSMain -T ps_6_6 $_.FullName -Od -Fo "data/$($_.BaseName).cpixel" -Zi -Qembed_debug
-    $ExitStatus += $LASTEXITCODE
+
+    $HasPixel = Select-String -Path $_.FullName -Pattern "PSMain"
+    if ($HasPixel -ne $null) {
+        dxc.exe -HV 2021 -E PSMain -T ps_6_6 $_.FullName -Od -Fo "data/$($_.BaseName).cpixel" -Zi -Qembed_debug
+        $ExitStatus += $LASTEXITCODE
+    }
 }
 Get-ChildItem "assets/" -Filter *.hlslc |
 Foreach-Object {

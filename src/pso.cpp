@@ -2,75 +2,41 @@
 #include "util.h"
 
 #include <iostream>
+#include <mutex>
+#include <map>
 
 #include <d3dcompiler.h>
 
-ID3D12PipelineState* ManagedGraphicsPSO::Get()
+void PSOManager::Reload(ID3D12Device2* device)
 {
-    return PSO.Get();
-}
+    shaderByteCodeCache.Invalidate();
 
-void ManagedGraphicsPSO::Reload(ID3D12Device* device)
-{
-    ComPtr<ID3DBlob> vertexShader = nullptr;
-    ComPtr<ID3DBlob> pixelShader = nullptr;
-
-    if (!shaderPaths.vertex.empty()) {
-        if (!SUCCEEDED(D3DReadFileToBlob(shaderPaths.vertex.c_str(), &vertexShader))) {
-            std::wcout << "Failed to read vertex shader " << shaderPaths.vertex << "\n";
-            return;
-        }
-        desc.VS = { reinterpret_cast<UINT8*>(vertexShader->GetBufferPointer()), vertexShader->GetBufferSize() };
-    }
-    if (!shaderPaths.pixel.empty()) {
-        if (!SUCCEEDED(D3DReadFileToBlob(shaderPaths.pixel.c_str(), &pixelShader))) {
-            std::wcout << "Failed to read pixel shader " << shaderPaths.pixel << "\n";
-            return;
-        }
-        desc.PS = { reinterpret_cast<UINT8*>(pixelShader->GetBufferPointer()), pixelShader->GetBufferSize() };
-    }
-
-    ComPtr<ID3D12PipelineState> NewPSO;
-    if (!SUCCEEDED(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&NewPSO)))) {
-        std::wcout << L"Error: PSO reload failed for PSO with\n"
-            << L"Vertex shader: " << shaderPaths.vertex << L"\n"
-            << L"Pixel shader: " << shaderPaths.pixel << L"\n";
-        return;
-    }
-    PSO = NewPSO;
-}
-
-ID3D12PipelineState* ManagedComputePSO::Get()
-{
-    return PSO.Get();
-}
-
-void ManagedComputePSO::Reload(ID3D12Device* device)
-{
-    ComPtr<ID3DBlob> computeShader = nullptr;
-
-    if (!SUCCEEDED(D3DReadFileToBlob(computeShaderPath.c_str(), &computeShader))) {
-        std::wcout << "Failed to read compute shader " << computeShaderPath << "\n";
-        return;
-    }
-    desc.CS = { reinterpret_cast<UINT8*>(computeShader->GetBufferPointer()), computeShader->GetBufferSize() };
-
-    ComPtr<ID3D12PipelineState> NewPSO;
-    if (!SUCCEEDED(device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&NewPSO)))) {
-        std::wcout << L"Error: PSO reload failed for PSO with\n"
-            << L"Compute shader: " << computeShaderPath << L"\n";
-        return;
-    }
-    PSO = NewPSO;
-}
-
-void PSOManager::Reload(ID3D12Device* device)
-{
-    for (auto& PSO : PSOs) {
-        if (std::shared_ptr<IManagedPSO> pso = PSO.lock()) {
-            pso->Reload(device);
+    for (auto PSO = PSOs.begin(); PSO != PSOs.end(); ) {
+        if (ManagedPSORef pso = PSO->lock()) {
+            pso->Reload(device, shaderByteCodeCache);
+            PSO++;
+        } else {
+            // Erase any unused PSOs.
+            PSO = PSOs.erase(PSO);
         }
     }
+}
+
+ManagedPSORef PSOManager::FindPSO(UINT hash)
+{
+    for (auto PSO = PSOs.begin(); PSO != PSOs.end(); ) {
+        if (ManagedPSORef pso = PSO->lock()) {
+            if (pso->hash == hash) {
+                return pso;
+            }
+            PSO++;
+        } else {
+            // Erase any unused PSOs.
+            PSO = PSOs.erase(PSO);
+        }
+    }
+
+    return nullptr;
 }
 
 D3D12_GRAPHICS_PIPELINE_STATE_DESC DefaultGraphicsPSODesc()
@@ -96,22 +62,35 @@ D3D12_GRAPHICS_PIPELINE_STATE_DESC DefaultGraphicsPSODesc()
     return psoDesc;
 }
 
-ManagedPSORef CreateGraphicsPSO(
+std::mutex g_PSOMutex;
+
+ManagedPSORef CreatePSO(
     PSOManager& manager,
-    ID3D12Device* device,
-    const PSOGraphicsShaderPaths& paths,
+    ID3D12Device2* device,
+    const ShaderPaths& paths,
     ID3D12RootSignature* rootSignature,
     std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout,
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc
+    CD3DX12_PIPELINE_STATE_STREAM psoDesc
 )
 {
-    auto mPso = std::make_shared<ManagedGraphicsPSO>();
+    std::scoped_lock<std::mutex> lock(g_PSOMutex);
+
+    auto mPso = std::make_shared<ManagedPSO>();
     mPso->desc = psoDesc;
-    mPso->inputLayout = inputLayout;
+    mPso->inputLayoutMemory = inputLayout;
     mPso->desc.pRootSignature = rootSignature;
-    mPso->desc.InputLayout = { mPso->inputLayout.data(), (UINT)mPso->inputLayout.size() };
+    mPso->desc.InputLayout = { mPso->inputLayoutMemory.data(), (UINT)mPso->inputLayoutMemory.size() };
     mPso->shaderPaths = paths;
-    mPso->Reload(device);
+
+    CHECK(mPso->Load(manager.shaderByteCodeCache));
+
+    // Check if we've already created this PSO
+    auto PSO = manager.FindPSO(mPso->hash);
+    if (PSO) {
+        return PSO;
+    }
+
+    ASSERT_HRESULT(mPso->Compile(device));
 
     manager.PSOs.emplace_back(mPso);
 
@@ -120,23 +99,21 @@ ManagedPSORef CreateGraphicsPSO(
 
 ManagedPSORef SimpleCreateGraphicsPSO(
     PSOManager& manager,
-    ID3D12Device* device,
+    ID3D12Device2* device,
     const std::string& baseShaderPath,
     ID3D12RootSignature* rootSignature,
     std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout,
     D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc
 )
 {
-    std::wstring wBaseShaderPath = convert_to_wstring(baseShaderPath);
+    const std::string vertexShaderPath = (baseShaderPath + ".cvert");
+    const std::string pixelShaderPath = (baseShaderPath + ".cpixel");
 
-    const std::wstring vertexShaderPath = (wBaseShaderPath + L".cvert");
-    const std::wstring pixelShaderPath = (wBaseShaderPath + L".cpixel");
-
-    PSOGraphicsShaderPaths paths;
+    ShaderPaths paths;
     paths.vertex = vertexShaderPath;
     paths.pixel = pixelShaderPath;
 
-    return CreateGraphicsPSO(
+    return CreatePSO(
         manager,
         device,
         paths,
@@ -148,26 +125,28 @@ ManagedPSORef SimpleCreateGraphicsPSO(
 
 ManagedPSORef CreateComputePSO(
     PSOManager& manager,
-    ID3D12Device* device,
+    ID3D12Device2* device,
     const std::string& baseShaderPath,
     ID3D12RootSignature* rootSignature,
     D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc
 )
 {
-    auto mPso = std::make_shared<ManagedComputePSO>();
-    mPso->desc = psoDesc;
-    mPso->desc.pRootSignature = rootSignature;
-    mPso->computeShaderPath = convert_to_wstring(baseShaderPath + ".ccomp");
-    mPso->Reload(device);
+    ShaderPaths shaderPaths;
+    shaderPaths.compute = baseShaderPath + ".ccomp";
 
-    manager.PSOs.emplace_back(mPso);
-
-    return mPso;
+    return CreatePSO(
+        manager,
+        device,
+        shaderPaths,
+        rootSignature,
+        {},
+        CD3DX12_PIPELINE_STATE_STREAM(psoDesc)
+    );
 }
 
 ManagedPSORef CreateMipMapGeneratorPSO(
     PSOManager& manager,
-    ID3D12Device* device,
+    ID3D12Device2* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature
 )
@@ -184,7 +163,7 @@ ManagedPSORef CreateMipMapGeneratorPSO(
 
 ManagedPSORef CreateMeshPBRPSO(
     PSOManager& manager,
-    ID3D12Device* device,
+    ID3D12Device2* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -207,7 +186,7 @@ ManagedPSORef CreateMeshPBRPSO(
 
 ManagedPSORef CreateMeshAlphaBlendedPBRPSO(
     PSOManager& manager,
-    ID3D12Device* device,
+    ID3D12Device2* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -245,7 +224,7 @@ ManagedPSORef CreateMeshAlphaBlendedPBRPSO(
 
 ManagedPSORef CreateMeshUnlitPSO(
     PSOManager& manager,
-    ID3D12Device* device,
+    ID3D12Device2* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -268,7 +247,7 @@ ManagedPSORef CreateMeshUnlitPSO(
 
 ManagedPSORef CreateDirectionalLightPSO(
     PSOManager& manager,
-    ID3D12Device* device,
+    ID3D12Device2* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -306,9 +285,46 @@ ManagedPSORef CreateDirectionalLightPSO(
     );
 }
 
+ManagedPSORef CreateDirectionalLightShadowMapPSO(
+    PSOManager& manager,
+    ID3D12Device2* device,
+    const std::string& dataDir,
+    ID3D12RootSignature* rootSignature,
+    const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
+)
+{
+    auto psoDesc = DefaultGraphicsPSODesc();
+    psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+
+    float depthBias = -0.0005f;
+    psoDesc.RasterizerState.DepthBias = -(depthBias / (1.0f / pow(2.0, 23.0)));
+    psoDesc.RasterizerState.SlopeScaledDepthBias = -0.005;
+    psoDesc.RasterizerState.DepthBiasClamp = -0.05f;
+
+    // No RTVs
+    psoDesc.NumRenderTargets = 0;
+    std::fill_n(psoDesc.RTVFormats, _countof(psoDesc.RTVFormats), DXGI_FORMAT_UNKNOWN);
+
+    // This is a depth only render pass, so no fragment shader.
+    std::string baseShaderPath = dataDir + "shadow_directional";
+    const std::string vertexShaderPath = baseShaderPath + ".cvert";
+
+    ShaderPaths paths;
+    paths.vertex = vertexShaderPath;
+
+    return CreatePSO(
+        manager,
+        device,
+        paths,
+        rootSignature,
+        inputLayout,
+        psoDesc
+    );
+}
+
 ManagedPSORef CreateEnvironmentCubemapLightPSO(
     PSOManager& manager,
-    ID3D12Device* device,
+    ID3D12Device2* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -348,7 +364,7 @@ ManagedPSORef CreateEnvironmentCubemapLightPSO(
 
 ManagedPSORef CreatePointLightPSO(
     PSOManager& manager,
-    ID3D12Device* device,
+    ID3D12Device2* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -388,7 +404,7 @@ ManagedPSORef CreatePointLightPSO(
 
 ManagedPSORef CreateSkyboxPSO(
     PSOManager& manager,
-    ID3D12Device* device,
+    ID3D12Device2* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -411,7 +427,7 @@ ManagedPSORef CreateSkyboxPSO(
 
 ManagedPSORef CreateSkyboxDiffuseIrradiancePSO(
     PSOManager& manager,
-    ID3D12Device* device,
+    ID3D12Device2* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -436,7 +452,7 @@ ManagedPSORef CreateSkyboxDiffuseIrradiancePSO(
 
 ManagedPSORef CreateSkyboxLightMapsPSO(
     PSOManager& manager,
-    ID3D12Device* device,
+    ID3D12Device2* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -461,7 +477,7 @@ ManagedPSORef CreateSkyboxLightMapsPSO(
 
 ManagedPSORef CreateSkyboxComputeLightMapsPSO(
     PSOManager& manager,
-    ID3D12Device* device,
+    ID3D12Device2* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout

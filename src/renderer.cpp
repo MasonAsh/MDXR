@@ -25,11 +25,7 @@ void SetupCubemapData(App& app)
 void SetupDepthStencil(App& app, bool isResize)
 {
     if (!isResize) {
-        D3D12_DESCRIPTOR_HEAP_DESC dsHeapDesc = {};
-        dsHeapDesc.NumDescriptors = 1;
-        dsHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
-        dsHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
-        ASSERT_HRESULT(app.device->CreateDescriptorHeap(&dsHeapDesc, IID_PPV_ARGS(&app.dsHeap)));
+        app.depthStencilDescriptor = AllocateDescriptorsUnique(app.dsvDescriptorPool, 1, "Main DepthStencilView");
     }
 
     D3D12_DEPTH_STENCIL_VIEW_DESC dsDesc = {};
@@ -58,7 +54,7 @@ void SetupDepthStencil(App& app, bool isResize)
     app.device->CreateDepthStencilView(
         app.depthStencilBuffer.Get(),
         &dsDesc,
-        app.dsHeap->GetCPUDescriptorHandleForHeapStart()
+        app.depthStencilDescriptor.CPUHandle()
     );
 }
 
@@ -211,12 +207,29 @@ void CreateMainRootSignature(App& app)
     sampler.RegisterSpace = 0;
     sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
+    D3D12_STATIC_SAMPLER_DESC shadowMapSampler = {};
+    shadowMapSampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    shadowMapSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    shadowMapSampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    shadowMapSampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    shadowMapSampler.MipLODBias = 0;
+    shadowMapSampler.MaxAnisotropy = 8;
+    shadowMapSampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+    shadowMapSampler.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
+    shadowMapSampler.MinLOD = 0.0f;
+    shadowMapSampler.MaxLOD = D3D12_FLOAT32_MAX;
+    shadowMapSampler.ShaderRegister = 1;
+    shadowMapSampler.RegisterSpace = 0;
+    shadowMapSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_STATIC_SAMPLER_DESC samplers[] = { sampler, shadowMapSampler };
+
     CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rootSignatureDesc;
     rootSignatureDesc.Init_1_1(
         _countof(rootParameters),
         rootParameters,
-        1,
-        &sampler,
+        _countof(samplers),
+        samplers,
         rootSignatureFlags
     );
 
@@ -230,8 +243,8 @@ void CreateMainRootSignature(App& app)
             &error
         )
     )) {
-        std::cout << "Error: root signature compilation failed\n";
-        std::cout << (char*)error->GetBufferPointer();
+        DebugLog() << "Error: root signature compilation failed\n";
+        DebugLog() << (char*)error->GetBufferPointer();
         abort();
     }
 
@@ -247,7 +260,7 @@ void CreateMainRootSignature(App& app)
 
 void SetupMipMapGenerator(App& app)
 {
-    ID3D12Device* device = app.device.Get();
+    ID3D12Device2* device = app.device.Get();
     D3D12_FEATURE_DATA_ROOT_SIGNATURE featureData = {};
     featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_1;
     if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &featureData, sizeof(featureData))))
@@ -362,7 +375,7 @@ void SetupGBufferPass(App& app)
     heapDesc.NumDescriptors = MaxDescriptors;
     heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    app.descriptorPool.Initialize(app.device.Get(), heapDesc, "GBufferPassArena");
+    app.descriptorPool.Initialize(app.device.Get(), heapDesc, "Main DescriptorPool");
 
     SetupMaterialBuffer(app);
 }
@@ -505,6 +518,14 @@ void InitD3D(App& app)
         app.rtvDescriptorPool.Initialize(app.device.Get(), rtvHeapDesc, "RTV Heap Arena");
     }
 
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC dsHeapDesc = {};
+        dsHeapDesc.NumDescriptors = MaxLightCount + 1;
+        dsHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+        dsHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+        app.dsvDescriptorPool.Initialize(app.device.Get(), dsHeapDesc, "DSV DescriptorPool");
+    }
+
     G_IncrementSizes.CbvSrvUav = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     G_IncrementSizes.Rtv = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
@@ -624,8 +645,70 @@ void UpdatePerPrimitiveConstantBuffers(App& app, const glm::mat4& projection, co
         for (const auto& primitive : mesh->primitives) {
             primitive->constantData->MVP = mvp;
             primitive->constantData->MV = mv;
+            primitive->constantData->M = modelMatrix;
         }
         meshIter = app.meshPool.Next(meshIter);
+    }
+}
+
+void SetupDirectionalLightShadowMap(App& app, Light& light)
+{
+    // We can use the same resource description as the GBuffer depth render target
+    // for directional shadow map lights.
+    auto resourceDesc = GBufferResourceDesc(GBufferTarget::GBuffer_Depth, light.directionalShadowMapSize, light.directionalShadowMapSize);
+
+    // Create the resource
+    {
+        D3D12_CLEAR_VALUE clearValue = {};
+        clearValue.Format = resourceDesc.Format;
+        clearValue.DepthStencil.Depth = 1.0f;
+        clearValue.DepthStencil.Stencil = 0;
+
+        D3D12MA::ALLOCATION_DESC allocDesc{};
+        allocDesc.HeapType = D3D12_HEAP_TYPE_DEFAULT;
+        ASSERT_HRESULT(
+            app.mainAllocator->CreateResource(
+                &allocDesc,
+                &resourceDesc,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                &clearValue,
+                &light.directionalShadowMap,
+                IID_NULL, nullptr
+            )
+        );
+    }
+
+    // Create SRV
+    {
+        light.directionalShadowMapSRV = AllocateDescriptorsUnique(app.descriptorPool, 1, "Directional light shadow SRV");
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvDesc.Format = DXGI_FORMAT_R32_FLOAT; // Can't use D32_FLOAT with SRVs...
+        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Texture2D.MipLevels = 1;
+        app.device->CreateShaderResourceView(
+            light.directionalShadowMap->GetResource(),
+            &srvDesc,
+            light.directionalShadowMapSRV.CPUHandle()
+        );
+
+        DebugTextureGUI(app, light.directionalShadowMap->GetResource(), &srvDesc);
+    }
+
+    // Create DSV
+    {
+        light.directionalShadowMapDSV = AllocateDescriptorsUnique(app.dsvDescriptorPool, 1, "Directional light shadow DSV");
+
+        D3D12_DEPTH_STENCIL_VIEW_DESC dsDesc = {};
+        dsDesc.Format = DepthFormat;
+        dsDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+        dsDesc.Flags = D3D12_DSV_FLAG_NONE;
+        app.device->CreateDepthStencilView(
+            light.directionalShadowMap->GetResource(),
+            &dsDesc,
+            light.directionalShadowMapDSV.CPUHandle()
+        );
     }
 }
 
@@ -635,6 +718,10 @@ void UpdateLightConstantBuffers(App& app, const glm::mat4& projection, const glm
     app.LightBuffer.passData->inverseViewMatrix = glm::inverse(view);
 
     for (UINT i = 0; i < app.LightBuffer.count; i++) {
+        if (app.lights[i].lightType == LightType_Directional && app.lights[i].directionalShadowMap == nullptr) {
+            SetupDirectionalLightShadowMap(app, app.lights[i]);
+        }
+
         app.lights[i].UpdateConstantData(view);
     }
 }
@@ -742,7 +829,7 @@ void BindAndClearGBufferRTVs(const App& app, ID3D12GraphicsCommandList* commandL
         renderTargetHandles[i + 1] = app.GBuffer.rtvs[i].CPUHandle();
     }
 
-    CD3DX12_CPU_DESCRIPTOR_HANDLE dsvHandle(app.dsHeap->GetCPUDescriptorHandleForHeapStart());
+    auto dsvHandle = app.depthStencilDescriptor.CPUHandle();
     commandList->OMSetRenderTargets(_countof(renderTargetHandles), renderTargetHandles, FALSE, &dsvHandle);
 
     // Clear render targets
@@ -753,35 +840,61 @@ void BindAndClearGBufferRTVs(const App& app, ID3D12GraphicsCommandList* commandL
     commandList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 }
 
-void TransitionRTVsForRendering(const App& app, ID3D12GraphicsCommandList* commandList)
+void TransitionResourcesForGBufferPass(const App& app, ID3D12GraphicsCommandList* commandList)
 {
     // Transition our GBuffers into being render targets.
-    std::array<D3D12_RESOURCE_BARRIER, GBuffer_Count> barriers;
+    std::vector<D3D12_RESOURCE_BARRIER> barriers;
+    barriers.reserve(GBuffer_Count + 2);
     // Back buffer
-    barriers[0] = CD3DX12_RESOURCE_BARRIER::Transition(app.renderTargets[app.frameIdx].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(app.renderTargets[app.frameIdx].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET));
     // GBuffer RTVs
     for (int i = 0; i < GBuffer_RTVCount; i++) {
-        barriers[i + 1] = CD3DX12_RESOURCE_BARRIER::Transition(app.GBuffer.renderTargets[i].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(app.GBuffer.renderTargets[i].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET));
     }
-    // Depth buffer is already in the correct state from AlphaBlendPass
+
+    // Transition any directional light shadow maps to being depth write state
+    for (UINT i = 0; i < app.LightBuffer.count; i++) {
+        if (app.lights[i].lightType == LightType_Directional) {
+            barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(
+                app.lights[i].directionalShadowMap->GetResource(),
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_DEPTH_WRITE
+            ));
+        }
+    }
+
     commandList->ResourceBarrier((UINT)barriers.size(), barriers.data());
 }
 
-void TransitionGBufferForLighting(const App& app, ID3D12GraphicsCommandList* commandList)
+void TransitionResourcesForLightPass(const App& app, ID3D12GraphicsCommandList* commandList)
 {
     // Transition them back to being shader resource views so that they can be used in the lighting shaders.
-    std::array<D3D12_RESOURCE_BARRIER, GBuffer_Count> barriers;
+    std::vector<D3D12_RESOURCE_BARRIER> barriers;
+    barriers.reserve(GBuffer_Count + 2);
     for (int i = 0; i < GBuffer_RTVCount; i++) {
-        barriers[i] = CD3DX12_RESOURCE_BARRIER::Transition(app.GBuffer.renderTargets[i].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(app.GBuffer.renderTargets[i].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
     }
+
     // Depth buffer is special
-    barriers[GBuffer_Depth] = CD3DX12_RESOURCE_BARRIER::Transition(app.depthStencilBuffer.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(app.depthStencilBuffer.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
+
+    // Transition any directional light shadow maps to being pixel resources
+    for (UINT i = 0; i < app.LightBuffer.count; i++) {
+        if (app.lights[i].lightType == LightType_Directional) {
+            barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(
+                app.lights[i].directionalShadowMap->GetResource(),
+                D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+            ));
+        }
+    }
+
     commandList->ResourceBarrier((UINT)barriers.size(), barriers.data());
 }
 
 void GBufferPass(App& app, ID3D12GraphicsCommandList* commandList)
 {
-    TransitionRTVsForRendering(app, commandList);
+    TransitionResourcesForGBufferPass(app, commandList);
 
     BindAndClearGBufferRTVs(app, commandList);
 
@@ -793,12 +906,75 @@ void GBufferPass(App& app, ID3D12GraphicsCommandList* commandList)
     DrawMeshesGBuffer(app, commandList);
 }
 
+// Renders all shadow maps for all lights.
+void ShadowPass(App& app, ID3D12GraphicsCommandList* commandList)
+{
+    for (UINT i = 0; i < app.LightBuffer.count; i++) {
+        auto& light = app.lights[i];
+        if (light.lightType == LightType_Directional) {
+            auto dsvHandle = light.directionalShadowMapDSV.CPUHandle();
+            commandList->OMSetRenderTargets(0, nullptr, FALSE, &dsvHandle);
+            commandList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+
+            D3D12_VIEWPORT viewport;
+            viewport.MinDepth = 0.0f;
+            viewport.MaxDepth = 1.0f;
+            viewport.TopLeftX = 0.0f;
+            viewport.TopLeftY = 0.0f;
+            viewport.Width = static_cast<float>(light.directionalShadowMapSize);
+            viewport.Height = static_cast<float>(light.directionalShadowMapSize);
+            commandList->RSSetViewports(1, &viewport);
+
+            CD3DX12_RECT scissorRect(0, 0, static_cast<LONG>(light.directionalShadowMapSize), static_cast<LONG>(light.directionalShadowMapSize));
+            commandList->RSSetScissorRects(1, &scissorRect);
+
+            auto meshIter = app.meshPool.Begin();
+
+            while (meshIter) {
+                if (!meshIter->isReadyForRender) {
+                    meshIter = app.meshPool.Next(meshIter);
+                    continue;
+                }
+
+                for (const auto& primitive : meshIter->primitives) {
+                    const auto& material = primitive->material.get();
+                    if (!material || !material->castsShadow) {
+                        continue;
+                    }
+
+                    // Set the per-primitive constant buffer
+                    UINT constantValues[5] = {
+                        primitive->perPrimitiveDescriptor.index,
+                         UINT_MAX,
+                         app.LightBuffer.cbvHandle.Index() + i + 1,
+                         UINT_MAX,
+                         primitive->miscDescriptorParameter.index
+                    };
+
+                    commandList->SetGraphicsRoot32BitConstants(0, _countof(constantValues), constantValues, 0);
+                    commandList->IASetPrimitiveTopology(primitive->primitiveTopology);
+                    commandList->SetPipelineState(primitive->directionalShadowPSO->Get());
+                    commandList->IASetVertexBuffers(0, (UINT)primitive->vertexBufferViews.size(), primitive->vertexBufferViews.data());
+                    commandList->IASetIndexBuffer(&primitive->indexBufferView);
+                    commandList->DrawIndexedInstanced(primitive->indexCount, 1, 0, 0, 0);
+
+                    app.Stats.drawCalls++;
+                }
+                meshIter = app.meshPool.Next(meshIter);
+            }
+        }
+    }
+}
+
 void LightPass(App& app, ID3D12GraphicsCommandList* commandList)
 {
-    TransitionGBufferForLighting(app, commandList);
+    TransitionResourcesForLightPass(app, commandList);
 
     auto rtvHandle = app.frameBufferRTVs[app.frameIdx].CPUHandle();
     commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
+
+    commandList->RSSetViewports(1, &app.viewport);
+    commandList->RSSetScissorRects(1, &app.scissorRect);
 
     {
         auto descriptorHeap = app.descriptorPool.Heap();
@@ -859,7 +1035,7 @@ void AlphaBlendPass(App& app, ID3D12GraphicsCommandList* commandList)
     commandList->ResourceBarrier(1, &barrier);
 
     auto rtvHandle = app.frameBufferRTVs[app.frameIdx].CPUHandle();
-    CD3DX12_CPU_DESCRIPTOR_HANDLE dsvHandle(app.dsHeap->GetCPUDescriptorHandleForHeapStart());
+    auto dsvHandle = app.depthStencilDescriptor.CPUHandle();
     commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, &dsvHandle);
 
     ID3D12DescriptorHeap* mainDescriptorHeap = app.descriptorPool.Heap();
@@ -888,10 +1064,11 @@ void BuildCommandList(App& app)
     commandList->RSSetScissorRects(1, &app.scissorRect);
 
     GBufferPass(app, commandList);
+    ShadowPass(app, commandList);
     LightPass(app, commandList);
     AlphaBlendPass(app, commandList);
 
-    ID3D12DescriptorHeap* ppHeaps[] = { app.ImGui.srvHeap.Get() };
+    ID3D12DescriptorHeap* ppHeaps[] = { app.ImGui.srvHeap.Heap() };
     commandList->SetDescriptorHeaps(1, ppHeaps);
     ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), commandList);
 
@@ -924,8 +1101,4 @@ void RenderFrame(App& app)
     app.graphicsQueue.WaitForEventCPU(renderEvent);
 
     app.frameIdx = app.swapChain->GetCurrentBackBufferIndex();
-}
-
-void EnsureRenderingFinished(App& app)
-{
 }

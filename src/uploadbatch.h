@@ -69,8 +69,9 @@ public:
         for (int i = 0; i < numSubresources; i++) {
             UINT64 requiredBytes = GetRequiredIntermediateSize(destResource, i, 1);
 
-            // FIXME: This case should be possible to handle
-            assert(requiredBytes <= uploadBufferSize);
+            // FIXME: This case should be possible to handle.
+            // Currently not sure how to split apart a texture upload, but it should be possible.
+            CHECK(requiredBytes <= uploadBufferSize);
 
             UINT64 offset;
             D3D12MA::VirtualAllocation allocation;
@@ -84,8 +85,6 @@ public:
                 Flush();
                 Wait();
 
-                // This *should* work 100%, as we've made sure we're not uploading >
-                // uploadBufferSize at once at this point.
                 ASSERT_HRESULT(
                     virtualBlock->Allocate(
                         &allocDesc,

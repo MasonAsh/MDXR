@@ -11,8 +11,6 @@ struct PSInput {
 #define METAL_ROUGHNESS_BUFFER 2
 #define DEPTH_BUFFER 3
 
-SamplerState g_samp : register(s0);
-
 float4 ClipToView(float4 clipCoord)
 {
     float4 view = mul(GetLightPassData().inverseProjection, clipCoord);
@@ -47,28 +45,45 @@ float4 PSMain(PSInput input) : SV_TARGET
     Texture2D normalTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + NORMAL_BUFFER];
     Texture2D metalRoughnessTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + METAL_ROUGHNESS_BUFFER];
     Texture2D depthTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + DEPTH_BUFFER];
+    Texture2D shadowMap = ResourceDescriptorHeap[light.directionalShadowMapDescriptorIdx];
 
-    float3 baseColor = pow(baseColorTexture.Sample(g_samp, input.uv).rgb, 2.2);
-    float depth = depthTexture.Sample(g_samp, input.uv).r;
-    float4 normal = normalTexture.Sample(g_samp, input.uv);
-    float4 metalRoughness = metalRoughnessTexture.Sample(g_samp, input.uv);
+    float3 baseColor = pow(baseColorTexture.Sample(g_sampler, input.uv).rgb, 2.2);
+    float depth = depthTexture.Sample(g_sampler, input.uv).r;
+    float4 normal = normalTexture.Sample(g_sampler, input.uv);
+    float4 metalRoughness = metalRoughnessTexture.Sample(g_sampler, input.uv);
 
     float roughness = metalRoughness.g;
     float metallic = metalRoughness.b;
 
     float4 viewPos = ScreenToView(float4(input.uv, depth, 1.0f));
 
-    float3 lightToFragment = (-viewPos.xyz) -  (-light.positionViewSpace.xyz);
+    float4 worldPos = mul(passData.inverseView, viewPos);
+
     float attenuation = 1.0f;
 
     float3 N = normal.xyz;
 
     // Light direction to fragment
-    float3 Wi = normalize(light.directionViewSpace.xyz);
+    float3 Wi = normalize(-light.directionViewSpace.xyz);
     // Direction from fragment to eye
     float3 Wo = normalize(-viewPos.xyz);
+    
+    //float bias = 0.005f;
+    //float bias = max(0.001f * (1.0f - dot(N, Wi)), 0.0005);
+    float bias = 0.0f;
 
-    if (passData.debug) return float4(Wi, 1);
+    float4 lightPos = mul(light.directionalLightViewProjection, float4(worldPos.xyz, 1.0f));
+
+    float3 projCoords = lightPos.xyz / lightPos.w;
+    projCoords.xy = projCoords.xy * 0.5f + 0.5f;
+    // DirectX UVs are vertically flipped from OpenGL
+    projCoords.y *= -1;
+    float closestDepth = shadowMap.Sample(g_sampler, projCoords.xy).r;
+    float currentDepth = projCoords.z;
+    float shadow = currentDepth - bias > closestDepth ? 1.0f : 0.0f;
+
+    //if (passData.debug) return float4(projCoords.xy, 0.0f, 1.0f);
+    if (passData.debug) return (float4)closestDepth;
 
     return ShadePBR(
         light.colorIntensity.xyz,
@@ -79,5 +94,5 @@ float4 PSMain(PSInput input) : SV_TARGET
         Wi,
         Wo,
         attenuation
-    );
+    ) * (1.0f - shadow);
 }

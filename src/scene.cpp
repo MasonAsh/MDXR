@@ -17,7 +17,7 @@ void InitializeLights(App& app)
     app.lights[0].color = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f);
     app.lights[0].intensity = 1.5f;
     app.lights[0].position = glm::vec3(0.0f);
-    app.lights[0].direction = glm::normalize(glm::vec3(0.0f, 1.0f, 1.0f));
+    app.lights[0].direction = glm::normalize(glm::vec3(1.0f, -0.4f, -1.0f));
     app.lights[0].range = 5.0f;
 
     for (int i = 1; i < MaxLightCount; i++) {
@@ -37,7 +37,6 @@ void InitializeScene(App& app)
 {
     InitializeCamera(app);
     InitializeLights(app);
-    //app.models[1].meshes[0]->translation = glm::vec3(0, 0.5f, 0.0f);
 }
 
 void StartSceneAssetLoad(App& app)
@@ -51,16 +50,17 @@ void StartSceneAssetLoad(App& app)
     EnqueueGLTF(app, dataDir + "/floor/floor.gltf");
     EnqueueGLTF(app, dataDir + "/FlightHelmet/FlightHelmet.gltf");
     // EnqueueGLTF(app, dataDir + "/metallicsphere.gltf");
-    //EnqueueGLTF(app, "C:\\Users\\mason\\dev\\glTF-Sample-Models\\Main\\tangified\\sponza_tangents.gltf");
+    // EnqueueGLTF(app, "C:\\Users\\mason\\dev\\glTF-Sample-Models\\Main\\tang2\\Sponza.gltf");
 
     SkyboxImagePaths images;
-    const std::string skyboxDir = "/ColorfulStudio/";
-    images.paths[CubeImage_Front] = dataDir + skyboxDir + "pz.png";
-    images.paths[CubeImage_Back] = dataDir + skyboxDir + "nz.png";
-    images.paths[CubeImage_Right] = dataDir + skyboxDir + "px.png";
-    images.paths[CubeImage_Left] = dataDir + skyboxDir + "nx.png";
-    images.paths[CubeImage_Top] = dataDir + skyboxDir + "py.png";
-    images.paths[CubeImage_Bottom] = dataDir + skyboxDir + "ny.png";
+    const std::string skyboxDir = "/Forest/";
+    const std::string extension = ".png";
+    images.paths[CubeImage_Front] = dataDir + skyboxDir + "pz" + extension;
+    images.paths[CubeImage_Back] = dataDir + skyboxDir + "nz" + extension;
+    images.paths[CubeImage_Right] = dataDir + skyboxDir + "px" + extension;
+    images.paths[CubeImage_Left] = dataDir + skyboxDir + "nx" + extension;
+    images.paths[CubeImage_Top] = dataDir + skyboxDir + "py" + extension;
+    images.paths[CubeImage_Bottom] = dataDir + skyboxDir + "ny" + extension;
 
     EnqueueSkybox(app, images);
 }

@@ -1,9 +1,12 @@
-struct PrimitiveData {
+struct PrimitiveData
+{
     float4x4 MVP;
     float4x4 MV;
+    float4x4 M;
 };
 
-struct MaterialData {
+struct MaterialData
+{
     float4 baseColorFactor;
     float4 metalRoughnessFactor;
     uint baseColorTextureIdx;
@@ -11,7 +14,8 @@ struct MaterialData {
     uint metalRoughnessIdx;
 };
 
-struct LightConstantData {
+struct LightConstantData
+{
     float4 position;
     float4 direction;
 
@@ -20,15 +24,20 @@ struct LightConstantData {
 
     float4 colorIntensity;
 
-    float range;
+    float4x4 directionalLightViewProjection;
 
+    float range;
+    uint directionalShadowMapDescriptorIdx;
     uint type;
+
+    float pad[25];
 };
 
 #define LIGHT_POINT 0
 #define LIGHT_DIRECTIONAL 1
 
-struct LightPassConstantData {
+struct LightPassConstantData
+{
     float4x4 inverseProjection;
     float4x4 inverseView;
     float4 environmentIntensity;
@@ -67,6 +76,7 @@ cbuffer Indices : register(b0) {
 };
 
 SamplerState g_sampler : register(s0);
+SamplerState g_samplerShadowMap : register(s1);
 
 float4 DoNormalMap(Texture2D normalMap, float3x3 TBN, float2 uv)
 {

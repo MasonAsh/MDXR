@@ -3,6 +3,12 @@
         "generator" : "Khronos glTF Blender I/O v1.7.33",
         "version" : "2.0"
     },
+    "extensionsUsed" : [
+        "KHR_texture_transform"
+    ],
+    "extensionsRequired" : [
+        "KHR_texture_transform"
+    ],
     "scene" : 0,
     "scenes" : [
         {
@@ -28,15 +34,66 @@
             "doubleSided" : true,
             "name" : "Material.002",
             "normalTexture" : {
+                "extensions" : {
+                    "KHR_texture_transform" : {
+                        "offset" : [
+                            0,
+                            -2
+                        ],
+                        "scale" : [
+                            3,
+                            3
+                        ]
+                    }
+                },
                 "index" : 0
+            },
+            "occlusionTexture" : {
+                "extensions" : {
+                    "KHR_texture_transform" : {
+                        "offset" : [
+                            0,
+                            -2
+                        ],
+                        "scale" : [
+                            3,
+                            3
+                        ]
+                    }
+                },
+                "index" : 1
             },
             "pbrMetallicRoughness" : {
                 "baseColorTexture" : {
-                    "index" : 1
+                    "extensions" : {
+                        "KHR_texture_transform" : {
+                            "offset" : [
+                                0,
+                                -2
+                            ],
+                            "scale" : [
+                                3,
+                                3
+                            ]
+                        }
+                    },
+                    "index" : 2
                 },
                 "metallicFactor" : 0,
                 "metallicRoughnessTexture" : {
-                    "index" : 2
+                    "extensions" : {
+                        "KHR_texture_transform" : {
+                            "offset" : [
+                                0,
+                                -2
+                            ],
+                            "scale" : [
+                                3,
+                                3
+                            ]
+                        }
+                    },
+                    "index" : 1
                 }
             }
         }
@@ -75,18 +132,18 @@
     "images" : [
         {
             "mimeType" : "image/png",
-            "name" : "kitchen_wood_nor_gl_4k",
-            "uri" : "textures/kitchen_wood_nor_gl_4k.png"
-        },
-        {
-            "mimeType" : "image/jpeg",
-            "name" : "kitchen_wood_diff_4k",
-            "uri" : "textures/kitchen_wood_diff_4k.jpg"
+            "name" : "tiling_72_normal-4K",
+            "uri" : "textures/tiling_72_normal-4K.png"
         },
         {
             "mimeType" : "image/png",
-            "name" : "kitchen_wood_rough_4k",
-            "uri" : "textures/kitchen_wood_rough_4k.png"
+            "name" : "tiling_72_ambientocclusion-4K-tiling_72_roughness-4K",
+            "uri" : "textures/tiling_72_ambientocclusion-4K-tiling_72_roughness-4K.png"
+        },
+        {
+            "mimeType" : "image/png",
+            "name" : "tiling_72_basecolor-4K",
+            "uri" : "textures/tiling_72_basecolor-4K.png"
         }
     ],
     "accessors" : [

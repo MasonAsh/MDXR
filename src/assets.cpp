@@ -215,6 +215,7 @@ void CreateModelMaterials(
         material->metalRoughnessFactor.b = static_cast<float>(inputMaterial.pbrMetallicRoughness.metallicFactor);
         material->cbvDescriptor = std::move(descriptor);
         material->name = inputMaterial.name;
+        material->castsShadow = material->receivesShadow = true;
         material->UpdateConstantData();
 
         modelMaterials.push_back(SharedPoolItem<Material>(material));
@@ -880,6 +881,14 @@ PoolItem<Primitive> CreateModelPrimitive(
         );
     }
 
+    primitive->directionalShadowPSO = CreateDirectionalLightShadowMapPSO(
+        app.psoManager,
+        app.device.Get(),
+        app.dataDir,
+        app.rootSignature.Get(),
+        primitive->inputLayout
+    );
+
     D3D12_INDEX_BUFFER_VIEW& ibv = primitive->indexBufferView;
     int accessorIdx = inputPrimitive.indices;
     auto& accessor = inputModel.accessors[accessorIdx];
@@ -1395,10 +1404,17 @@ void CreateSkybox(App& app, const SkyboxAssets& asset, AssetLoadProgress* progre
     auto cubemapUpload = uploadBatch.Finish();
     app.copyQueue.WaitForEventCPU(cubemapUpload);
 
+    SharedPoolItem<Material> material = app.materials.AllocateShared();
+    material->castsShadow = false;
+    material->receivesShadow = false;
+    material->materialType = MaterialType_Unlit;
+    material->name = "Internal Skybox";
+
     PoolItem<Primitive> primitive = app.primitivePool.AllocateUnique();
     primitive->indexBufferView.BufferLocation = indexBuffer->GetResource()->GetGPUVirtualAddress();
     primitive->indexBufferView.Format = DXGI_FORMAT_R16_UINT;
     primitive->indexBufferView.SizeInBytes = sizeof(indices);
+    primitive->material = material;
 
     D3D12_VERTEX_BUFFER_VIEW vertexView;
     vertexView.BufferLocation = vertexBuffer->GetResource()->GetGPUVirtualAddress();

@@ -8,6 +8,17 @@
 #include <directx/d3dx12.h>
 #include <tinyfiledialogs.h>
 
+void DebugTextureGUI(App& app, ID3D12Resource* resource, D3D12_SHADER_RESOURCE_VIEW_DESC* srvDesc)
+{
+    app.ImGui.debugSRV = AllocateDescriptorsUnique(app.ImGui.srvHeap, 1, "ImGUI Debug SRV");
+
+    app.device->CreateShaderResourceView(
+        resource,
+        srvDesc,
+        app.ImGui.debugSRV.CPUHandle()
+    );
+}
+
 void InitImGui(App& app)
 {
     IMGUI_CHECKVERSION();
@@ -18,23 +29,25 @@ void InitImGui(App& app)
     {
         D3D12_DESCRIPTOR_HEAP_DESC desc = {};
         desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        desc.NumDescriptors = 1;
+        desc.NumDescriptors = 10;
         desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-        ASSERT_HRESULT(app.device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&app.ImGui.srvHeap)));
+        app.ImGui.srvHeap.Initialize(app.device.Get(), desc, "ImGUI DescriptorPool");
     }
 
     CHECK(
         ImGui_ImplSDL2_InitForD3D(app.window)
     );
 
+    app.ImGui.fontSRV = AllocateDescriptorsUnique(app.ImGui.srvHeap, 1, "ImGUI Fonts SRV");
+
     CHECK(
         ImGui_ImplDX12_Init(
             app.device.Get(),
             FrameBufferCount,
             DXGI_FORMAT_R8G8B8A8_UNORM,
-            app.ImGui.srvHeap.Get(),
-            app.ImGui.srvHeap->GetCPUDescriptorHandleForHeapStart(),
-            app.ImGui.srvHeap->GetGPUDescriptorHandleForHeapStart()
+            app.ImGui.srvHeap.Heap(),
+            app.ImGui.fontSRV.CPUHandle(),
+            app.ImGui.fontSRV.GPUHandle()
         )
     );
 }
@@ -114,7 +127,12 @@ void DrawMaterialEditor(App& app)
                     selectedMaterial = materialIter.item;
                 }
 
-                if (ImGui::Selectable(materialIter->name.c_str(), isSelected)) {
+                const char* materialName = materialIter->name.c_str();
+                if (materialIter->name.empty()) {
+                    materialName = "UNNAMED";
+                }
+
+                if (ImGui::Selectable(materialName, isSelected)) {
                     selectedMaterialIdx = materialIdx;
                     break;
                 }
@@ -310,6 +328,13 @@ void DrawGeekMenu(App& app)
         float degreesFOV = glm::degrees(app.camera.fovY);
         ImGui::DragFloat("Camera FOVy Degrees", &degreesFOV, 0.05f, 0.01f, 180.0f);
         app.camera.fovY = glm::radians(degreesFOV);
+
+        if (app.ImGui.debugSRV.IsValid()) {
+            ImGui::Text("Debug texture:");
+            auto handle = app.ImGui.debugSRV.GPUHandle();
+            ImVec2 debugSize = ImGui::GetContentRegionAvail();
+            ImGui::Image(*reinterpret_cast<void**>(&handle), debugSize);
+        }
 
         for (const auto& loadInfo : app.AssetThread.assetLoadInfo) {
             if (loadInfo->isFinished) {

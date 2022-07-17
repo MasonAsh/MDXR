@@ -75,6 +75,11 @@ struct DescriptorAlloc
     ID3D12DescriptorHeap* heap;
     UINT incrementSize;
 
+    DescriptorAlloc()
+        : index(-1)
+        , heap(nullptr)
+        , incrementSize(0) {}
+
     CD3DX12_CPU_DESCRIPTOR_HANDLE CPUHandle(int offset = 0) const
     {
         return CD3DX12_CPU_DESCRIPTOR_HANDLE(heap->GetCPUDescriptorHandleForHeapStart(), index + offset, incrementSize);

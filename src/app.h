@@ -17,10 +17,13 @@
 #include <dxgi1_3.h>
 #include <DXProgrammableCapture.h>
 
+#include <DirectXMath.h>
+
 #include <tiny_gltf.h>
 
 #include <glm/glm.hpp>
 #include <glm/gtc/constants.hpp>
+#include <glm/gtc/type_ptr.hpp>
 
 #include <span>
 #include <string>
@@ -63,7 +66,8 @@ struct PerPrimitiveConstantData
     // MVP & MV are PerMesh, but most meshes only have one primitive.
     glm::mat4 MVP;
     glm::mat4 MV;
-    float padding[32];
+    glm::mat4 M;
+    float padding[16];
 };
 static_assert((sizeof(PerPrimitiveConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
 
@@ -105,12 +109,22 @@ struct Material
     glm::vec4 baseColorFactor = glm::vec4(1.0f);
     glm::vec4 metalRoughnessFactor = glm::vec4(0.0f, 1.0f, 0.0f, 1.0f);
 
+    bool castsShadow = true;
+    bool receivesShadow = true;
+
     MaterialType materialType;
 
     std::string name;
 
     void UpdateConstantData()
     {
+        // CPU only material.
+        // For example: Skybox has a material to flag that it doesn't cast or receive shadows,
+        // but isn't GPU visible and has no constant data.
+        if (!constantData) {
+            return;
+        }
+
         constantData->baseColorTextureIdx = textureDescriptors.baseColor.index;
         constantData->normalTextureIdx = textureDescriptors.normal.index;
         constantData->metalRoughnessTextureIdx = textureDescriptors.metalRoughness.index;
@@ -134,6 +148,8 @@ struct Primitive
     // Optional custom descriptor for special primitive shaders. Can be anything.
     // For example, the skybox uses this for the texcube shader parameter.
     DescriptorRef miscDescriptorParameter;
+
+    ManagedPSORef directionalShadowPSO;
 
     SharedPoolItem<Material> material = nullptr;
 };
@@ -325,11 +341,15 @@ struct LightConstantData
 
     glm::vec4 colorIntensity;
 
-    float range;
+    // NOTE: This might be better off in a separate constant buffer.
+    // Point lights will potentially need 6 of these.
+    glm::mat4 directionalLightViewProjection;
 
+    float range;
+    UINT directionalShadowMapDescriptorIdx;
     UINT lightType;
 
-    float pad[42];
+    float pad[25];
 };
 static_assert((sizeof(LightConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
 
@@ -443,15 +463,41 @@ struct Light
 
     LightType lightType;
 
+    ComPtr<D3D12MA::Allocation> directionalShadowMap;
+    UniqueDescriptors directionalShadowMapSRV;
+    UniqueDescriptors directionalShadowMapDSV;
+
+    UINT directionalShadowMapSize = 4096;
+    float frustumSize = 4.0f;
+
     void UpdateConstantData(glm::mat4 viewMatrix)
     {
+        glm::vec3 normalizedDirection = glm::normalize(direction);
         constantData->position = glm::vec4(position, 1.0f);
-        constantData->direction = glm::vec4(direction, 0.0f);
+        constantData->direction = glm::vec4(normalizedDirection, 0.0f);
         constantData->positionViewSpace = viewMatrix * constantData->position;
         constantData->directionViewSpace = viewMatrix * glm::normalize(constantData->direction);
         constantData->colorIntensity = glm::vec4(color * intensity, 1.0f);
         constantData->range = range;
+        constantData->directionalShadowMapDescriptorIdx = directionalShadowMapSRV.Index();
         constantData->lightType = (UINT)lightType;
+
+        if (lightType == LightType_Directional) {
+            DirectX::XMMATRIX mat = DirectX::XMMatrixOrthographicRH(frustumSize, frustumSize, -frustumSize, frustumSize);
+            //glm::mat4 directionalProjection = glm::transpose(glm::make_mat4(reinterpret_cast<float*>(&mat.r)));
+            glm::mat4 directionalProjection = glm::ortho(-frustumSize, frustumSize, -frustumSize, frustumSize, 0.1f, frustumSize * 2.0f);
+            //glm::mat4 directionalProjection = glm::perspective(0.628319f, 1.0f, 0.1f, 10.0f);
+            glm::vec3 eye = -normalizedDirection * frustumSize * 1.2f;
+
+            glm::vec3 up(0.0f, 1.0f, 0.0f);
+            if (abs(glm::dot(up, normalizedDirection)) > 0.99f) {
+                // If the light is pointing straight up or down, we can't use the normal up vector
+                up = glm::vec3(1.0f, 0.0f, 0.0f);
+            }
+
+            glm::mat4 directionalView = glm::lookAt(eye, glm::vec3(0, 0, 0), up);
+            constantData->directionalLightViewProjection = directionalProjection * directionalView;
+        }
     }
 };
 
@@ -468,6 +514,7 @@ struct App
     // NOTE: DESTRUCTOR ORDER IS IMPORTANT ON THESE. LEAVE AT TOP.
     DescriptorPool descriptorPool;
     DescriptorPool rtvDescriptorPool;
+    DescriptorPool dsvDescriptorPool;
 
     std::string dataDir;
     std::wstring wDataDir;
@@ -499,7 +546,7 @@ struct App
     Pool<Material, 128> materials;
     ConstantBufferArena<MaterialConstantData> materialConstantBuffer;
 
-    ComPtr<ID3D12Device> device;
+    ComPtr<ID3D12Device2> device;
     CommandQueue graphicsQueue;
     ComPtr<ID3D12CommandAllocator> commandAllocator;
     ComPtr<IDXGISwapChain3> swapChain;
@@ -514,7 +561,7 @@ struct App
     ComPtr<ID3D12CommandAllocator> computeCommandAllocator;
 
     ComPtr<ID3D12Resource> depthStencilBuffer;
-    ComPtr<ID3D12DescriptorHeap> dsHeap;
+    UniqueDescriptors depthStencilDescriptor;
 
     tinygltf::TinyGLTF loader;
 
@@ -536,13 +583,16 @@ struct App
 
     struct
     {
-        ComPtr<ID3D12DescriptorHeap> srvHeap;
+        DescriptorPool srvHeap;
         bool lightsOpen = true;
         bool meshesOpen = true;
         bool materialsOpen = false;
         bool geekOpen = true;
         bool demoOpen = false;
         bool showStats = true;
+
+        UniqueDescriptors fontSRV;
+        UniqueDescriptors debugSRV;
     } ImGui;
 
 
