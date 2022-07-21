@@ -329,3 +329,11 @@ ManagedPSORef CreateSkyboxComputeLightMapsPSO(
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
 );
+
+ManagedPSORef CreateToneMapPSO(
+    PSOManager& manager,
+    ID3D12Device2* device,
+    const std::string& dataDir,
+    ID3D12RootSignature* rootSignature,
+    const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
+);

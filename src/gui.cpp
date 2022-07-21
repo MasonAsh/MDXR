@@ -65,7 +65,7 @@ void DrawMeshEditor(App& app)
     if (!app.ImGui.meshesOpen) {
         return;
     }
-    if (ImGui::Begin("Mesh Editor", &app.ImGui.meshesOpen, 0)) {
+    if (ImGui::Begin("Mesh Editor", &app.ImGui.meshesOpen, ImGuiWindowFlags_AlwaysAutoResize)) {
         Mesh* selectedMesh = nullptr;
 
         if (ImGui::BeginListBox("Meshes")) {
@@ -235,6 +235,8 @@ void DrawLightEditor(App& app)
 
         ImGui::Separator();
         ImGui::DragFloat3("Environment Intensity", &app.LightBuffer.passData->environmentIntensity[0]);
+        ImGui::DragFloat("Gamma", &app.PostProcessPass.gamma, 0.1f, 0.0f, 3.0f, nullptr, 1.0f);
+        ImGui::DragFloat("Exposure", &app.PostProcessPass.exposure, 0.1f, 0.0f, 2.0f, nullptr, 1.0f);
     }
 
     ImGui::End();

@@ -33,7 +33,7 @@ const UINT FrameBufferCount = 2;
 const UINT MaxLightCount = 64;
 const UINT MaxMaterialCount = 2048;
 const UINT MaxDescriptors = 4096;
-const DXGI_FORMAT DepthFormat = DXGI_FORMAT_D32_FLOAT;
+const DXGI_FORMAT DepthStencilFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
 
 enum ConstantIndex
 {
@@ -468,7 +468,7 @@ struct Light
     UniqueDescriptors directionalShadowMapDSV;
 
     UINT directionalShadowMapSize = 4096;
-    float frustumSize = 4.0f;
+    float frustumSize = 30.0f;
 
     void UpdateConstantData(glm::mat4 viewMatrix)
     {
@@ -574,6 +574,7 @@ struct App
     unsigned int frameIdx;
 
     DescriptorRef frameBufferRTVs[FrameBufferCount];
+    DescriptorRef nonSRGBFrameBufferRTVs[FrameBufferCount];
 
     Camera camera;
     const UINT8* keyState;
@@ -627,6 +628,12 @@ struct App
     } LightBuffer;
 
     std::array<Light, MaxLightCount> lights;
+
+    struct {
+        ManagedPSORef toneMapPSO;
+        float gamma = 2.2f;
+        float exposure = 1.0f;
+    } PostProcessPass;
 
     // Per primitive constant buffer for cubemap rendering
     // Contains the view projection matrices for all CubeImage_*

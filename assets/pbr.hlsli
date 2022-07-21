@@ -60,7 +60,7 @@ float4 ShadePBR(
     float cosWh = max(0.0, dot(N, H));
     float cosWo = max(0.0, dot(N, Wo));
 
-    float3 F = FSchlick(max(0.0, dot(H, Wo)), F0);
+    float3 F = FSchlick(clamp(dot(H, Wo), 0.0f, 1.0f), F0);
     float G = DistributionGGX(cosWh, roughness);
     float D = GeometrySmith(cosWi, cosWo, roughness);
 
@@ -70,14 +70,13 @@ float4 ShadePBR(
     float denominator = max(Epsilon, 4.0 * cosWi * cosWo);
     float3 specular = numerator / denominator;
 
-    float4 diffuseBRDF = float4(kD, 1.0f) * baseColor * baseColor.a;
+    float3 diffuseBRDF = kD * baseColor.rgb * baseColor.a;
 
-    float4 Lo = (diffuseBRDF + float4(specular, 1.0f)) * float4(radiance, 1) * cosWi;
+    float3 Lo = (diffuseBRDF + specular) * radiance * cosWi;
 
-    float4 color = float4(Lo);
+    float4 color = float4(Lo, 1.0f);
 
-    color = color / (color + 1.0f);
-    color = pow(color, 1.0/2.2);
+    color.rgb = color.rgb / (color.rgb + 1.0f);
 
     return color;
 }

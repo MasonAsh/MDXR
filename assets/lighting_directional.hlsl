@@ -6,11 +6,6 @@ struct PSInput {
     float2 uv : TEXCOORD;
 };
 
-#define BASE_COLOR_BUFFER 0
-#define NORMAL_BUFFER 1
-#define METAL_ROUGHNESS_BUFFER 2
-#define DEPTH_BUFFER 3
-
 float4 ClipToView(float4 clipCoord)
 {
     float4 view = mul(GetLightPassData().inverseProjection, clipCoord);
@@ -35,19 +30,18 @@ PSInput VSMain(uint id : SV_VertexID)
 
 // P = position of point being shaded in view space
 // N = normal of point being shaded in view space
-[earlydepthstencil]
 float4 PSMain(PSInput input) : SV_TARGET
 {
     ConstantBuffer<LightPassConstantData> passData = GetLightPassData();
     ConstantBuffer<LightConstantData> light = GetLight();
 
-    Texture2D baseColorTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + BASE_COLOR_BUFFER];
-    Texture2D normalTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + NORMAL_BUFFER];
-    Texture2D metalRoughnessTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + METAL_ROUGHNESS_BUFFER];
-    Texture2D depthTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + DEPTH_BUFFER];
+    Texture2D baseColorTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + GBUFFER_BASE_COLOR];
+    Texture2D normalTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + GBUFFER_NORMAL];
+    Texture2D metalRoughnessTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + GBUFFER_METAL_ROUGHNESS];
+    Texture2D depthTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + GBUFFER_DEPTH];
     Texture2D shadowMap = ResourceDescriptorHeap[light.directionalShadowMapDescriptorIdx];
 
-    float3 baseColor = pow(baseColorTexture.Sample(g_sampler, input.uv).rgb, 2.2);
+    float3 baseColor = baseColorTexture.Sample(g_sampler, input.uv).rgb;
     float depth = depthTexture.Sample(g_sampler, input.uv).r;
     float4 normal = normalTexture.Sample(g_sampler, input.uv);
     float4 metalRoughness = metalRoughnessTexture.Sample(g_sampler, input.uv);
@@ -68,10 +62,6 @@ float4 PSMain(PSInput input) : SV_TARGET
     // Direction from fragment to eye
     float3 Wo = normalize(-viewPos.xyz);
     
-    //float bias = 0.005f;
-    //float bias = max(0.001f * (1.0f - dot(N, Wi)), 0.0005);
-    float bias = 0.0f;
-
     float4 lightPos = mul(light.directionalLightViewProjection, float4(worldPos.xyz, 1.0f));
 
     float3 projCoords = lightPos.xyz / lightPos.w;
@@ -80,12 +70,12 @@ float4 PSMain(PSInput input) : SV_TARGET
     projCoords.y *= -1;
     float closestDepth = shadowMap.Sample(g_sampler, projCoords.xy).r;
     float currentDepth = projCoords.z;
-    float shadow = currentDepth - bias > closestDepth ? 1.0f : 0.0f;
+    float shadow = currentDepth > closestDepth ? 1.0f : 0.0f;
 
     //if (passData.debug) return float4(projCoords.xy, 0.0f, 1.0f);
     if (passData.debug) return (float4)closestDepth;
 
-    return ShadePBR(
+    float4 color = ShadePBR(
         light.colorIntensity.xyz,
         float4(baseColor, 1.0f),
         N,
@@ -94,5 +84,8 @@ float4 PSMain(PSInput input) : SV_TARGET
         Wi,
         Wo,
         attenuation
-    ) * (1.0f - shadow);
+    );
+    color.rgb *=  (1.0f - shadow);
+
+    return color;
 }

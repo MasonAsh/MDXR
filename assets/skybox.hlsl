@@ -31,5 +31,5 @@ PSInput VSMain(Vertex input)
 float4 PSMain(PSInput input) : SV_TARGET0
 {
     TextureCube skybox = GetSkyboxTexture();
-    return skybox.Sample(g_sampler, input.texcoord);
+    return float4(skybox.Sample(g_sampler, input.texcoord).rgb, 1.0f);
 }

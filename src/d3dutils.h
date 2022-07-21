@@ -117,7 +117,7 @@ inline void CreateConstantBufferAndViews(
     }
 }
 
-inline D3D12_RESOURCE_DESC GetImageResourceDesc(const tinygltf::Image& image)
+inline D3D12_RESOURCE_DESC GetImageResourceDesc(const tinygltf::Image& image, bool isSRGB)
 {
     D3D12_RESOURCE_DESC desc = {};
     desc.Width = image.width;
@@ -136,10 +136,13 @@ inline D3D12_RESOURCE_DESC GetImageResourceDesc(const tinygltf::Image& image)
 
     switch (image.pixel_type) {
     case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
-        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.Format = !isSRGB ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
         break;
     case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT:
         desc.Format = DXGI_FORMAT_R16G16B16A16_UNORM;
+        if (isSRGB) {
+            DebugLog() << "16Bit image will not be treated as SRGB";
+        }
         break;
     default:
         abort();

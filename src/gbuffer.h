@@ -3,6 +3,7 @@
 #include <directx/d3dx12.h>
 
 enum GBufferTarget {
+    GBuffer_Radiance,
     GBuffer_BaseColor,
     GBuffer_Normal,
     GBuffer_MetalRoughness,
@@ -27,6 +28,9 @@ inline D3D12_RESOURCE_DESC GBufferResourceDesc(GBufferTarget target, int windowW
     // https://www.3dgep.com/forward-plus/#:~:text=G%2Dbuffer%20pass.-,Layout%20Summary,G%2Dbuffer%20layout%20looks%20similar%20to%20the%20table%20shown%20below.,-R
     switch (target)
     {
+    case GBuffer_Radiance:
+        desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        break;
     case GBuffer_BaseColor:
     case GBuffer_MetalRoughness:
         desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -35,7 +39,7 @@ inline D3D12_RESOURCE_DESC GBufferResourceDesc(GBufferTarget target, int windowW
         desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
         break;
     case GBuffer_Depth:
-        desc.Format = DXGI_FORMAT_D32_FLOAT;
+        desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
         desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
         break;
     };

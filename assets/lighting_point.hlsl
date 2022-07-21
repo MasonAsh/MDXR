@@ -6,11 +6,6 @@ struct PSInput {
     float2 uv : TEXCOORD;
 };
 
-#define BASE_COLOR_BUFFER 0
-#define NORMAL_BUFFER 1
-#define METAL_ROUGHNESS_BUFFER 2
-#define DEPTH_BUFFER 3
-
 float4 ClipToView(float4 clipCoord)
 {
     float4 view = mul(GetLightPassData().inverseProjection, clipCoord);
@@ -35,18 +30,17 @@ PSInput VSMain(uint id : SV_VertexID)
 
 // P = position of point being shaded in view space
 // N = normal of point being shaded in view space
-[earlydepthstencil]
 float4 PSMain(PSInput input) : SV_TARGET
 {
     ConstantBuffer<LightPassConstantData> passData = GetLightPassData();
     ConstantBuffer<LightConstantData> light = GetLight();
 
-    Texture2D baseColorTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + BASE_COLOR_BUFFER];
-    Texture2D normalTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + NORMAL_BUFFER];
-    Texture2D metalRoughnessTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + METAL_ROUGHNESS_BUFFER];
-    Texture2D depthTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + DEPTH_BUFFER];
+    Texture2D baseColorTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + GBUFFER_BASE_COLOR];
+    Texture2D normalTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + GBUFFER_NORMAL];
+    Texture2D metalRoughnessTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + GBUFFER_METAL_ROUGHNESS];
+    Texture2D depthTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + GBUFFER_DEPTH];
 
-    float3 baseColor = pow(baseColorTexture.Sample(g_sampler, input.uv).rgb, 2.2);
+    float3 baseColor = baseColorTexture.Sample(g_sampler, input.uv).rgb;
     float depth = depthTexture.Sample(g_sampler, input.uv).r;
     float4 normal = normalTexture.Sample(g_sampler, input.uv);
     float4 metalRoughness = metalRoughnessTexture.Sample(g_sampler, input.uv);

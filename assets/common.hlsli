@@ -65,6 +65,12 @@ float3 ExpandNormal(float3 n)
 
 #define PREFILTER_MAP_MIPCOUNT 5
 
+#define GBUFFER_RADIANCE 0
+#define GBUFFER_BASE_COLOR 1
+#define GBUFFER_NORMAL 2
+#define GBUFFER_METAL_ROUGHNESS 3
+#define GBUFFER_DEPTH 4
+
 #ifndef NO_DEFAULT_RESOURCES
 
 cbuffer Indices : register(b0) {

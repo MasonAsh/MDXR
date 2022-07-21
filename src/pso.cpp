@@ -57,7 +57,48 @@ D3D12_GRAPHICS_PIPELINE_STATE_DESC DefaultGraphicsPSODesc()
     psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     psoDesc.SampleDesc.Count = 1;
     psoDesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
-    psoDesc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    psoDesc.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+
+    return psoDesc;
+}
+
+D3D12_GRAPHICS_PIPELINE_STATE_DESC DefaultLightPSODesc()
+{
+    // Unlike other PSOs, we go clockwise here.
+    CD3DX12_RASTERIZER_DESC rasterizerState(D3D12_DEFAULT);
+
+    auto psoDesc = DefaultGraphicsPSODesc();
+    psoDesc.DepthStencilState.DepthEnable = FALSE;
+    // Only write lighting to areas in the stencil mask
+    psoDesc.DepthStencilState.StencilEnable = TRUE;
+    psoDesc.DepthStencilState.StencilReadMask = 0xff;
+    psoDesc.DepthStencilState.StencilWriteMask = 0x00;
+    psoDesc.DepthStencilState.FrontFace.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+    psoDesc.DepthStencilState.FrontFace.StencilFailOp = D3D12_STENCIL_OP_KEEP;
+    psoDesc.DepthStencilState.FrontFace.StencilPassOp = D3D12_STENCIL_OP_KEEP;
+    psoDesc.DepthStencilState.FrontFace.StencilFunc = D3D12_COMPARISON_FUNC_EQUAL;
+    psoDesc.DepthStencilState.BackFace.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+    psoDesc.DepthStencilState.BackFace.StencilFailOp = D3D12_STENCIL_OP_KEEP;
+    psoDesc.DepthStencilState.BackFace.StencilPassOp = D3D12_STENCIL_OP_KEEP;
+    psoDesc.DepthStencilState.BackFace.StencilFunc = D3D12_COMPARISON_FUNC_EQUAL;
+    psoDesc.RasterizerState = rasterizerState;
+
+    psoDesc.RTVFormats[0] = GBufferResourceDesc(GBuffer_Radiance, 0, 0).Format;
+
+    // Blending enabled for the accumulation (back) buffer
+    D3D12_RENDER_TARGET_BLEND_DESC blendDesc;
+    blendDesc.BlendEnable = TRUE;
+    blendDesc.LogicOpEnable = FALSE;
+    blendDesc.SrcBlend = D3D12_BLEND_ONE;
+    blendDesc.DestBlend = D3D12_BLEND_ONE;
+    blendDesc.BlendOp = D3D12_BLEND_OP_ADD;
+    blendDesc.SrcBlendAlpha = D3D12_BLEND_ONE;
+    blendDesc.DestBlendAlpha = D3D12_BLEND_ZERO;
+    blendDesc.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    blendDesc.LogicOp = D3D12_LOGIC_OP_NOOP;
+    blendDesc.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+    psoDesc.BlendState.RenderTarget[0] = blendDesc;
 
     return psoDesc;
 }
@@ -170,10 +211,28 @@ ManagedPSORef CreateMeshPBRPSO(
 )
 {
     auto psoDesc = DefaultGraphicsPSODesc();
+
     psoDesc.NumRenderTargets = GBuffer_RTVCount + 1;
-    for (UINT i = 1; i < psoDesc.NumRenderTargets; i++) {
-        psoDesc.RTVFormats[i] = GBufferResourceDesc((GBufferTarget)(i - 1), 0, 0).Format;
+    for (UINT i = 0; i < psoDesc.NumRenderTargets; i++) {
+        psoDesc.RTVFormats[i] = GBufferResourceDesc((GBufferTarget)(i), 0, 0).Format;
     }
+
+    // Use stencil to indicate which pixels are drawn in the GBuffer pipeline.
+    psoDesc.DepthStencilState.StencilEnable = TRUE;
+    psoDesc.DepthStencilState.StencilWriteMask = 0xff;
+
+    // Always write front faces
+    psoDesc.DepthStencilState.FrontFace.StencilPassOp = D3D12_STENCIL_OP_REPLACE;
+    psoDesc.DepthStencilState.FrontFace.StencilFailOp = D3D12_STENCIL_OP_KEEP;
+    psoDesc.DepthStencilState.FrontFace.StencilFailOp = D3D12_STENCIL_OP_KEEP;
+    psoDesc.DepthStencilState.FrontFace.StencilFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+
+    // Ignore backfaces
+    psoDesc.DepthStencilState.BackFace.StencilFailOp = D3D12_STENCIL_OP_KEEP;
+    psoDesc.DepthStencilState.BackFace.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+    psoDesc.DepthStencilState.BackFace.StencilPassOp = D3D12_STENCIL_OP_KEEP;
+    psoDesc.DepthStencilState.BackFace.StencilFunc = D3D12_COMPARISON_FUNC_NEVER;
+
     return SimpleCreateGraphicsPSO(
         manager,
         device,
@@ -193,10 +252,10 @@ ManagedPSORef CreateMeshAlphaBlendedPBRPSO(
 )
 {
     auto psoDesc = DefaultGraphicsPSODesc();
-    psoDesc.NumRenderTargets = GBuffer_RTVCount + 1;
-    for (UINT i = 1; i < psoDesc.NumRenderTargets; i++) {
-        psoDesc.RTVFormats[i] = GBufferResourceDesc((GBufferTarget)(i - 1), 0, 0).Format;
-    }
+    psoDesc.NumRenderTargets = 1;
+    // for (UINT i = 1; i < psoDesc.NumRenderTargets; i++) {
+    //     psoDesc.RTVFormats[i] = GBufferResourceDesc((GBufferTarget)(i - 1), 0, 0).Format;
+    // }
 
     D3D12_RENDER_TARGET_BLEND_DESC blendDesc;
     blendDesc.BlendEnable = TRUE;
@@ -211,6 +270,8 @@ ManagedPSORef CreateMeshAlphaBlendedPBRPSO(
     blendDesc.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
 
     psoDesc.BlendState.RenderTarget[0] = blendDesc;
+
+    psoDesc.RTVFormats[0] = GBufferResourceDesc(GBuffer_Radiance, 0, 0).Format;
 
     return SimpleCreateGraphicsPSO(
         manager,
@@ -231,10 +292,12 @@ ManagedPSORef CreateMeshUnlitPSO(
 )
 {
     auto psoDesc = DefaultGraphicsPSODesc();
+
     psoDesc.NumRenderTargets = GBuffer_RTVCount + 1;
     for (UINT i = 1; i < psoDesc.NumRenderTargets; i++) {
         psoDesc.RTVFormats[i] = GBufferResourceDesc((GBufferTarget)(i - 1), 0, 0).Format;
     }
+
     return SimpleCreateGraphicsPSO(
         manager,
         device,
@@ -253,27 +316,7 @@ ManagedPSORef CreateDirectionalLightPSO(
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
 )
 {
-    // Unlike other PSOs, we go clockwise here.
-    CD3DX12_RASTERIZER_DESC rasterizerState(D3D12_DEFAULT);
-    auto psoDesc = DefaultGraphicsPSODesc();
-    psoDesc.DepthStencilState.DepthEnable = FALSE;
-    psoDesc.DepthStencilState.StencilEnable = FALSE;
-    psoDesc.RasterizerState = rasterizerState;
-
-    // Blending enabled for the accumulation (back) buffer
-    D3D12_RENDER_TARGET_BLEND_DESC blendDesc;
-    blendDesc.BlendEnable = TRUE;
-    blendDesc.LogicOpEnable = FALSE;
-    blendDesc.SrcBlend = D3D12_BLEND_ONE;
-    blendDesc.DestBlend = D3D12_BLEND_ONE;
-    blendDesc.BlendOp = D3D12_BLEND_OP_ADD;
-    blendDesc.SrcBlendAlpha = D3D12_BLEND_ONE;
-    blendDesc.DestBlendAlpha = D3D12_BLEND_ZERO;
-    blendDesc.BlendOpAlpha = D3D12_BLEND_OP_ADD;
-    blendDesc.LogicOp = D3D12_LOGIC_OP_NOOP;
-    blendDesc.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-
-    psoDesc.BlendState.RenderTarget[0] = blendDesc;
+    auto psoDesc = DefaultLightPSODesc();
 
     return SimpleCreateGraphicsPSO(
         manager,
@@ -295,6 +338,9 @@ ManagedPSORef CreateDirectionalLightShadowMapPSO(
 {
     auto psoDesc = DefaultGraphicsPSODesc();
     psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+
+    // These shadow maps are depth only - no stencil
+    psoDesc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
 
     float depthBias = -0.0005f;
     psoDesc.RasterizerState.DepthBias = -(depthBias / (1.0f / pow(2.0, 23.0)));
@@ -330,27 +376,7 @@ ManagedPSORef CreateEnvironmentCubemapLightPSO(
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
 )
 {
-    // Unlike other PSOs, we go clockwise here.
-    CD3DX12_RASTERIZER_DESC rasterizerState(D3D12_DEFAULT);
-    auto psoDesc = DefaultGraphicsPSODesc();
-    psoDesc.DepthStencilState.DepthEnable = FALSE;
-    psoDesc.DepthStencilState.StencilEnable = FALSE;
-    psoDesc.RasterizerState = rasterizerState;
-
-    // Blending enabled for the accumulation (back) buffer
-    D3D12_RENDER_TARGET_BLEND_DESC blendDesc;
-    blendDesc.BlendEnable = TRUE;
-    blendDesc.LogicOpEnable = FALSE;
-    blendDesc.SrcBlend = D3D12_BLEND_ONE;
-    blendDesc.DestBlend = D3D12_BLEND_ONE;
-    blendDesc.BlendOp = D3D12_BLEND_OP_ADD;
-    blendDesc.SrcBlendAlpha = D3D12_BLEND_ONE;
-    blendDesc.DestBlendAlpha = D3D12_BLEND_ZERO;
-    blendDesc.BlendOpAlpha = D3D12_BLEND_OP_ADD;
-    blendDesc.LogicOp = D3D12_LOGIC_OP_NOOP;
-    blendDesc.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-
-    psoDesc.BlendState.RenderTarget[0] = blendDesc;
+    auto psoDesc = DefaultLightPSODesc();
 
     return SimpleCreateGraphicsPSO(
         manager,
@@ -371,26 +397,7 @@ ManagedPSORef CreatePointLightPSO(
 )
 {
     // Unlike other PSOs, we go clockwise here.
-    CD3DX12_RASTERIZER_DESC rasterizerState(D3D12_DEFAULT);
-    auto psoDesc = DefaultGraphicsPSODesc();
-    psoDesc.DepthStencilState.DepthEnable = FALSE;
-    psoDesc.DepthStencilState.StencilEnable = FALSE;
-    psoDesc.RasterizerState = rasterizerState;
-
-    // Blend settings for accumulation buffer
-    D3D12_RENDER_TARGET_BLEND_DESC blendDesc;
-    blendDesc.BlendEnable = TRUE;
-    blendDesc.LogicOpEnable = FALSE;
-    blendDesc.SrcBlend = D3D12_BLEND_ONE;
-    blendDesc.DestBlend = D3D12_BLEND_ONE;
-    blendDesc.BlendOp = D3D12_BLEND_OP_ADD;
-    blendDesc.SrcBlendAlpha = D3D12_BLEND_ONE;
-    blendDesc.DestBlendAlpha = D3D12_BLEND_ZERO;
-    blendDesc.BlendOpAlpha = D3D12_BLEND_OP_ADD;
-    blendDesc.LogicOp = D3D12_LOGIC_OP_NOOP;
-    blendDesc.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-
-    psoDesc.BlendState.RenderTarget[0] = blendDesc;
+    auto psoDesc = DefaultLightPSODesc();
 
     return SimpleCreateGraphicsPSO(
         manager,
@@ -414,6 +421,7 @@ ManagedPSORef CreateSkyboxPSO(
     CD3DX12_RASTERIZER_DESC rasterizerState(D3D12_DEFAULT);
     rasterizerState.FrontCounterClockwise = FALSE;
     psoDesc.RasterizerState = rasterizerState;
+    psoDesc.RTVFormats[0] = GBufferResourceDesc(GBuffer_Radiance, 0, 0).Format;
 
     return SimpleCreateGraphicsPSO(
         manager,
@@ -490,5 +498,49 @@ ManagedPSORef CreateSkyboxComputeLightMapsPSO(
         dataDir + "skybox_compute_maps",
         rootSignature,
         desc
+    );
+}
+
+ManagedPSORef CreateToneMapPSO(
+    PSOManager& manager,
+    ID3D12Device2* device,
+    const std::string& dataDir,
+    ID3D12RootSignature* rootSignature,
+    const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
+)
+{
+    // Unlike other PSOs, we go clockwise here.
+    CD3DX12_RASTERIZER_DESC rasterizerState(D3D12_DEFAULT);
+    auto psoDesc = DefaultGraphicsPSODesc();
+    psoDesc.DepthStencilState.DepthEnable = FALSE;
+    psoDesc.DepthStencilState.StencilEnable = FALSE;
+    psoDesc.RasterizerState = rasterizerState;
+
+    // Blend settings for accumulation buffer
+    D3D12_RENDER_TARGET_BLEND_DESC blendDesc;
+    blendDesc.BlendEnable = TRUE;
+    blendDesc.LogicOpEnable = FALSE;
+    blendDesc.SrcBlend = D3D12_BLEND_ONE;
+    blendDesc.DestBlend = D3D12_BLEND_ONE;
+    blendDesc.BlendOp = D3D12_BLEND_OP_ADD;
+    blendDesc.SrcBlendAlpha = D3D12_BLEND_ONE;
+    blendDesc.DestBlendAlpha = D3D12_BLEND_ZERO;
+    blendDesc.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    blendDesc.LogicOp = D3D12_LOGIC_OP_NOOP;
+    blendDesc.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+    psoDesc.BlendState.RenderTarget[0] = blendDesc;
+
+    // Back buffer is SRGB format
+    psoDesc.NumRenderTargets = 1;
+    psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+
+    return SimpleCreateGraphicsPSO(
+        manager,
+        device,
+        dataDir + "tonemap",
+        rootSignature,
+        inputLayout,
+        psoDesc
     );
 }

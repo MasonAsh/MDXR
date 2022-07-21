@@ -224,7 +224,7 @@ void CreateModelMaterials(
 
 // Generates mip maps for a range of textures. The `textures` must have their
 // MipLevels already set. Textures must also be UAV compatible.
-void GenerateMipMaps(App& app, const std::span<ComPtr<ID3D12Resource>>& textures, const std::vector<bool>& textureIsSRGB, FenceEvent& initialUploadEvent)
+void GenerateMipMaps(App& app, const std::span<ComPtr<ID3D12Resource>>& textures, const std::vector<bool>& imageIsSRGB, FenceEvent& initialUploadEvent)
 {
     if (app.graphicsAnalysis) {
         app.graphicsAnalysis->BeginCapture();
@@ -342,6 +342,9 @@ void GenerateMipMaps(App& app, const std::span<ComPtr<ID3D12Resource>>& textures
             for (UINT mip = 0; mip < mipCount; mip++) {
                 D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
                 uavDesc.Format = resourceDesc.Format;
+                if (resourceDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
+                    uavDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                }
                 uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
                 uavDesc.Texture2D.MipSlice = srcMip + mip + 1;
 
@@ -350,7 +353,7 @@ void GenerateMipMaps(App& app, const std::span<ComPtr<ID3D12Resource>>& textures
 
             constantBuffers.data[cbvIndex].srcMipLevel = srcMip;
             constantBuffers.data[cbvIndex].srcDimension = (srcHeight & 1) << 1 | (srcWidth & 1);
-            constantBuffers.data[cbvIndex].isSRGB = 0 /*textureIsSRGB[textureIdx]*/; // SRGB does not seem to work right
+            constantBuffers.data[cbvIndex].isSRGB = imageIsSRGB[textureIdx]; // SRGB does not seem to work right
             constantBuffers.data[cbvIndex].numMipLevels = mipCount;
             constantBuffers.data[cbvIndex].texelSize.x = 1.0f / (float)dstWidth;
             constantBuffers.data[cbvIndex].texelSize.y = 1.0f / (float)dstHeight;
@@ -393,7 +396,7 @@ void LoadModelTextures(
     Model& outputModel,
     tinygltf::Model& inputModel,
     std::vector<CD3DX12_RESOURCE_BARRIER>& resourceBarriers,
-    const std::vector<bool>& textureIsSRGB,
+    const std::vector<bool>& imageIsSRGB,
     ID3D12GraphicsCommandList* commandList,
     ID3D12CommandAllocator* commandAllocator,
     FenceEvent& fenceEvent
@@ -413,7 +416,7 @@ void LoadModelTextures(
         const auto& gltfImage = inputModel.images[i];
         ComPtr<ID3D12Resource> buffer;
         CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
-        auto resourceDesc = GetImageResourceDesc(gltfImage);
+        auto resourceDesc = GetImageResourceDesc(gltfImage, imageIsSRGB[i]);
         resourceDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         auto resourceState = D3D12_RESOURCE_STATE_COMMON;
         ASSERT_HRESULT(
@@ -447,7 +450,7 @@ void LoadModelTextures(
         image.image.shrink_to_fit();
     }
 
-    GenerateMipMaps(app, stagingTexturesForMipMaps, textureIsSRGB, uploadEvent);
+    GenerateMipMaps(app, stagingTexturesForMipMaps, imageIsSRGB, uploadEvent);
 
     D3D12MA::Budget localBudget;
     app.mainAllocator->GetBudget(&localBudget, nullptr);
@@ -462,7 +465,7 @@ void LoadModelTextures(
         // require switching the model to use the D3D12MA system for placed resources.
         ComPtr<ID3D12Resource> destResource;
         CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
-        auto resourceDesc = GetImageResourceDesc(inputModel.images[textureIdx]);
+        auto resourceDesc = GetImageResourceDesc(inputModel.images[textureIdx], imageIsSRGB[textureIdx]);
 
         auto allocInfo = app.device->GetResourceAllocationInfo(0, 1, &resourceDesc);
         if (pendingUploadBytes > 0 && allocInfo.SizeInBytes + pendingUploadBytes > maxUploadBytes) {
@@ -522,18 +525,18 @@ void LoadModelTextures(
 // images are SRGB. This information is needed to generate the mipmaps properly.
 std::vector<bool> DetermineSRGBTextures(const tinygltf::Model& inputModel)
 {
-    std::vector<bool> textureIsSRGB(inputModel.images.size(), false);
+    std::vector<bool> imageIsSRGB(inputModel.images.size(), false);
 
     // The only textures in a GLTF model that are SRGB are the base color textures.
     for (const auto& material : inputModel.materials) {
         auto textureIndex = material.pbrMetallicRoughness.baseColorTexture.index;
         if (textureIndex != -1) {
             auto imageIndex = inputModel.textures[textureIndex].source;
-            textureIsSRGB[imageIndex] = true;
+            imageIsSRGB[imageIndex] = true;
         }
     }
 
-    return textureIsSRGB;
+    return imageIsSRGB;
 }
 
 std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
@@ -552,7 +555,7 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
     progress->currentTask = "Uploading model buffers";
     progress->overallPercent = 0.15f;
 
-    std::vector<bool> textureIsSRGB = DetermineSRGBTextures(inputModel);
+    std::vector<bool> imageIsSRGB = DetermineSRGBTextures(inputModel);
 
     std::vector<ComPtr<ID3D12Resource>>& resourceBuffers = outputModel.buffers;
     resourceBuffers.reserve(inputModel.buffers.size() + inputModel.images.size());
@@ -601,7 +604,7 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
         outputModel,
         inputModel,
         resourceBarriers,
-        textureIsSRGB,
+        imageIsSRGB,
         copyCommandList,
         copyCommandAllocator,
         fenceEvent
@@ -1058,9 +1061,9 @@ bool ValidateGLTFModel(const tinygltf::Model& model)
 
 bool ValidateSkyboxAssets(const SkyboxAssets& assets)
 {
-    auto resourceDesc = GetImageResourceDesc(assets.images[0]);
+    auto resourceDesc = GetImageResourceDesc(assets.images[0], true);
     for (int i = 1; i < assets.images.size(); i++) {
-        if (GetImageResourceDesc(assets.images[i]) != resourceDesc) {
+        if (GetImageResourceDesc(assets.images[i], true) != resourceDesc) {
             DebugLog() << "Error: all skybox images must have the same image format and dimensions\n";
             return false;
         }
@@ -1140,6 +1143,7 @@ void RenderSkyboxEnvironmentLightMaps(App& app, const SkyboxAssets& assets, Fenc
 
     D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
     uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+    uavDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     uavDesc.Texture2DArray.FirstArraySlice = 0;
     uavDesc.Texture2DArray.ArraySize = CubeImage_Count;
     app.device->CreateUnorderedAccessView(app.Skybox.irradianceCubeMap->GetResource(), nullptr, &uavDesc, diffuseIrradianceUAV.CPUHandle());
@@ -1150,6 +1154,7 @@ void RenderSkyboxEnvironmentLightMaps(App& app, const SkyboxAssets& assets, Fenc
     for (UINT i = 0; i < PrefilterMipCount; i++) {
         D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
         uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+        uavDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         uavDesc.Texture2DArray.FirstArraySlice = 0;
         uavDesc.Texture2DArray.MipSlice = i;
         uavDesc.Texture2DArray.ArraySize = CubeImage_Count;
@@ -1261,7 +1266,7 @@ void LoadBRDFLUT(App& app, UploadBatch& uploadBatch)
     }
 
     auto image = LoadImageFile(app.dataDir + "/brdfLUT.png");
-    auto resourceDesc = GetImageResourceDesc(image);
+    auto resourceDesc = GetImageResourceDesc(image, false);
     resourceDesc.MipLevels = 1;
     D3D12MA::ALLOCATION_DESC allocDesc{};
     allocDesc.HeapType = D3D12_HEAP_TYPE_DEFAULT;
@@ -1318,9 +1323,10 @@ void CreateSkybox(App& app, const SkyboxAssets& asset, AssetLoadProgress* progre
     ComPtr<D3D12MA::Allocation> indexBuffer;
     ComPtr<D3D12MA::Allocation> perPrimitiveBuffer;
 
-    auto cubemapDesc = GetImageResourceDesc(asset.images[0]);
+    auto cubemapDesc = GetImageResourceDesc(asset.images[0], true);
     cubemapDesc.MipLevels = 1;
     cubemapDesc.DepthOrArraySize = CubeImage_Count;
+    cubemapDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
     {
         D3D12MA::ALLOCATION_DESC allocDesc{};
         allocDesc.HeapType = D3D12_HEAP_TYPE_DEFAULT;

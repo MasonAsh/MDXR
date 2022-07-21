@@ -56,7 +56,7 @@ PSOutput PSMain(PSInput input)
 
     if (mat.baseColorTextureIdx != -1) {
         Texture2D texture = GetBaseColorTexture(mat);
-        baseColor = pow(texture.Sample(g_sampler, input.uv), 2.2);
+        baseColor = texture.Sample(g_sampler, input.uv);
     }
 
     if (mat.normalTextureIdx != -1) {

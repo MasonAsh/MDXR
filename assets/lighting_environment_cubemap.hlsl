@@ -1,15 +1,11 @@
 #include "common.hlsli"
 #include "pbr.hlsli"
 
-struct PSInput {
+struct PSInput 
+{
     float4 pos : SV_POSITION;
     float2 uv : TEXCOORD;
 };
-
-#define BASE_COLOR_BUFFER 0
-#define NORMAL_BUFFER 1
-#define METAL_ROUGHNESS_BUFFER 2
-#define DEPTH_BUFFER 3
 
 TextureCube GetSkyboxTexture() 
 {
@@ -53,12 +49,12 @@ float4 PSMain(PSInput input) : SV_TARGET
     TextureCube skybox = GetSkyboxTexture();
     Texture2D lut = GetBRDFLUT();
 
-    Texture2D baseColorTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + BASE_COLOR_BUFFER];
-    Texture2D normalTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + NORMAL_BUFFER];
-    Texture2D metalRoughnessTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + METAL_ROUGHNESS_BUFFER];
-    Texture2D depthTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + DEPTH_BUFFER];
+    Texture2D baseColorTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + GBUFFER_BASE_COLOR];
+    Texture2D normalTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + GBUFFER_NORMAL];
+    Texture2D metalRoughnessTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + GBUFFER_METAL_ROUGHNESS];
+    Texture2D depthTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + GBUFFER_DEPTH];
 
-    float3 baseColor = pow(baseColorTexture.Sample(g_sampler, input.uv).rgb, 2.2);
+    float3 baseColor = baseColorTexture.Sample(g_sampler, input.uv).rgb;
     float depth = depthTexture.Sample(g_sampler, input.uv).r;
     float4 normal = normalTexture.Sample(g_sampler, input.uv);
     float4 metalRoughness = metalRoughnessTexture.Sample(g_sampler, input.uv);
@@ -107,7 +103,6 @@ float4 PSMain(PSInput input) : SV_TARGET
     float4 color = float4(Lo);
 
     color = color / (color + 1.0f);
-    color = pow(color, 1.0/2.2);
 
     return color;
 }
