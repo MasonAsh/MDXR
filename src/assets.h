@@ -22,9 +22,9 @@ struct AssetBundle
     std::optional<SkyboxAssets> skybox;
 };
 
-void LoadModelAsset(AssetBundle& assets, tinygltf::TinyGLTF& loader, const std::string& filePath);
 std::vector<unsigned char> LoadBinaryFile(const std::string& filePath);
-tinygltf::Image LoadImageFile(const std::string& imagePath);
+std::optional<tinygltf::Image> LoadImageFromMemory(const unsigned char* bytes, int size);
+std::optional<tinygltf::Image> LoadImageFile(const std::string& imagePath);
 void ProcessAssets(App& app, AssetBundle& assets);
 
 void StartAssetThread(App& app);

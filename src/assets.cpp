@@ -12,6 +12,7 @@
 #include <glm/gtx/euler_angles.hpp>
 
 #include <fstream>
+#include <future>
 
 struct alignas(16) GenerateMipsConstantData
 {
@@ -32,25 +33,14 @@ struct alignas(16) ComputeSkyboxMapsConstantData
 };
 static_assert((sizeof(ComputeSkyboxMapsConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
 
-void LoadModelAsset(AssetBundle& assets, tinygltf::TinyGLTF& loader, const std::string& filePath)
-{
-    tinygltf::Model model;
-    assets.models.push_back(model);
-    std::string err;
-    std::string warn;
-    CHECK(
-        loader.LoadASCIIFromFile(
-            &assets.models.back(),
-            &err,
-            &warn,
-            filePath
-        )
-    );
-}
-
 std::vector<unsigned char> LoadBinaryFile(const std::string& filePath)
 {
     std::ifstream file(filePath, std::ios::binary);
+    std::vector<unsigned char> data;
+
+    if (!file.good()) {
+        return data;
+    }
 
     file.unsetf(std::ios::skipws);
 
@@ -59,7 +49,6 @@ std::vector<unsigned char> LoadBinaryFile(const std::string& filePath)
     fileSize = file.tellg();
     file.seekg(0, std::ios::beg);
 
-    std::vector<unsigned char> data;
     data.reserve(fileSize);
 
     data.insert(data.begin(), std::istream_iterator<unsigned char>(file), std::istream_iterator<unsigned char>());
@@ -67,18 +56,19 @@ std::vector<unsigned char> LoadBinaryFile(const std::string& filePath)
     return data;
 }
 
-tinygltf::Image LoadImageFile(const std::string& imagePath)
+std::optional<tinygltf::Image> LoadImageFromMemory(const unsigned char* bytes, int size)
 {
     tinygltf::Image image;
 
-    auto fileData = LoadBinaryFile(imagePath);
-    unsigned char* imageData = stbi_load_from_memory(fileData.data(), (int)fileData.size(), &image.width, &image.height, nullptr, STBI_rgb_alpha);
+    unsigned char* imageData = stbi_load_from_memory(bytes, size, &image.width, &image.height, nullptr, STBI_rgb_alpha);
+
     if (!imageData) {
-        std::cout << "Failed to load " << imagePath << ": " << stbi_failure_reason() << "\n";
-        assert(false);
+        return {};
     }
+
     image.pixel_type = TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE;
     image.component = STBI_rgb_alpha;
+    image.as_is = false;
 
     // Copy image data over
     image.image.assign(imageData, imageData + (image.width * image.height * STBI_rgb_alpha));
@@ -86,6 +76,18 @@ tinygltf::Image LoadImageFile(const std::string& imagePath)
     stbi_image_free(imageData);
 
     return image;
+}
+
+std::optional<tinygltf::Image> LoadImageFile(const std::string& imagePath)
+{
+    auto fileData = LoadBinaryFile(imagePath);
+
+    if (fileData.empty()) {
+        DebugLog() << "Failed to load " << imagePath << ": " << stbi_failure_reason() << "\n";
+        assert(false);
+    }
+
+    return LoadImageFromMemory(fileData.data(), fileData.size());
 }
 
 void CreateModelDescriptors(
@@ -391,6 +393,8 @@ void GenerateMipMaps(App& app, const std::span<ComPtr<ID3D12Resource>>& textures
     }
 }
 
+// Note: if I truely want to do things as efficiently as possible I will
+// Generate mips on demand as images load asynchronously.
 void LoadModelTextures(
     App& app,
     Model& outputModel,
@@ -539,6 +543,15 @@ std::vector<bool> DetermineSRGBTextures(const tinygltf::Model& inputModel)
     return imageIsSRGB;
 }
 
+typedef std::vector<std::thread> ImageLoadContext;
+
+void WaitForModelImages(ImageLoadContext& threads)
+{
+    for (auto& thread : threads) {
+        thread.join();
+    }
+}
+
 std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
     Model& outputModel,
     App& app,
@@ -549,6 +562,7 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
     std::span<ComPtr<ID3D12Resource>>& outGeometryResources,
     std::span<ComPtr<ID3D12Resource>>& outTextureResources,
     FenceEvent& fenceEvent,
+    ImageLoadContext& imageLoadContext,
     AssetLoadProgress* progress
 )
 {
@@ -598,6 +612,8 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
 
     progress->currentTask = "Loading model textures";
     progress->overallPercent = 0.30f;
+
+    WaitForModelImages(imageLoadContext);
 
     LoadModelTextures(
         app,
@@ -1265,7 +1281,7 @@ void LoadBRDFLUT(App& app, UploadBatch& uploadBatch)
         return;
     }
 
-    auto image = LoadImageFile(app.dataDir + "/brdfLUT.png");
+    auto image = *LoadImageFile(app.dataDir + "/brdfLUT.png");
     auto resourceDesc = GetImageResourceDesc(image, false);
     resourceDesc.MipLevels = 1;
     D3D12MA::ALLOCATION_DESC allocDesc{};
@@ -1534,12 +1550,70 @@ void CreateSkybox(App& app, const SkyboxAssets& asset, AssetLoadProgress* progre
     RenderSkyboxEnvironmentLightMaps(app, asset, cubemapUpload, progress);
 }
 
+void GLTFImageLoaderThread(
+    tinygltf::Image* out
+)
+{
+    auto maybeImage = LoadImageFromMemory(out->image.data(), out->image.size());
+
+    if (maybeImage) {
+        *out = *maybeImage;
+    } else {
+        // Indicate that the image load has failed
+        out->image.clear();
+        out->width = 0;
+        out->height = 0;
+    }
+}
+
+ImageLoadContext BeginModelImageLoad(tinygltf::Model& model)
+{
+    std::vector<std::thread> imageLoadThreads;
+    imageLoadThreads.reserve(model.images.size());
+    for (auto& image : model.images) {
+        imageLoadThreads.push_back(std::thread(GLTFImageLoaderThread, &image));
+    }
+
+    return imageLoadThreads;
+}
+
+bool TinyGLTFImageLoader(
+    tinygltf::Image* image,
+    const int image_idx,
+    std::string* err,
+    std::string* warn,
+    int req_width,
+    int req_height,
+    const unsigned char* bytes,
+    int size,
+    void* user_pointer
+)
+{
+    image->image.assign(bytes, bytes + size);
+
+    image->width = req_width;
+    image->height = req_height;
+    image->component = 0;
+
+    image->as_is = true;
+
+    return true;
+}
+
 void LoadGLTFThread(App& app, const std::string& gltfFile, AssetLoadProgress* progress)
 {
+    auto perfName = "Loading " + gltfFile;
+    ScopedPerformanceTracker perf(perfName.c_str(), PerformancePrecision::Milliseconds);
+
     tinygltf::TinyGLTF loader;
     tinygltf::Model gltfModel;
     std::string err;
     std::string warn;
+
+    loader.SetImageLoader(
+        TinyGLTFImageLoader,
+        nullptr
+    );
 
     progress->assetName = gltfFile;
 
@@ -1556,6 +1630,8 @@ void LoadGLTFThread(App& app, const std::string& gltfFile, AssetLoadProgress* pr
     if (!ValidateGLTFModel(gltfModel)) {
         return;
     }
+
+    auto imageLoadContext = BeginModelImageLoad(gltfModel);
 
     std::vector<UINT64> uploadOffsets;
 
@@ -1609,6 +1685,7 @@ void LoadGLTFThread(App& app, const std::string& gltfFile, AssetLoadProgress* pr
         geometryBuffers,
         textureBuffers,
         fenceEvent,
+        imageLoadContext,
         progress
     );
 
@@ -1662,12 +1739,31 @@ void LoadSkyboxThread(App& app, const SkyboxImagePaths& paths, AssetLoadProgress
     progress->overallPercent = 0.0f;
 
     SkyboxAssets assets;
-    assets.images[CubeImage_Front] = LoadImageFile(paths.paths[CubeImage_Front]);
-    assets.images[CubeImage_Back] = LoadImageFile(paths.paths[CubeImage_Back]);
-    assets.images[CubeImage_Left] = LoadImageFile(paths.paths[CubeImage_Left]);
-    assets.images[CubeImage_Right] = LoadImageFile(paths.paths[CubeImage_Right]);
-    assets.images[CubeImage_Top] = LoadImageFile(paths.paths[CubeImage_Top]);
-    assets.images[CubeImage_Bottom] = LoadImageFile(paths.paths[CubeImage_Bottom]);
+
+    std::array<std::future<std::optional<tinygltf::Image>>, CubeImage_Count> images;
+
+    for (int i = 0; i < CubeImage_Count; i++) {
+        images[i] = std::async(std::launch::async, LoadImageFile, paths.paths[i]);
+    }
+
+    bool fail = false;
+    for (int i = 0; i < CubeImage_Count; i++) {
+        images[i].wait();
+        auto maybeImage = images[i].get();
+        if (!maybeImage) {
+            DebugLog() << "Failed to load image " << paths.paths[i];
+            fail = true;
+            break;
+        }
+
+        assets.images[i] = *maybeImage;
+    }
+
+    if (fail) {
+        progress->isFinished = true;
+        return;
+    }
+
     CreateSkybox(app, assets, progress);
 
     progress->isFinished = true;
