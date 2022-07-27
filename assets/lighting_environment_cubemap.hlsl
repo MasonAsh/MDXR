@@ -12,6 +12,11 @@ TextureCube GetSkyboxTexture()
     return ResourceDescriptorHeap[g_MiscDescriptorIndex];
 }
 
+TextureCube GetIrradianceMap()
+{
+    return ResourceDescriptorHeap[g_LightIndex];
+}
+
 Texture2D GetBRDFLUT()
 {
     return ResourceDescriptorHeap[g_MaterialDataIndex];
@@ -47,6 +52,7 @@ float4 PSMain(PSInput input) : SV_TARGET
     ConstantBuffer<LightPassConstantData> passData = GetLightPassData();
 
     TextureCube skybox = GetSkyboxTexture();
+    TextureCube irradianceMap = GetIrradianceMap();
     Texture2D lut = GetBRDFLUT();
 
     Texture2D baseColorTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + GBUFFER_BASE_COLOR];
@@ -83,7 +89,14 @@ float4 PSMain(PSInput input) : SV_TARGET
 
     float3 R = reflect(-worldSpaceView, worldSpaceNormal);
 
-    float3 radiance = skybox.SampleLevel(g_sampler, R, roughness * (PREFILTER_MAP_MIPCOUNT - 1)).rgb * passData.environmentIntensity.rgb;
+    float4 irradianceSample = irradianceMap.Sample(g_sampler, worldSpaceNormal);
+    float3 irradiance = irradianceSample.rgb * irradianceSample.a;
+
+    float3 diffuse = irradiance * baseColor;
+
+    float mip = roughness * (PREFILTER_MAP_MIPCOUNT - 1);
+    float4 prefilterSample = skybox.SampleLevel(g_sampler, R, mip);
+    float3 prefilterColor = prefilterSample.rgb * passData.environmentIntensity.rgb * prefilterSample.a;
     
     float2 envUV = float2(max(dot(N, -V), 0.0f), roughness);
     float2 envBRDF = lut.Sample(g_sampler, envUV).rg;
@@ -95,10 +108,10 @@ float4 PSMain(PSInput input) : SV_TARGET
 
     float3 kS = FSchlickRoughness(max(0.0, dot(N, V)), F0, roughness);
     float3 kD = 1.0f - kS;
-    float4 diffuseBRDF = float4(kD, 1.0f) * float4(baseColor, 1.0f);
-    float3 specular = radiance * (kS * envBRDF.x + envBRDF.y);
+    float4 diffuseBRDF = float4(kD, 1.0f) * float4(diffuse, 1.0f);
+    float3 specular = prefilterColor * (kS * envBRDF.x + envBRDF.y);
 
-    float4 Lo = (diffuseBRDF + float4(specular, 1.0f)) * float4(radiance, 1);
+    float4 Lo = (diffuseBRDF + float4(specular, 1.0f)) * float4(prefilterColor, 1);
 
     float4 color = float4(Lo);
 

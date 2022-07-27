@@ -1,5 +1,12 @@
 #define NO_COMMON_RESOURCES
 #include "common.hlsli"
+#include "pbr.hlsli"
+
+#define BLOCK_SIZE 8
+#define THREADS_PER_PIXEL 16
+#define SAMPLES_PER_PIXEL 256
+#define SAMPLES_PER_THREAD ((float)SAMPLES_PER_PIXEL / (float)THREADS_PER_PIXEL)
+#define SAMPLE_DELTA sqrt((4.0f*PI) / (float)SAMPLES_PER_PIXEL)
 
 cbuffer Constants : register(b0) {
     uint g_SkyboxSrvIdx;
@@ -9,8 +16,6 @@ cbuffer Constants : register(b0) {
     float2 g_TexelSize;
 };
 
-#define BLOCK_SIZE 8
-
 struct ComputeShaderInput {
     uint3 groupID : SV_GroupID;
     uint3 groupThreadID : SV_GroupThreadID;
@@ -18,11 +23,7 @@ struct ComputeShaderInput {
     uint groupIndex : SV_GroupIndex;
 };
 
-#define THREADS_PER_PIXEL 16
-#define SAMPLES_PER_PIXEL 1000
-#define SAMPLES_PER_THREAD (SAMPLES_PER_PIXEL / THREADS_PER_PIXEL)
-
-#define SAMPLE_DELTA sqrt((4.0f*PI) / (float)SAMPLES_PER_PIXEL)
+groupshared float4 g_IrradianceAccumulators[BLOCK_SIZE * BLOCK_SIZE * THREADS_PER_PIXEL];
 
 TextureCube GetSkyboxTexture()
 {
@@ -63,19 +64,21 @@ float2 Hammersley(uint i, uint N)
     return float2(float(i) / float(N), ri);
 }
 
-groupshared float3 g_IrradianceAccumulators[BLOCK_SIZE * BLOCK_SIZE * THREADS_PER_PIXEL];
-
-float3 ImportanceSampleGGX(float2 Xi, float3 N, float roughness, float3 tangentX, float3 tangentY)
+float3 ImportanceSampleGGX(float2 Xi, float3x3 TBN, float roughness)
 {
     float a = roughness * roughness;
 
-    float cosTheta = sqrt((1 - Xi.y) / (1.0f + (a*a - 1.0f) * Xi.y));
+    float phi = 2 * PI * Xi.x;
+    float cosTheta = sqrt((1 - Xi.y) / (1 + (a*a - 1) * Xi.y));
     float sinTheta = sqrt(1 - cosTheta * cosTheta);
-    float phi = 2*PI*Xi.x;
 
-    float3 tangentSample = float3(sinTheta * cos(phi),  sinTheta * sin(phi), cosTheta);
+    float3 H;
+    H.x = sinTheta * cos(phi);
+    H.y = sinTheta * sin(phi);
+    H.z = cosTheta;
 
-    return tangentSample.x * tangentX + tangentSample.y * tangentY + tangentSample.z * N; 
+    //return tangentSample.x * tangentX + tangentSample.y * tangentY + tangentSample.z * N; 
+    return mul(H, TBN);
 }
 
 [numthreads(BLOCK_SIZE, BLOCK_SIZE, THREADS_PER_PIXEL)]
@@ -89,39 +92,65 @@ void CSMain(ComputeShaderInput input)
     uint3 groupThreadID = input.groupThreadID;
 
     float3 N = normalize(ConvertCubeUVToXYZ(g_FaceIndex, outUV));
-
+    float3 R = N;
+    float3 V = N;
 
     float3 up = abs(N.z) < 0.999 ? float3(0,0,1) : float3(1,0,0);
     float3 tangentX = normalize(cross(up, N));
-    float3 tangentY = cross(N, tangentX);
+    float3 tangentY = normalize(cross(N, tangentX));
 
-    float3 irradiance = (float3)0.0f;
+    float4 irradiance = (float4)0.0f;
     uint startSample = groupThreadID.z * SAMPLES_PER_THREAD;
     uint endSample = (groupThreadID.z + 1) * SAMPLES_PER_THREAD;
 
+    //float2 dimensions = 1.0f / texelSize;
+    float2 dimensions;
+    skybox.GetDimensions(dimensions.x, dimensions.y);
+
     float sampleCount = 0;
+
+    float3x3 tangentToWorld = float3x3(
+        tangentX,
+        tangentY,
+        N
+    );
 
     for (uint i = startSample; i < endSample; i += 1) {
         float2 Xi = Hammersley(i, SAMPLES_PER_PIXEL);
-        float3 H = ImportanceSampleGGX(Xi, N, g_Roughness, tangentX, tangentY);
-        float3 L = normalize(2 * dot( N, H ) * H - N);
-        float NoL = saturate(dot( N, L ));
-        if (NoL > 0.0f) {
-            irradiance += skybox.Sample(g_sampler, H).rgb;
-            sampleCount += 1;
+
+        float3 H = ImportanceSampleGGX(Xi, tangentToWorld, g_Roughness);
+        float3 L  = 2.0 * dot(V, H) * H - V;
+        float NdotL = max(dot(N, L), 0);
+        float NdotH = max(dot(N, H), 0);
+        float VdotH = max(dot(V, H), 0);
+        if (NdotL > 0.0f) {
+            float D = DistributionGGX(NdotH, g_Roughness);
+            float pdf = (D * NdotH / (4.0f * VdotH)) + 0.0001f;
+            float solidAngleTexel = 4.0f * PI / (6 * dimensions.x * dimensions.x);
+            float solidAngleSample = 1.0f / ((float)SAMPLES_PER_PIXEL * pdf + 0.0001f);
+
+            float mip = g_Roughness == 0.0f ? 0.0f : 0.5f * log2((float)(solidAngleSample/solidAngleTexel));
+
+            float4 skySample = skybox.SampleLevel(g_sampler, H, mip);
+            irradiance.rgb += skySample.rgb * NdotL;
+            irradiance.a += NdotL;
         }
     }
 
-    g_IrradianceAccumulators[input.groupIndex] = irradiance / sampleCount;
+    g_IrradianceAccumulators[input.groupIndex] = irradiance;
 
     GroupMemoryBarrierWithGroupSync();
 
     if (groupThreadID.z == 0) {
-        float4 finalColor = float4(0, 0, 0, 1);
+        float4 finalColor = float4(0, 0, 0, 0);
+        float totalWeight = 0.0f;
         for (float i = 0; i < THREADS_PER_PIXEL; i += 1) {
-            finalColor.xyz += g_IrradianceAccumulators[input.groupIndex + (i * BLOCK_SIZE * BLOCK_SIZE)];
+            float4 irradiance = g_IrradianceAccumulators[input.groupIndex + (i * BLOCK_SIZE * BLOCK_SIZE)];
+            finalColor.xyz += irradiance.rgb;
+            totalWeight += irradiance.a;
         }
-        finalColor = finalColor / THREADS_PER_PIXEL;
+        finalColor.rgb = finalColor.rgb / totalWeight;
+        finalColor.a = 1.0f;
 
         float3 uv = float3(input.dispatchThreadID.xy, (float)g_FaceIndex);
         outTexture[uv] = finalColor;

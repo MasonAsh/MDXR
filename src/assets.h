@@ -11,9 +11,16 @@
 struct App;
 struct SkyboxImagePaths;
 
+struct HDRImage
+{
+    std::vector<float> data;
+    int width;
+    int height;
+};
+
 struct SkyboxAssets
 {
-    std::array<tinygltf::Image, CubeImage_Count> images;
+    std::array<HDRImage, CubeImage_Count> images;
 };
 
 struct AssetBundle
@@ -25,6 +32,7 @@ struct AssetBundle
 std::vector<unsigned char> LoadBinaryFile(const std::string& filePath);
 std::optional<tinygltf::Image> LoadImageFromMemory(const unsigned char* bytes, int size);
 std::optional<tinygltf::Image> LoadImageFile(const std::string& imagePath);
+std::optional<HDRImage> LoadHDRImage(const std::string& filePath);
 void ProcessAssets(App& app, AssetBundle& assets);
 
 void StartAssetThread(App& app);

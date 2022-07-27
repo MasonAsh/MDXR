@@ -67,7 +67,7 @@ public:
     {
         // Suballocate one resource at a time. It's just easier this way and the end effect should be the same.
         for (int i = 0; i < numSubresources; i++) {
-            UINT64 requiredBytes = GetRequiredIntermediateSize(destResource, i, 1);
+            UINT64 requiredBytes = GetRequiredIntermediateSize(destResource, subresource + i, 1);
 
             // FIXME: This case should be possible to handle.
             // Currently not sure how to split apart a texture upload, but it should be possible.
@@ -98,7 +98,7 @@ public:
             D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
             device->GetCopyableFootprints(
                 &resourceDesc,
-                i,
+                subresource + i,
                 1,
                 offset,
                 &footprint,
@@ -113,7 +113,7 @@ public:
                 memcpy(pDestPtr, pSrcPtr, subresourceData[i].RowPitch);
             }
 
-            const CD3DX12_TEXTURE_COPY_LOCATION Dst(destResource, i);
+            const CD3DX12_TEXTURE_COPY_LOCATION Dst(destResource, subresource + i);
             const CD3DX12_TEXTURE_COPY_LOCATION Src(uploadBuffer->GetResource(), footprint);
             commandList->CopyTextureRegion(&Dst, 0, 0, 0, &Src, nullptr);
         }

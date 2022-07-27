@@ -312,8 +312,8 @@ void SetupMipMapGenerator(App& app)
             &error
         )
     )) {
-        std::cout << "Error: root signature compilation failed\n";
-        std::cout << (char*)error->GetBufferPointer();
+        DebugLog() << "Error: root signature compilation failed";
+        DebugLog() << (char*)error->GetBufferPointer();
         abort();
     }
 
@@ -450,7 +450,7 @@ void InitD3D(App& app)
                 debugController1->SetEnableGPUBasedValidation(true);
             }
         } else {
-            std::cout << "Failed to enable D3D12 debug layer\n";
+            DebugLog() << "Failed to enable D3D12 debug layer";
         }
 
         ComPtr<ID3D12DeviceRemovedExtendedDataSettings> pDredSettings;
@@ -459,7 +459,7 @@ void InitD3D(App& app)
             pDredSettings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
             pDredSettings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
         } else {
-            std::cout << "Failed to load DRED\n";
+            DebugLog() << "Failed to load DRED\n";
         }
 
         DXGIGetDebugInterface1(0, IID_PPV_ARGS(&app.graphicsAnalysis));
@@ -488,7 +488,7 @@ void InitD3D(App& app)
             infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, true);
             infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, false);
         } else {
-            std::cout << "Failed to set info queue breakpoints\n";
+            DebugLog() << "Failed to set info queue breakpoints\n";
         }
     }
 
@@ -719,8 +719,6 @@ void SetupDirectionalLightShadowMap(App& app, Light& light)
             &srvDesc,
             light.directionalShadowMapSRV.CPUHandle()
         );
-
-        DebugTextureGUI(app, light.directionalShadowMap->GetResource(), &srvDesc);
     }
 
     // Create DSV
@@ -1052,7 +1050,7 @@ void LightPass(App& app, ID3D12GraphicsCommandList* commandList)
             UINT constantValues[5] = {
                 UINT_MAX,
                 app.Skybox.brdfLUTDescriptor.Index(),
-                UINT_MAX,
+                app.Skybox.irradianceCubeSRV.Index(),
                 app.LightBuffer.cbvHandle.Index(),
                 app.Skybox.prefilterMapSRV.Index(),
             };
@@ -1147,7 +1145,11 @@ void BuildCommandList(App& app)
     ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), commandList);
 
     // Indicate that the back buffer will now be used to present.
-    auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(app.renderTargets[app.frameIdx].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+    auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+        app.renderTargets[app.frameIdx].Get(),
+        D3D12_RESOURCE_STATE_RENDER_TARGET,
+        D3D12_RESOURCE_STATE_PRESENT
+    );
     commandList->ResourceBarrier(1, &barrier);
 
     ASSERT_HRESULT(
@@ -1165,7 +1167,13 @@ void RenderFrame(App& app)
     FenceEvent renderEvent;
 
     // FIXME: multithreading
-    HRESULT hr = app.graphicsQueue.ExecuteCommandListsAndPresentBlocking({ app.commandList.Get() }, app.swapChain.Get(), 0, DXGI_PRESENT_ALLOW_TEARING);
+    HRESULT hr = app.graphicsQueue.ExecuteCommandListsAndPresentBlocking(
+        { app.commandList.Get() },
+        app.swapChain.Get(),
+        0,
+        DXGI_PRESENT_ALLOW_TEARING
+    );
+
     if (!SUCCEEDED(hr)) {
         tdrOccurred = true;
         app.running = false;

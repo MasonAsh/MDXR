@@ -14,16 +14,21 @@
 #include <fstream>
 #include <future>
 
+std::mutex g_assetMutex;
+std::mutex g_punctualLightLock;
+
 struct alignas(16) GenerateMipsConstantData
 {
+    UINT texIdx;
     UINT srcMipLevel;
     UINT numMipLevels;
     UINT srcDimension;
     UINT isSRGB;
     glm::vec2 texelSize;
-    float padding[58];
+    float padding[57];
 };
 static_assert((sizeof(GenerateMipsConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
+
 
 struct alignas(16) ComputeSkyboxMapsConstantData
 {
@@ -32,6 +37,7 @@ struct alignas(16) ComputeSkyboxMapsConstantData
     float padding[61];
 };
 static_assert((sizeof(ComputeSkyboxMapsConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
+
 
 std::vector<unsigned char> LoadBinaryFile(const std::string& filePath)
 {
@@ -56,6 +62,7 @@ std::vector<unsigned char> LoadBinaryFile(const std::string& filePath)
     return data;
 }
 
+
 std::optional<tinygltf::Image> LoadImageFromMemory(const unsigned char* bytes, int size)
 {
     tinygltf::Image image;
@@ -78,6 +85,7 @@ std::optional<tinygltf::Image> LoadImageFromMemory(const unsigned char* bytes, i
     return image;
 }
 
+
 std::optional<tinygltf::Image> LoadImageFile(const std::string& imagePath)
 {
     auto fileData = LoadBinaryFile(imagePath);
@@ -89,6 +97,23 @@ std::optional<tinygltf::Image> LoadImageFile(const std::string& imagePath)
 
     return LoadImageFromMemory(fileData.data(), fileData.size());
 }
+
+
+std::optional<HDRImage> LoadHDRImage(const std::string& filePath)
+{
+    HDRImage result;
+
+    float* data = stbi_loadf(filePath.c_str(), &result.width, &result.height, nullptr, STBI_rgb_alpha);
+
+    if (!data) {
+        return {};
+    }
+
+    result.data.assign(data, data + (result.width * result.height * STBI_rgb_alpha));
+
+    return result;
+}
+
 
 void CreateModelDescriptors(
     App& app,
@@ -142,6 +167,7 @@ void CreateModelDescriptors(
     ASSERT_HRESULT(perPrimitiveConstantBuffer->Map(0, &readRange, reinterpret_cast<void**>(&outputModel.perPrimitiveBufferPtr)));
 }
 
+
 void CreateModelMaterials(
     App& app,
     const tinygltf::Model& inputModel,
@@ -193,7 +219,7 @@ void CreateModelMaterials(
             if (inputMaterial.alphaMode == "BLEND") {
                 materialType = MaterialType_AlphaBlendPBR;
             } else {
-                std::cout << "GLTF material " << inputMaterial.name << " has unsupported alpha mode and will be treated as opaque\n";
+                DebugLog() << "GLTF material " << inputMaterial.name << " has unsupported alpha mode and will be treated as opaque";
                 materialType = MaterialType_PBR;
             }
         }
@@ -224,13 +250,69 @@ void CreateModelMaterials(
     }
 }
 
+
+std::pair<ComPtr<ID3D12GraphicsCommandList>, ComPtr<ID3D12CommandAllocator>>
+EasyCreateGraphicsCommandList(App& app, D3D12_COMMAND_LIST_TYPE commandListType)
+{
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ComPtr<ID3D12GraphicsCommandList> commandList;
+
+    ASSERT_HRESULT(app.device->CreateCommandAllocator(
+        commandListType,
+        IID_PPV_ARGS(&allocator)
+    ));
+
+    ASSERT_HRESULT(app.device->CreateCommandList(
+        0,
+        commandListType,
+        allocator.Get(),
+        nullptr,
+        IID_PPV_ARGS(&commandList)
+    ));
+
+    return std::pair(commandList, allocator);
+}
+
+
+ComPtr<D3D12MA::Allocation> CopyResourceWithDifferentFlags(
+    App& app,
+    ID3D12Resource* srcResource,
+    D3D12_RESOURCE_FLAGS newFlags,
+    D3D12_RESOURCE_STATES resourceStates,
+    ID3D12GraphicsCommandList* commandList
+)
+{
+    D3D12_RESOURCE_DESC resourceDesc = srcResource->GetDesc();
+    resourceDesc.Flags = newFlags;
+
+    D3D12MA::ALLOCATION_DESC allocDesc = {};
+    allocDesc.HeapType = D3D12_HEAP_TYPE_DEFAULT;
+
+    ComPtr<D3D12MA::Allocation> destResource;
+    ASSERT_HRESULT(app.mainAllocator->CreateResource(
+        &allocDesc,
+        &resourceDesc,
+        resourceStates,
+        nullptr,
+        &destResource,
+        IID_NULL, nullptr
+    ));
+
+    commandList->CopyResource(destResource->GetResource(), srcResource);
+
+    return destResource;
+}
+
+
 // Generates mip maps for a range of textures. The `textures` must have their
 // MipLevels already set. Textures must also be UAV compatible.
 void GenerateMipMaps(App& app, const std::span<ComPtr<ID3D12Resource>>& textures, const std::vector<bool>& imageIsSRGB, FenceEvent& initialUploadEvent)
 {
-    if (app.graphicsAnalysis) {
-        app.graphicsAnalysis->BeginCapture();
-    }
+    // This function is a damn mess...
+
+    // if (app.graphicsAnalysis) {
+    //     app.graphicsAnalysis->BeginCapture();
+    // }
 
     if (textures.size() == 0) {
         return;
@@ -240,18 +322,6 @@ void GenerateMipMaps(App& app, const std::span<ComPtr<ID3D12Resource>>& textures
 
     UINT descriptorCount = 0;
     UINT numTextures = static_cast<UINT>(textures.size());
-
-    // Create SRVs for the base mip
-    auto baseTextureDescriptor = AllocateDescriptorsUnique(app.descriptorPool, numTextures, "MipGenerationSourceSRVs");
-    for (UINT i = 0; i < numTextures; i++) {
-        auto textureDesc = textures[i]->GetDesc();
-        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        srvDesc.Format = textureDesc.Format;
-        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        srvDesc.Texture2D.MipLevels = textureDesc.MipLevels;
-        app.device->CreateShaderResourceView(textures[i].Get(), &srvDesc, baseTextureDescriptor.CPUHandle(i));
-    }
 
     ComPtr<D3D12MA::Allocation> constantBuffer;
 
@@ -269,15 +339,19 @@ void GenerateMipMaps(App& app, const std::span<ComPtr<ID3D12Resource>>& textures
         )
     );
 
-    ComPtr<ID3D12GraphicsCommandList> commandList;
-    ASSERT_HRESULT(
-        app.device->CreateCommandList(
-            0,
-            D3D12_COMMAND_LIST_TYPE_COMPUTE,
-            app.computeCommandAllocator.Get(),
-            nullptr,
-            IID_PPV_ARGS(&commandList)
-        )
+    auto [commandList, commandAllocator] = EasyCreateGraphicsCommandList(
+        app,
+        D3D12_COMMAND_LIST_TYPE_COMPUTE
+    );
+
+    auto [copyToCommandList, copyCommandAllocator] = EasyCreateGraphicsCommandList(
+        app,
+        D3D12_COMMAND_LIST_TYPE_COPY
+    );
+
+    auto [copyFromCommandList, copyCommandAllocator2] = EasyCreateGraphicsCommandList(
+        app,
+        D3D12_COMMAND_LIST_TYPE_COPY
     );
 
     commandList->SetPipelineState(app.MipMapGenerator.PSO->Get());
@@ -286,28 +360,81 @@ void GenerateMipMaps(App& app, const std::span<ComPtr<ID3D12Resource>>& textures
     ID3D12DescriptorHeap* ppHeaps[] = { app.descriptorPool.Heap() };
     commandList->SetDescriptorHeaps(_countof(ppHeaps), ppHeaps);
 
+    std::vector<ComPtr<D3D12MA::Allocation>> allocations;
+    allocations.reserve(textures.size());
+
+    bool needsCopy = false;
+    std::vector<ID3D12Resource*> destResources;
+    destResources.resize(textures.size());
+
     UINT uavCount = 0;
     UINT cbvCount = 0;
-    // Dry run to find the total number of constant buffers to allocate
+    // Dry run to create destination resources and compute constant buffer count
     for (size_t textureIdx = 0; textureIdx < textures.size(); textureIdx++) {
-        auto resourceDesc = textures[textureIdx]->GetDesc();
-        for (UINT16 srcMip = 0; srcMip < resourceDesc.MipLevels - 1u; ) {
-            UINT64 srcWidth = resourceDesc.Width >> srcMip;
-            UINT64 srcHeight = resourceDesc.Height >> srcMip;
-            UINT64 dstWidth = (UINT)(srcWidth >> 1);
-            UINT64 dstHeight = srcHeight >> 1;
+        ID3D12Resource* destResource = textures[textureIdx].Get();
+        auto resourceDesc = destResource->GetDesc();
+        auto sliceCount = resourceDesc.DepthOrArraySize;
 
-            DWORD mipCount;
-            _BitScanForward64(&mipCount, (dstWidth == 1 ? dstHeight : dstWidth) | (dstHeight == 1 ? dstWidth : dstHeight));
+        // IF source does not have UAV flag, we need to create a copy of the resource with the flag.
+        if (!(resourceDesc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+            auto alloc = CopyResourceWithDifferentFlags(
+                app,
+                textures[textureIdx].Get(),
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COMMON,
+                copyToCommandList.Get()
+            );
+            destResource = alloc->GetResource();
 
-            mipCount = std::min<DWORD>(4, mipCount + 1);
-            mipCount = (srcMip + mipCount) >= resourceDesc.MipLevels ? resourceDesc.MipLevels - srcMip - 1 : mipCount;
+            // After mip generation finishes, we will use this command list to copy back the UAVs to the non-UAVS
+            copyFromCommandList->CopyResource(textures[textureIdx].Get(), destResource);
 
-            uavCount += mipCount;
-
-            srcMip += assert_cast<UINT16>(mipCount);
-            cbvCount++;
+            allocations.push_back(alloc);
+            needsCopy = true;
         }
+
+        destResources[textureIdx] = destResource;
+
+        for (UINT16 slice = 0; slice < sliceCount; slice++) {
+            for (UINT16 srcMip = 0; srcMip < resourceDesc.MipLevels - 1u; ) {
+                UINT64 srcWidth = resourceDesc.Width >> srcMip;
+                UINT64 srcHeight = resourceDesc.Height >> srcMip;
+                UINT64 dstWidth = (UINT)(srcWidth >> 1);
+                UINT64 dstHeight = srcHeight >> 1;
+
+                DWORD mipCount;
+                _BitScanForward64(&mipCount, (dstWidth == 1 ? dstHeight : dstWidth) | (dstHeight == 1 ? dstWidth : dstHeight));
+
+                mipCount = std::min<DWORD>(4, mipCount + 1);
+                mipCount = (srcMip + mipCount) >= resourceDesc.MipLevels ? resourceDesc.MipLevels - srcMip - 1 : mipCount;
+
+                uavCount += mipCount;
+
+                srcMip += assert_cast<UINT16>(mipCount);
+                cbvCount++;
+            }
+        }
+    }
+
+    // Create SRVs for the base mip
+    auto baseTextureDescriptor = AllocateDescriptorsUnique(app.descriptorPool, numTextures, "MipGenerationSourceSRVs");
+    for (UINT i = 0; i < numTextures; i++) {
+        auto textureDesc = destResources[i]->GetDesc();
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvDesc.Format = textureDesc.Format;
+        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        srvDesc.Texture2DArray.MipLevels = textureDesc.MipLevels;
+        srvDesc.Texture2DArray.ArraySize = textureDesc.DepthOrArraySize;
+        srvDesc.Texture2DArray.FirstArraySlice = 0;
+        srvDesc.Texture2DArray.PlaneSlice = 0;
+        app.device->CreateShaderResourceView(destResources[i], &srvDesc, baseTextureDescriptor.CPUHandle(i));
+    }
+
+    if (needsCopy) {
+        copyToCommandList->Close();
+        copyFromCommandList->Close();
+        app.copyQueue.ExecuteCommandListsBlocking({ copyToCommandList.Get() }, initialUploadEvent);
     }
 
     ConstantBufferArena<GenerateMipsConstantData> constantBufferArena;
@@ -324,74 +451,88 @@ void GenerateMipMaps(App& app, const std::span<ComPtr<ID3D12Resource>>& textures
     UINT uavIndex = 0;
 
     for (size_t textureIdx = 0; textureIdx < textures.size(); textureIdx++) {
-        auto resourceDesc = textures[textureIdx]->GetDesc();
-        for (UINT16 srcMip = 0; srcMip < resourceDesc.MipLevels - 1u; ) {
-            UINT64 srcWidth = resourceDesc.Width >> srcMip;
-            UINT64 srcHeight = resourceDesc.Height >> srcMip;
-            UINT64 dstWidth = (UINT)(srcWidth >> 1);
-            UINT64 dstHeight = srcHeight >> 1;
+        ID3D12Resource* destResource = destResources[textureIdx];
+        auto resourceDesc = destResource->GetDesc();
 
-            DWORD mipCount;
-            _BitScanForward64(&mipCount, (dstWidth == 1 ? dstHeight : dstWidth) | (dstHeight == 1 ? dstWidth : dstHeight));
+        auto sliceCount = resourceDesc.DepthOrArraySize;
+        for (UINT16 slice = 0; slice < sliceCount; slice++) {
+            for (UINT16 srcMip = 0; srcMip < resourceDesc.MipLevels - 1u; ) {
+                UINT64 srcWidth = resourceDesc.Width >> srcMip;
+                UINT64 srcHeight = resourceDesc.Height >> srcMip;
+                UINT64 dstWidth = (UINT)(srcWidth >> 1);
+                UINT64 dstHeight = srcHeight >> 1;
 
-            mipCount = std::min<DWORD>(4, mipCount + 1);
-            mipCount = (srcMip + mipCount) >= resourceDesc.MipLevels ? resourceDesc.MipLevels - srcMip - 1 : mipCount;
+                DWORD mipCount;
+                _BitScanForward64(&mipCount, (dstWidth == 1 ? dstHeight : dstWidth) | (dstHeight == 1 ? dstWidth : dstHeight));
 
-            dstWidth = std::max<UINT64>(dstWidth, 1);
-            dstHeight = std::max<UINT64>(dstHeight, 1);
+                mipCount = std::min<DWORD>(4, mipCount + 1);
+                mipCount = (srcMip + mipCount) >= resourceDesc.MipLevels ? resourceDesc.MipLevels - srcMip - 1 : mipCount;
 
-            auto uavs = uavDescriptors.Ref(uavIndex);
-            for (UINT mip = 0; mip < mipCount; mip++) {
-                D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
-                uavDesc.Format = resourceDesc.Format;
-                if (resourceDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
-                    uavDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                dstWidth = std::max<UINT64>(dstWidth, 1);
+                dstHeight = std::max<UINT64>(dstHeight, 1);
+
+                auto uavs = uavDescriptors.Ref(uavIndex);
+                for (UINT mip = 0; mip < mipCount; mip++) {
+                    D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+                    uavDesc.Format = resourceDesc.Format;
+                    if (resourceDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
+                        uavDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                    }
+                    uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+                    uavDesc.Texture2DArray.MipSlice = srcMip + mip + 1;
+                    uavDesc.Texture2DArray.FirstArraySlice = slice;
+                    uavDesc.Texture2DArray.ArraySize = 1;
+
+                    app.device->CreateUnorderedAccessView(destResource, nullptr, &uavDesc, (uavs + mip).CPUHandle());
                 }
-                uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-                uavDesc.Texture2D.MipSlice = srcMip + mip + 1;
 
-                app.device->CreateUnorderedAccessView(textures[textureIdx].Get(), nullptr, &uavDesc, (uavs + mip).CPUHandle());
+                constantBuffers.data[cbvIndex].texIdx = slice;
+                constantBuffers.data[cbvIndex].srcMipLevel = srcMip;
+                constantBuffers.data[cbvIndex].srcDimension = (srcHeight & 1) << 1 | (srcWidth & 1);
+                constantBuffers.data[cbvIndex].isSRGB = imageIsSRGB[textureIdx]; // SRGB does not seem to work right
+                constantBuffers.data[cbvIndex].numMipLevels = mipCount;
+                constantBuffers.data[cbvIndex].texelSize.x = 1.0f / (float)dstWidth;
+                constantBuffers.data[cbvIndex].texelSize.y = 1.0f / (float)dstHeight;
+                constantBuffers.data[cbvIndex].texelSize.y = 1.0f / (float)dstHeight;
+
+                UINT constantValues[6] = {
+                    uavs.index,
+                    uavs.index + 1,
+                    uavs.index + 2,
+                    uavs.index + 3,
+                    cbvs.Index() + cbvIndex,
+                    baseTextureDescriptor.Ref((int)textureIdx).index
+                };
+
+                commandList->SetComputeRoot32BitConstants(0, _countof(constantValues), constantValues, 0);
+
+                UINT threadsX = static_cast<UINT>(std::ceil((float)dstWidth / 8.0f));
+                UINT threadsY = static_cast<UINT>(std::ceil((float)dstHeight / 8.0f));
+                commandList->Dispatch(threadsX, threadsY, 1);
+
+                CD3DX12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::UAV(destResource);
+                commandList->ResourceBarrier(1, &barrier);
+
+                uavIndex += mipCount;
+                cbvIndex++;
+                srcMip += assert_cast<UINT16>(mipCount);
             }
-
-            constantBuffers.data[cbvIndex].srcMipLevel = srcMip;
-            constantBuffers.data[cbvIndex].srcDimension = (srcHeight & 1) << 1 | (srcWidth & 1);
-            constantBuffers.data[cbvIndex].isSRGB = imageIsSRGB[textureIdx]; // SRGB does not seem to work right
-            constantBuffers.data[cbvIndex].numMipLevels = mipCount;
-            constantBuffers.data[cbvIndex].texelSize.x = 1.0f / (float)dstWidth;
-            constantBuffers.data[cbvIndex].texelSize.y = 1.0f / (float)dstHeight;
-
-            UINT constantValues[6] = {
-                uavs.index,
-                uavs.index + 1,
-                uavs.index + 2,
-                uavs.index + 3,
-                cbvs.Index() + cbvIndex,
-                baseTextureDescriptor.Ref((int)textureIdx).index
-            };
-
-            commandList->SetComputeRoot32BitConstants(0, _countof(constantValues), constantValues, 0);
-
-            UINT threadsX = static_cast<UINT>(std::ceil((float)dstWidth / 8.0f));
-            UINT threadsY = static_cast<UINT>(std::ceil((float)dstHeight / 8.0f));
-            commandList->Dispatch(threadsX, threadsY, 1);
-
-            CD3DX12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::UAV(textures[textureIdx].Get());
-            commandList->ResourceBarrier(1, &barrier);
-
-            uavIndex += mipCount;
-            cbvIndex++;
-            srcMip += assert_cast<UINT16>(mipCount);
         }
     }
 
-    commandList->Close();
+    ASSERT_HRESULT(commandList->Close());
 
     app.computeQueue.ExecuteCommandListsBlocking({ commandList.Get() }, initialUploadEvent);
 
-    if (app.graphicsAnalysis) {
-        app.graphicsAnalysis->EndCapture();
+    if (needsCopy) {
+        app.copyQueue.ExecuteCommandListsBlocking({ copyFromCommandList.Get() });
     }
+
+    // if (app.graphicsAnalysis) {
+    //     app.graphicsAnalysis->EndCapture();
+    // }
 }
+
 
 // Note: if I truely want to do things as efficiently as possible I will
 // Generate mips on demand as images load asynchronously.
@@ -421,7 +562,6 @@ void LoadModelTextures(
         ComPtr<ID3D12Resource> buffer;
         CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
         auto resourceDesc = GetImageResourceDesc(gltfImage, imageIsSRGB[i]);
-        resourceDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         auto resourceState = D3D12_RESOURCE_STATE_COMMON;
         ASSERT_HRESULT(
             app.device->CreateCommittedResource(
@@ -445,7 +585,6 @@ void LoadModelTextures(
 
     FenceEvent uploadEvent = uploadBatch.Finish();
 
-    //app.copyFence.WaitCPU(uploadEvent);
     app.copyQueue.WaitForEventCPU(uploadEvent);
 
     // Now that the images are uploaded these can be free'd
@@ -525,6 +664,7 @@ void LoadModelTextures(
     }
 }
 
+
 // Gets a vector of booleans parallel to inputModel.images to determine which
 // images are SRGB. This information is needed to generate the mipmaps properly.
 std::vector<bool> DetermineSRGBTextures(const tinygltf::Model& inputModel)
@@ -543,7 +683,9 @@ std::vector<bool> DetermineSRGBTextures(const tinygltf::Model& inputModel)
     return imageIsSRGB;
 }
 
+
 typedef std::vector<std::thread> ImageLoadContext;
+
 
 void WaitForModelImages(ImageLoadContext& threads)
 {
@@ -551,6 +693,7 @@ void WaitForModelImages(ImageLoadContext& threads)
         thread.join();
     }
 }
+
 
 std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
     Model& outputModel,
@@ -635,6 +778,7 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
     return resourceBuffers;
 }
 
+
 glm::mat4 GetNodeTransfomMatrix(const tinygltf::Node& node, glm::vec3& translate, glm::quat& rotation, glm::vec3& scale, bool& hasTRS)
 {
     translate = glm::vec3(0.0f);
@@ -668,11 +812,13 @@ glm::mat4 GetNodeTransfomMatrix(const tinygltf::Node& node, glm::vec3& translate
     }
 }
 
+
 struct GLTFLightTransform {
     int lightIndex;
     glm::vec3 position;
     glm::quat rotation;
 };
+
 
 void TraverseNode(const tinygltf::Model& model, const tinygltf::Node& node, std::vector<PoolItem<Mesh>>& meshes, std::vector<GLTFLightTransform>& lights, const glm::mat4& accumulator, const glm::vec3& translateAccum, const glm::quat& rotAccum, const glm::vec3& scaleAccum)
 {
@@ -705,6 +851,7 @@ void TraverseNode(const tinygltf::Model& model, const tinygltf::Node& node, std:
     }
 }
 
+
 // Traverse the GLTF scene to get the correct model matrix for each mesh.
 void ResolveModelTransforms(
     const tinygltf::Model& model,
@@ -721,6 +868,7 @@ void ResolveModelTransforms(
         TraverseNode(model, model.nodes[node], meshes, lightTransforms, glm::mat4(1.0f), glm::vec3(0.0f), glm::quat_identity<float, glm::defaultp>(), glm::vec3(1.0f));
     }
 }
+
 
 PoolItem<Primitive> CreateModelPrimitive(
     App& app,
@@ -785,7 +933,7 @@ PoolItem<Primitive> CreateModelPrimitive(
         auto semanticName = std::find(SEMANTIC_NAMES.begin(), SEMANTIC_NAMES.end(), targetSemantic);
 
         if (semanticName == SEMANTIC_NAMES.end()) {
-            std::cout << "Unsupported semantic in " << inputMesh.name << " " << targetSemantic << "\n";
+            DebugLog() << "Unsupported semantic in " << inputMesh.name << " " << targetSemantic << "\n";
             continue;
         }
 
@@ -834,11 +982,11 @@ PoolItem<Primitive> CreateModelPrimitive(
 
             if (view.BufferLocation + view.SizeInBytes > buffer->GetGPUVirtualAddress() + buffer->GetDesc().Width) {
                 // The Sponza scene seems to have an oddity mesh that goes out of bounds.
-                std::cout << "NO!!\n";
-                std::cout << "Mesh " << inputMesh.name << "\n";
-                std::cout << "Input element desc.AlignedByteOffset: " << desc.AlignedByteOffset << "\n";
-                std::cout << "START ADDRESS: " << buffer->GetGPUVirtualAddress() << "\n";
-                std::cout << "END ADDRESS: " << buffer->GetGPUVirtualAddress() + buffer->GetDesc().Width << "\n";
+                DebugLog() << "NO!!\n";
+                DebugLog() << "Mesh " << inputMesh.name << "\n";
+                DebugLog() << "Input element desc.AlignedByteOffset: " << desc.AlignedByteOffset << "\n";
+                DebugLog() << "START ADDRESS: " << buffer->GetGPUVirtualAddress() << "\n";
+                DebugLog() << "END ADDRESS: " << buffer->GetGPUVirtualAddress() + buffer->GetDesc().Width << "\n";
                 DEBUG_VAR(byteStride);
                 DEBUG_VAR(desc.AlignedByteOffset);
                 DEBUG_VAR(accessor.byteOffset);
@@ -868,7 +1016,7 @@ PoolItem<Primitive> CreateModelPrimitive(
             topology = D3D_PRIMITIVE_TOPOLOGY_LINELIST;
             break;
         case TINYGLTF_MODE_LINE_LOOP:
-            std::cout << "Error: line loops are not supported";
+            DebugLog() << "Error: line loops are not supported";
             return nullptr;
         case TINYGLTF_MODE_LINE_STRIP:
             topology = D3D_PRIMITIVE_TOPOLOGY_LINESTRIP;
@@ -880,7 +1028,7 @@ PoolItem<Primitive> CreateModelPrimitive(
             topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
             break;
         case TINYGLTF_MODE_TRIANGLE_FAN:
-            std::cout << "Error: triangle fans are not supported";
+            DebugLog() << "Error: triangle fans are not supported";
             return nullptr;
         };
 
@@ -949,7 +1097,7 @@ PoolItem<Primitive> CreateModelPrimitive(
     switch (accessor.componentType) {
     case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
         ibv.Format = DXGI_FORMAT_R8_UINT;
-        std::cout << "GLTF mesh uses byte indices which aren't supported " << inputMesh.name;
+        DebugLog() << "GLTF mesh uses byte indices which aren't supported " << inputMesh.name;
         abort();
         break;
     case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT:
@@ -966,7 +1114,7 @@ PoolItem<Primitive> CreateModelPrimitive(
     return primitive;
 }
 
-std::mutex g_punctualLightLock;
+
 void AddPunctualLights(App& app, const tinygltf::Model& inputModel, std::vector<GLTFLightTransform> lightTransforms)
 {
     std::scoped_lock<std::mutex> lock(g_punctualLightLock);
@@ -1006,6 +1154,7 @@ void AddPunctualLights(App& app, const tinygltf::Model& inputModel, std::vector<
         }
     }
 }
+
 
 void FinalizeModel(
     Model& outputModel,
@@ -1054,6 +1203,7 @@ void FinalizeModel(
     }
 }
 
+
 // For the time being we cannot handle GLTF meshes without normals, tangents and UVs.
 bool ValidateGLTFModel(const tinygltf::Model& model)
 {
@@ -1075,11 +1225,12 @@ bool ValidateGLTFModel(const tinygltf::Model& model)
     return true;
 }
 
+
 bool ValidateSkyboxAssets(const SkyboxAssets& assets)
 {
-    auto resourceDesc = GetImageResourceDesc(assets.images[0], true);
+    auto resourceDesc = GetHDRImageDesc(assets.images[0].width, assets.images[0].height);
     for (int i = 1; i < assets.images.size(); i++) {
-        if (GetImageResourceDesc(assets.images[i], true) != resourceDesc) {
+        if (GetHDRImageDesc(assets.images[0].width, assets.images[0].height) != resourceDesc) {
             DebugLog() << "Error: all skybox images must have the same image format and dimensions\n";
             return false;
         }
@@ -1087,6 +1238,7 @@ bool ValidateSkyboxAssets(const SkyboxAssets& assets)
 
     return true;
 }
+
 
 // Renders all the lighting maps for the skybox, including diffuse irradiance,
 // prefilter map, and the BRDF lut.
@@ -1156,21 +1308,19 @@ void RenderSkyboxEnvironmentLightMaps(App& app, const SkyboxAssets& assets, Fenc
 
 
     auto diffuseIrradianceUAV = AllocateDescriptorsUnique(app.descriptorPool, 1, "Diffuse radiance UAV");
-
     D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
     uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
-    uavDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    uavDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
     uavDesc.Texture2DArray.FirstArraySlice = 0;
     uavDesc.Texture2DArray.ArraySize = CubeImage_Count;
     app.device->CreateUnorderedAccessView(app.Skybox.irradianceCubeMap->GetResource(), nullptr, &uavDesc, diffuseIrradianceUAV.CPUHandle());
-
 
     // Create UAVs for each mip on the prefilter map
     auto prefilterMapUAVs = AllocateDescriptorsUnique(app.descriptorPool, PrefilterMipCount, "Prefilter map UAVs");
     for (UINT i = 0; i < PrefilterMipCount; i++) {
         D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
         uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
-        uavDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        uavDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
         uavDesc.Texture2DArray.FirstArraySlice = 0;
         uavDesc.Texture2DArray.MipSlice = i;
         uavDesc.Texture2DArray.ArraySize = CubeImage_Count;
@@ -1274,6 +1424,7 @@ void RenderSkyboxEnvironmentLightMaps(App& app, const SkyboxAssets& assets, Fenc
     }
 }
 
+
 void LoadBRDFLUT(App& app, UploadBatch& uploadBatch)
 {
     if (app.Skybox.brdfLUT != nullptr) {
@@ -1325,6 +1476,7 @@ void LoadBRDFLUT(App& app, UploadBatch& uploadBatch)
     );
 }
 
+
 void CreateSkybox(App& app, const SkyboxAssets& asset, AssetLoadProgress* progress)
 {
     if (!ValidateSkyboxAssets(asset)) {
@@ -1339,8 +1491,7 @@ void CreateSkybox(App& app, const SkyboxAssets& asset, AssetLoadProgress* progre
     ComPtr<D3D12MA::Allocation> indexBuffer;
     ComPtr<D3D12MA::Allocation> perPrimitiveBuffer;
 
-    auto cubemapDesc = GetImageResourceDesc(asset.images[0], true);
-    cubemapDesc.MipLevels = 1;
+    auto cubemapDesc = GetHDRImageDesc(asset.images[0].width, asset.images[0].height);
     cubemapDesc.DepthOrArraySize = CubeImage_Count;
     cubemapDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
     {
@@ -1381,20 +1532,20 @@ void CreateSkybox(App& app, const SkyboxAssets& asset, AssetLoadProgress* progre
     cbvDesc.SizeInBytes = sizeof(PerPrimitiveConstantData);
     app.device->CreateConstantBufferView(&cbvDesc, perPrimitiveCBV.CPUHandle());
 
-    D3D12_SUBRESOURCE_DATA cubemapSubresourceData[CubeImage_Count] = {};
-    for (int i = 0; i < CubeImage_Count; i++) {
-        cubemapSubresourceData[i].pData = asset.images[i].image.data();
-        cubemapSubresourceData[i].RowPitch = asset.images[i].width * asset.images[i].component;
-        cubemapSubresourceData[i].SlicePitch = asset.images[i].height * cubemapSubresourceData[i].RowPitch;
-    }
-
     UploadBatch uploadBatch;
     uploadBatch.Begin(app.mainAllocator.Get(), &app.copyQueue);
-    uploadBatch.AddTexture(cubemap->GetResource(), cubemapSubresourceData, 0, CubeImage_Count);
 
-    LoadBRDFLUT(app, uploadBatch);
+    for (int i = 0; i < CubeImage_Count; i++) {
+        D3D12_SUBRESOURCE_DATA subresourceData = {};
+        subresourceData.pData = asset.images[i].data.data();
+        subresourceData.RowPitch = asset.images[i].width * 4 * sizeof(float);
+        subresourceData.SlicePitch = asset.images[i].height * subresourceData.RowPitch;
+        uploadBatch.AddTexture(cubemap->GetResource(), &subresourceData, i * cubemapDesc.MipLevels, 1);
+    }
 
     app.Skybox.cubemap = cubemap;
+
+    LoadBRDFLUT(app, uploadBatch);
 
     {
         UniqueDescriptors texcubeSRV = AllocateDescriptorsUnique(app.descriptorPool, 1, "Skybox SRV");
@@ -1403,7 +1554,7 @@ void CreateSkybox(App& app, const SkyboxAssets& asset, AssetLoadProgress* progre
         srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         srvDesc.Format = cubemapDesc.Format;
         srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
-        srvDesc.TextureCube.MipLevels = 1;
+        srvDesc.TextureCube.MipLevels = cubemapDesc.MipLevels;
         app.device->CreateShaderResourceView(
             cubemap->GetResource(),
             &srvDesc,
@@ -1499,6 +1650,15 @@ void CreateSkybox(App& app, const SkyboxAssets& asset, AssetLoadProgress* progre
     auto cubemapUpload = uploadBatch.Finish();
     app.copyQueue.WaitForEventCPU(cubemapUpload);
 
+    // Generate mips for the cubemap. This is needed by the prefilter map computations.
+    {
+        FenceEvent mipsFenceEvent;
+        std::vector<bool> imageIsSRGB(1, false);
+        ComPtr<ID3D12Resource> resource = cubemap->GetResource();
+        std::vector<ComPtr<ID3D12Resource>> resources = { resource };
+        GenerateMipMaps(app, resources, imageIsSRGB, cubemapUpload);
+    }
+
     SharedPoolItem<Material> material = app.materials.AllocateShared();
     material->castsShadow = false;
     material->receivesShadow = false;
@@ -1550,6 +1710,7 @@ void CreateSkybox(App& app, const SkyboxAssets& asset, AssetLoadProgress* progre
     RenderSkyboxEnvironmentLightMaps(app, asset, cubemapUpload, progress);
 }
 
+
 void GLTFImageLoaderThread(
     tinygltf::Image* out
 )
@@ -1566,6 +1727,7 @@ void GLTFImageLoaderThread(
     }
 }
 
+
 ImageLoadContext BeginModelImageLoad(tinygltf::Model& model)
 {
     std::vector<std::thread> imageLoadThreads;
@@ -1576,6 +1738,7 @@ ImageLoadContext BeginModelImageLoad(tinygltf::Model& model)
 
     return imageLoadThreads;
 }
+
 
 bool TinyGLTFImageLoader(
     tinygltf::Image* image,
@@ -1600,6 +1763,7 @@ bool TinyGLTFImageLoader(
     return true;
 }
 
+
 void LoadGLTFThread(App& app, const std::string& gltfFile, AssetLoadProgress* progress)
 {
     auto perfName = "Loading " + gltfFile;
@@ -1621,11 +1785,11 @@ void LoadGLTFThread(App& app, const std::string& gltfFile, AssetLoadProgress* pr
     progress->overallPercent = 0.0f;
 
     if (!loader.LoadASCIIFromFile(&gltfModel, &err, &warn, gltfFile)) {
-        DebugLog() << "Failed to load GLTF file " << gltfFile << ":\n";
-        DebugLog() << err << "\n";
+        DebugLog() << "Failed to load GLTF file " << gltfFile << ":";
+        DebugLog() << err;
         return;
     }
-    std::cout << warn << "\n";
+    DebugLog() << warn;
 
     if (!ValidateGLTFModel(gltfModel)) {
         return;
@@ -1705,18 +1869,19 @@ void LoadGLTFThread(App& app, const std::string& gltfFile, AssetLoadProgress* pr
     progress->isFinished = true;
 }
 
-std::mutex g_assetMutex;
 
 void StartAssetThread(App& app)
 {
     app.AssetThread.thread = std::thread(AssetLoadThread, std::ref(app));
 }
 
+
 void NotifyAssetThread(App& app)
 {
     std::lock_guard<std::mutex> lock(g_assetMutex);
     app.AssetThread.workEvent.notify_one();
 }
+
 
 void EnqueueGLTF(App& app, const std::string& filePath)
 {
@@ -1725,12 +1890,14 @@ void EnqueueGLTF(App& app, const std::string& filePath)
     NotifyAssetThread(app);
 }
 
+
 void EnqueueSkybox(App& app, const SkyboxImagePaths& assetPaths)
 {
     std::lock_guard<std::mutex> lock(app.AssetThread.mutex);
     app.AssetThread.skyboxToLoad = assetPaths;
     NotifyAssetThread(app);
 }
+
 
 void LoadSkyboxThread(App& app, const SkyboxImagePaths& paths, AssetLoadProgress* progress)
 {
@@ -1740,10 +1907,10 @@ void LoadSkyboxThread(App& app, const SkyboxImagePaths& paths, AssetLoadProgress
 
     SkyboxAssets assets;
 
-    std::array<std::future<std::optional<tinygltf::Image>>, CubeImage_Count> images;
+    std::array<std::future<std::optional<HDRImage>>, CubeImage_Count> images;
 
     for (int i = 0; i < CubeImage_Count; i++) {
-        images[i] = std::async(std::launch::async, LoadImageFile, paths.paths[i]);
+        images[i] = std::async(std::launch::async, LoadHDRImage, paths.paths[i]);
     }
 
     bool fail = false;
@@ -1769,10 +1936,12 @@ void LoadSkyboxThread(App& app, const SkyboxImagePaths& paths, AssetLoadProgress
     progress->isFinished = true;
 }
 
+
 bool AreAssetsPendingLoad(const App& app)
 {
     return !app.AssetThread.gltfFilesToLoad.empty() || app.AssetThread.skyboxToLoad.has_value();
 }
+
 
 template<class... Args>
 void StartLoadThread(App& app, std::vector<std::thread>& loadThreads, Args... args)
@@ -1798,6 +1967,7 @@ void StartLoadThread(App& app, std::vector<std::thread>& loadThreads, Args... ar
         progress
     );
 }
+
 
 void AssetLoadThread(App& app)
 {

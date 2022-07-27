@@ -117,13 +117,30 @@ inline void CreateConstantBufferAndViews(
     }
 }
 
+inline D3D12_RESOURCE_DESC GetHDRImageDesc(int width, int height)
+{
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Width = width;
+    desc.Height = height;
+    desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    desc.DepthOrArraySize = 1;
+    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Quality = 0;
+    UINT highestDimension = std::max((UINT)desc.Width, desc.Height);
+    desc.MipLevels = (UINT16)std::floor(std::log2(highestDimension)) + 1;
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+
+    desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+
+    return desc;
+}
+
 inline D3D12_RESOURCE_DESC GetImageResourceDesc(const tinygltf::Image& image, bool isSRGB)
 {
     D3D12_RESOURCE_DESC desc = {};
     desc.Width = image.width;
     desc.Height = image.height;
     desc.Flags = D3D12_RESOURCE_FLAG_NONE;
-    D3D12_RESOURCE_FLAG_NONE;
     desc.DepthOrArraySize = 1;
     desc.SampleDesc.Count = 1;
     desc.SampleDesc.Quality = 0;

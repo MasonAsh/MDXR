@@ -26,6 +26,7 @@ struct ComputeShaderInput {
 };
 
 struct MipsConstantData {
+    uint textureIdx;
     uint srcMipLevel;
     uint numMipLevels;
     uint srcDimension;
@@ -35,7 +36,7 @@ struct MipsConstantData {
 
 SamplerState g_sampler : register(s0);
 
-Texture2D<float4> GetSrcMip(MipsConstantData mipsData)
+Texture2DArray<float4> GetSrcMip(MipsConstantData mipsData)
 {
     return ResourceDescriptorHeap[g_srcMipDescriptorIdx];
 }
@@ -115,8 +116,9 @@ float4 PackColor(float4 x)
 void CSMain(ComputeShaderInput input)
 {
     ConstantBuffer<MipsConstantData> mipsData = GetMipsConstantData();
-    Texture2D srcMip = GetSrcMip(mipsData);
+    Texture2DArray srcMip = GetSrcMip(mipsData);
 
+    uint textureIdx = mipsData.textureIdx;
     uint srcMipLevel = mipsData.srcMipLevel;
     float2 texelSize = mipsData.texelSize;
     uint numMipLevels = mipsData.numMipLevels;
@@ -127,14 +129,14 @@ void CSMain(ComputeShaderInput input)
     {
         case WIDTH_HEIGHT_EVEN:
         {
-            float2 uv = texelSize * (input.dispatchThreadID.xy + 0.5);
+            float3 uv = float3(texelSize * (input.dispatchThreadID.xy + 0.5), textureIdx);
             src1 = srcMip.SampleLevel(g_sampler, uv, srcMipLevel);
         }
         break;
         case WIDTH_ODD_HEIGHT_EVEN:
         {
-            float2 uv1 = texelSize * ( input.dispatchThreadID.xy + float2( 0.25, 0.5 ) );
-            float2 offset = texelSize * float2( 0.5, 0.0 );
+            float3 uv1 = float3(texelSize * ( input.dispatchThreadID.xy + float2( 0.25, 0.5 ) ), textureIdx);
+            float3 offset = float3(texelSize * float2(0.5, 0.0), 0.0);
  
             src1 = 0.5 * ( srcMip.SampleLevel( g_sampler, uv1, srcMipLevel ) +
                            srcMip.SampleLevel( g_sampler, uv1 + offset, srcMipLevel ) );
@@ -145,8 +147,8 @@ void CSMain(ComputeShaderInput input)
             // > 2:1 in Y dimension
             // Use 2 bilinear samples to guarantee we don't undersample when downsizing by more than 2x
             // vertically.
-            float2 uv1 = texelSize * ( input.dispatchThreadID.xy + float2( 0.5, 0.25 ) );
-            float2 offset = texelSize * float2( 0.0, 0.5 );
+            float3 uv1 = float3(texelSize * (input.dispatchThreadID.xy + float2(0.5, 0.25)) , textureIdx);
+            float3 offset = float3(texelSize * float2(0.0, 0.5), 0.0);
  
             src1 = 0.5 * ( srcMip.SampleLevel( g_sampler, uv1, srcMipLevel ) +
                            srcMip.SampleLevel( g_sampler, uv1 + offset, srcMipLevel ) );
@@ -157,13 +159,13 @@ void CSMain(ComputeShaderInput input)
             // > 2:1 in in both dimensions
             // Use 4 bilinear samples to guarantee we don't undersample when downsizing by more than 2x
             // in both directions.
-            float2 uv1 = texelSize * ( input.dispatchThreadID.xy + float2( 0.25, 0.25 ) );
-            float2 offset = texelSize * 0.5;
+            float3 uv1 = float3(texelSize * ( input.dispatchThreadID.xy + float2( 0.25, 0.25 ) ), textureIdx);
+            float2 offset = float2(texelSize * 0.5);
  
             src1 =  srcMip.SampleLevel(g_sampler, uv1, srcMipLevel);
-            src1 += srcMip.SampleLevel(g_sampler, uv1 + float2(offset.x, 0.0),      srcMipLevel);
-            src1 += srcMip.SampleLevel(g_sampler, uv1 + float2(0.0,      offset.y), srcMipLevel);
-            src1 += srcMip.SampleLevel(g_sampler, uv1 + float2(offset.x, offset.y), srcMipLevel);
+            src1 += srcMip.SampleLevel(g_sampler, uv1 + float3(offset.x, 0.0,      0.0), srcMipLevel);
+            src1 += srcMip.SampleLevel(g_sampler, uv1 + float3(0.0,      offset.y, 0.0), srcMipLevel);
+            src1 += srcMip.SampleLevel(g_sampler, uv1 + float3(offset.x, offset.y, 0.0), srcMipLevel);
             src1 *= 0.25;
         }
         break;

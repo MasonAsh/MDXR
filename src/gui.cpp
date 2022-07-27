@@ -79,10 +79,13 @@ void DrawMeshEditor(App& app)
                         selectedMesh = mesh.get();
                     }
 
+                    ImGui::PushID(mesh.get());
                     if (ImGui::Selectable(label.c_str(), isSelected)) {
                         selectedMeshIdx = meshIdx;
+                        ImGui::PopID();
                         break;
                     }
+                    ImGui::PopID();
 
                     meshIdx++;
                 }
@@ -132,10 +135,13 @@ void DrawMaterialEditor(App& app)
                     materialName = "UNNAMED";
                 }
 
+                ImGui::PushID(materialIter.item);
                 if (ImGui::Selectable(materialName, isSelected)) {
                     selectedMaterialIdx = materialIdx;
+                    ImGui::PopID();
                     break;
                 }
+                ImGui::PopID();
 
                 materialIdx++;
                 materialIter = app.materials.Next(materialIter);
