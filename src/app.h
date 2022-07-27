@@ -30,7 +30,7 @@
 #include <deque>
 
 const UINT FrameBufferCount = 2;
-const UINT MaxLightCount = 64;
+const UINT MaxLightCount = 512;
 const UINT MaxMaterialCount = 2048;
 const UINT MaxDescriptors = 4096;
 const DXGI_FORMAT DepthStencilFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;

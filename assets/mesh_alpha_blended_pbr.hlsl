@@ -48,7 +48,6 @@ PSOutput PSMain(PSInput input)
     PSOutput result;
 
     ConstantBuffer<MaterialData> mat = GetMaterial();
-    ConstantBuffer<LightConstantData> light = GetLight();
 
     float4 baseColor = float4(0.5, 0.5, 0.5, 1.0);
     float4 normal = float4(normalize(input.normalVS), 0.0f);
@@ -79,35 +78,43 @@ PSOutput PSMain(PSInput input)
 
     float4 viewPos = input.viewPos;
 
-    float3 lightToFragment = (-viewPos.xyz) -  (-light.positionViewSpace.xyz);
-    float distance = length(lightToFragment);
-    float attenuation = 1.0f / (distance * distance);
+    uint lightCount = g_LightPassDataIndex;
 
-    float3 N = normal.xyz;
+    result.backBuffer = float4(0, 0, 0, 0);
 
-    // Light direction to fragment
-    float3 Wi = lightToFragment / distance;
-    // Direction from fragment to eye
-    float3 Wo = normalize(-viewPos.xyz);
+    for (uint i = 0; i < lightCount; i++) {
+        ConstantBuffer<LightConstantData> light = ResourceDescriptorHeap[g_LightIndex + i];
 
-    if (light.type == LIGHT_DIRECTIONAL) {
-        attenuation = 1.0f;
+        float3 lightToFragment = (-viewPos.xyz) -  (-light.positionViewSpace.xyz);
+        float distance = length(lightToFragment);
+        float attenuation = 1.0f / (distance * distance);
+
+        float3 N = normal.xyz;
+
         // Light direction to fragment
-        Wi = normalize(light.directionViewSpace.xyz);
+        float3 Wi = lightToFragment / distance;
         // Direction from fragment to eye
-        Wo = normalize(-viewPos.xyz);
-    }
+        float3 Wo = normalize(-viewPos.xyz);
 
-    result.backBuffer = ShadePBR(
-        light.colorIntensity.xyz,
-        baseColor,
-        N,
-        roughness,
-        metallic,
-        Wi,
-        Wo,
-        attenuation
-    );
+        if (light.type == LIGHT_DIRECTIONAL) {
+            attenuation = 1.0f;
+            // Light direction to fragment
+            Wi = normalize(light.directionViewSpace.xyz);
+            // Direction from fragment to eye
+            Wo = normalize(-viewPos.xyz);
+        }
+
+        result.backBuffer += ShadePBR(
+            light.colorIntensity.xyz,
+            baseColor,
+            N,
+            roughness,
+            metallic,
+            Wi,
+            Wo,
+            attenuation
+        );
+    }
 
     return result;
 }

@@ -47,14 +47,16 @@ void StartSceneAssetLoad(App& app)
 
     const std::string& dataDir = app.dataDir;
 
-    EnqueueGLTF(app, dataDir + "/floor/floor.gltf");
+    // EnqueueGLTF(app, dataDir + "/floor/floor.gltf");
     // EnqueueGLTF(app, dataDir + "/metallicsphere.gltf");
     // EnqueueGLTF(app, dataDir + "/FlightHelmet/FlightHelmet.gltf");
-    EnqueueGLTF(app, dataDir + "/LightTest/LightTest.gltf");
-    // EnqueueGLTF(app, "C:\\Users\\mason\\dev\\glTF-Sample-Models\\Main\\tang2\\Sponza.gltf");
+    // EnqueueGLTF(app, dataDir + "/LightTest/LightTest.gltf");
+    EnqueueGLTF(app, "C:\\Users\\mason\\dev\\glTF-Sample-Models\\Main\\tangified\\sponza_tangents.gltf");
+    EnqueueGLTF(app, "C:/Users/mason/dev/glTF-Sample-Models/Main/PKG_A_Curtains/NewSponza_Curtains_glTF_with_tangents.gltf");
+    EnqueueGLTF(app, "C:/Users/mason/dev/glTF-Sample-Models/Main/PKG_D_Candles/NewSponza_100sOfCandles_glTF_OmniLights_with_tangents.gltf");
 
     SkyboxImagePaths images;
-    const std::string skyboxDir = "/CountryClub/";
+    const std::string skyboxDir = "/Forest/";
     const std::string extension = ".hdr";
     // const std::string skyboxDir = "/DebugSky/";
     // const std::string extension = ".png";

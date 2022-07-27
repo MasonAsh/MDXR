@@ -799,6 +799,8 @@ void DrawMeshesGBuffer(App& app, ID3D12GraphicsCommandList* commandList)
 
 void DrawAlphaBlendedMeshes(App& app, ID3D12GraphicsCommandList* commandList)
 {
+    const UINT MaxLightsPerDraw = 8;
+
     auto meshIter = app.meshPool.Begin();
     // FIXME: This seems like a bad looping order..
     while (meshIter) {
@@ -817,10 +819,18 @@ void DrawAlphaBlendedMeshes(App& app, ID3D12GraphicsCommandList* commandList)
             }
             auto materialDescriptor = material->cbvDescriptor.Ref();
 
-            for (UINT lightIdx = 0; lightIdx < app.LightBuffer.count; lightIdx++) {
+            for (UINT lightIdx = 0; lightIdx < app.LightBuffer.count; lightIdx += MaxLightsPerDraw) {
+                UINT lightCount = glm::max(app.LightBuffer.count - lightIdx, MaxLightsPerDraw);
+
                 UINT lightDescriptorIndex = app.LightBuffer.cbvHandle.Index() + lightIdx + 1u;
                 // Set the per-primitive constant buffer
-                UINT constantValues[5] = { primitive->perPrimitiveDescriptor.index, materialDescriptor.Index(), lightDescriptorIndex, 0, primitive->miscDescriptorParameter.index };
+                UINT constantValues[5] = {
+                    primitive->perPrimitiveDescriptor.index,
+                    materialDescriptor.Index(),
+                    lightDescriptorIndex,
+                    0,
+                    primitive->miscDescriptorParameter.index
+                };
                 commandList->SetGraphicsRoot32BitConstants(0, _countof(constantValues), constantValues, 0);
                 commandList->IASetPrimitiveTopology(primitive->primitiveTopology);
                 commandList->SetPipelineState(primitive->PSO->Get());
