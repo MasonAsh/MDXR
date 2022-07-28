@@ -12,7 +12,7 @@ static unsigned int crc32b(const unsigned char* const data, size_t len) {
         byte = data[i];            // Get next byte.
         crc = crc ^ byte;
         for (j = 7; j >= 0; j--) {    // Do eight times.
-            mask = -(crc & 1);
+            mask = -(static_cast<signed>(crc & 1));
             crc = (crc >> 1) ^ (0xEDB88320 & mask);
         }
     }

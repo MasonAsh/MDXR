@@ -197,97 +197,6 @@ struct Model
     PerPrimitiveConstantData* perPrimitiveBufferPtr;
 };
 
-// Fixed capacity descriptor heap. Aborts when the size outgrows initial capacity.
-//
-// There are two types of descriptors that can be allocated with DescriptorArena:
-//  * Static descriptors for the lifetime of the program with AllocateDesciptors
-//  * Temporary descriptors pushed onto a stack with [Push|Pop]DescriptorStack
-// 
-// Static descriptors grow from the left side of the heap while the stack grows
-// from the right.
-// struct DescriptorArena
-// {
-//     // Left side of descriptor heap is permanent descriptors
-//     // Right side is a stack for temporary allocations
-//     ComPtr<ID3D12DescriptorHeap> descriptorHeap;
-//     UINT capacity;
-//     UINT size;
-//     UINT descriptorIncrementSize;
-//     std::string debugName;
-//     DescriptorRef stackPtr;
-//     std::mutex mutex;
-
-//     // Temporary descriptors can be allocated from the right side of the heap
-//     UINT stack;
-
-//     ID3D12DescriptorHeap* Heap()
-//     {
-//         return descriptorHeap.Get();
-//     }
-
-//     void Initialize(ID3D12Device* device, D3D12_DESCRIPTOR_HEAP_DESC heapDesc, const std::string& debugName)
-//     {
-//         this->debugName = debugName;
-//         descriptorIncrementSize = device->GetDescriptorHandleIncrementSize(heapDesc.Type);
-//         ASSERT_HRESULT(
-//             device->CreateDescriptorHeap(
-//                 &heapDesc,
-//                 IID_PPV_ARGS(&descriptorHeap)
-//             )
-//         );
-//         capacity = heapDesc.NumDescriptors;
-//         size = 0;
-//         stack = 0;
-
-//         stackPtr = DescriptorRef(descriptorHeap.Get(), capacity - 1, descriptorIncrementSize);
-//     }
-
-//     DescriptorRef AllocateDescriptors(UINT count, const char* debugName)
-//     {
-//         CHECK(count > 0);
-
-//         std::lock_guard<std::mutex> lock(mutex);
-
-//         if (debugName != nullptr) {
-//             DebugLog() << this->debugName << " allocation info: " <<
-//                 "\n\tIndex: " << this->size <<
-//                 "\n\tCount: " << count <<
-//                 "\n\tReason: " << debugName << "\n";
-//         }
-//         DescriptorRef reference(descriptorHeap.Get(), size, descriptorIncrementSize);
-//         size += count;
-//         if (size + stack > capacity) {
-//             DebugLog() << "Error: descriptor heap is not large enough\n";
-//             abort();
-//         }
-//         return reference;
-//     }
-
-//     // Allocate some temporary descriptors.
-//     // These descriptors are allocated from the opposite side of the heap.
-//     DescriptorRef PushDescriptorStack(UINT count)
-//     {
-//         std::lock_guard<std::mutex> lock(mutex);
-
-//         if (size + (capacity - stackPtr.index) + count > capacity) {
-//             std::cerr << "Error: descriptor heap is not large enough\n";
-//             abort();
-//         }
-
-//         stackPtr.index -= count;
-
-//         return stackPtr;
-//     }
-
-//     // Pops temporary descriptors from stack
-//     void PopDescriptorStack(UINT count)
-//     {
-//         std::lock_guard<std::mutex> lock(mutex);
-
-//         stackPtr.index += count;
-//     }
-// };
-
 struct Camera
 {
     glm::vec3 translation;
@@ -501,12 +410,36 @@ struct Light
     }
 };
 
-struct AssetLoadProgress {
+struct AssetLoadProgress
+{
     std::string assetName;
     std::string currentTask;
     float overallPercent;
 
     std::atomic<bool> isFinished{ false };
+};
+
+enum RenderThreadType
+{
+    RenderThread_GBufferPass,
+    RenderThread_ShadowPass,
+    RenderThread_LightPass,
+    RenderThread_AlphaBlendPass,
+    RenderThread_Count,
+};
+
+struct RenderThread
+{
+    std::thread thread;
+
+    std::mutex mutex;
+
+    bool workIsAvailable = false;
+    std::condition_variable beginWork;
+    std::condition_variable workFinished;
+
+    ComPtr<ID3D12GraphicsCommandList> commandList;
+    ComPtr<ID3D12CommandAllocator> commandAllocator;
 };
 
 struct App
@@ -531,7 +464,7 @@ struct App
     struct {
         long long lastFrameTimeNS = 0;
         long triangleCount = 0;
-        long drawCalls = 0;
+        std::atomic_uint drawCalls = 0;
     } Stats;
 
     int windowWidth = 1920;
@@ -556,6 +489,8 @@ struct App
     ComPtr<ID3D12GraphicsCommandList> commandList;
     CD3DX12_VIEWPORT viewport;
     CD3DX12_RECT scissorRect;
+
+    std::array<RenderThread, RenderThread_Count> renderThreads;
 
     CommandQueue computeQueue;
     ComPtr<ID3D12CommandAllocator> computeCommandAllocator;
@@ -634,11 +569,6 @@ struct App
         float gamma = 2.2f;
         float exposure = 1.0f;
     } PostProcessPass;
-
-    // Per primitive constant buffer for cubemap rendering
-    // Contains the view projection matrices for all CubeImage_*
-    ComPtr<D3D12MA::Allocation> cubemapPerPrimitiveBuffer;
-    DescriptorRef cubemapPerPrimitiveBufferDescriptor;
 
     struct
     {

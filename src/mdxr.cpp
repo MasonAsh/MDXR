@@ -250,7 +250,7 @@ int RunApp(int argc, char** argv)
     InitApp(app, argc, argv);
     InitWindow(app);
     InitController(app);
-    InitD3D(app);
+    InitRenderer(app);
     InitImGui(app);
 
     StartAssetThread(app);
@@ -278,6 +278,7 @@ int RunApp(int argc, char** argv)
             ImGui_ImplSDL2_ProcessEvent(&e);
             if (e.type == SDL_QUIT) {
                 app.running = false;
+                goto quit;
             } else if (e.type == SDL_WINDOWEVENT) {
                 if (e.window.event == SDL_WINDOWEVENT_RESIZED) {
                     int newWidth = e.window.data1;
@@ -328,8 +329,11 @@ int RunApp(int argc, char** argv)
         app.lastFrameTick = frameTick;
     }
 
+quit:
     NotifyAssetThread(app);
     app.AssetThread.thread.join();
+
+    DestroyRenderer(app);
 
     CleanImGui();
 
@@ -353,7 +357,7 @@ int RunMDXR(int argc, char** argv)
         {
             dxgiDebug->ReportLiveObjects(DXGI_DEBUG_ALL, DXGI_DEBUG_RLO_FLAGS(DXGI_DEBUG_RLO_SUMMARY | DXGI_DEBUG_RLO_IGNORE_INTERNAL));
         }
-    }
+}
 #endif
 
     return status;

@@ -7,6 +7,7 @@
 #include <dxgi.h>
 
 #include <mutex>
+#include <span>
 
 // Wrapper for a command queue, a fence, and a mutex to synchronize calls to ExecuteCommandLists
 class CommandQueue
@@ -32,7 +33,38 @@ public:
         return commandQueue.Get();
     }
 
-    void ExecuteCommandLists(std::initializer_list<ID3D12CommandList* const> commandLists, FenceEvent& fenceEvent, FenceEvent waitEvent = FenceEvent())
+#if 0
+    ID3D12GraphicsCommandList* GetCommandList(ID3D12Device* device, ID3D12PipelineState* initialState)
+    {
+        std::scoped_lock<std::mutex> lock(mutex);
+
+        CommandListEntry* entry = nullptr;
+
+        for (auto& commandListEntry : commandLists) {
+            if (!commandListEntry.isRecording) {
+                entry = &commandListEntry;
+            }
+        }
+
+        if (entry) {
+            ASSERT_HRESULT(entry->commandAllocator->Reset());
+            ASSERT_HRESULT(entry->commandList->Reset(
+                entry->commandAllocator.Get(),
+                initialState
+            ));
+
+        } else {
+            AppendCommandList(device, initialState);
+            entry = &commandLists.back();
+        }
+
+        entry->isRecording = true;
+
+        return commandLists.back().commandList.Get();
+    }
+#endif
+
+    void ExecuteCommandLists(std::span<ID3D12CommandList* const> commandLists, FenceEvent& fenceEvent, FenceEvent waitEvent = FenceEvent())
     {
 #ifdef MDXR_DEBUG
         for (auto& commandList : commandLists) {
@@ -42,12 +74,29 @@ public:
 
         std::scoped_lock lock{ mutex };
 
+#if 0
+        // Clear the recording flag for command lists that were allocated from this pool.
+        for (auto& commandList : commandLists) {
+            for (auto& entry : this->commandLists) {
+                if (entry.commandList.Get() == commandList) {
+                    entry.commandAllocator->Reset();
+                    entry.isRecording = false;
+                }
+            }
+        }
+#endif
+
         waitEvent.sourceFence->WaitQueue(commandQueue.Get(), waitEvent);
-        commandQueue->ExecuteCommandLists(assert_cast<UINT>(commandLists.size()), commandLists.begin());
+        commandQueue->ExecuteCommandLists(assert_cast<UINT>(commandLists.size()), &commandLists[0]);
         fence.SignalQueue(commandQueue.Get(), fenceEvent);
     }
 
-    void ExecuteCommandListsBlocking(std::initializer_list<ID3D12CommandList* const> commandLists, FenceEvent waitEvent = FenceEvent())
+    void ExecuteCommandLists(std::initializer_list<ID3D12CommandList* const> commandLists, FenceEvent& fenceEvent, FenceEvent waitEvent = FenceEvent())
+    {
+        ExecuteCommandLists(std::span<ID3D12CommandList* const>(commandLists), fenceEvent, waitEvent);
+    }
+
+    void ExecuteCommandListsBlocking(std::span<ID3D12CommandList* const> commandLists, FenceEvent waitEvent = FenceEvent())
     {
 #ifdef MDXR_DEBUG
         for (auto& commandList : commandLists) {
@@ -56,23 +105,13 @@ public:
 #endif
 
         FenceEvent fenceEvent;
-
-        {
-            // We must synchronize the calls to the queue, but don't want to keep the lock for
-            // the CPU wait.
-            std::scoped_lock lock{ mutex };
-
-            waitEvent.sourceFence->WaitQueue(commandQueue.Get(), waitEvent);
-            commandQueue->ExecuteCommandLists(assert_cast<UINT>(commandLists.size()), commandLists.begin());
-            fence.SignalQueue(commandQueue.Get(), fenceEvent);
-        }
-
+        ExecuteCommandLists(commandLists, fenceEvent);
         WaitForEventCPU(fenceEvent);
     }
 
     // This is necessary because Present must happen before signaling the queue.
     HRESULT ExecuteCommandListsAndPresentBlocking(
-        std::initializer_list<ID3D12CommandList* const> commandLists,
+        std::span<ID3D12CommandList* const> commandLists,
         IDXGISwapChain* swapChain,
         UINT syncInterval,
         UINT presentFlags,
@@ -93,7 +132,7 @@ public:
             std::scoped_lock lock{ mutex };
 
             waitEvent.sourceFence->WaitQueue(commandQueue.Get(), waitEvent);
-            commandQueue->ExecuteCommandLists(assert_cast<UINT>(commandLists.size()), commandLists.begin());
+            commandQueue->ExecuteCommandLists(assert_cast<UINT>(commandLists.size()), &commandLists[0]);
             hr = swapChain->Present(syncInterval, presentFlags);
             if (!SUCCEEDED(hr)) {
                 return hr;
@@ -106,11 +145,46 @@ public:
         return hr;
     }
 
+    void ExecuteCommandListsBlocking(std::initializer_list<ID3D12CommandList* const> commandLists, FenceEvent waitEvent = FenceEvent())
+    {
+        ExecuteCommandListsBlocking(std::span<ID3D12CommandList* const>(commandLists), waitEvent);
+    }
+
     void WaitForEventCPU(FenceEvent& fenceEvent)
     {
         fenceEvent.sourceFence->WaitCPU(fenceEvent);
     }
 private:
+
+#if 0
+    void AppendCommandList(ID3D12Device* device, ID3D12PipelineState* initialState)
+    {
+        CommandListEntry entry;
+        entry.isRecording = false;
+        ASSERT_HRESULT(device->CreateCommandAllocator(
+            commandListType,
+            IID_PPV_ARGS(&entry.commandAllocator)
+        ));
+        ASSERT_HRESULT(device->CreateCommandList(
+            0,
+            commandListType,
+            entry.commandAllocator.Get(),
+            initialState,
+            IID_PPV_ARGS(&entry.commandList)
+        ));
+
+        commandLists.push_back(entry);
+    }
+
+
+    struct CommandListEntry {
+        bool isRecording;
+        ComPtr<ID3D12GraphicsCommandList> commandList;
+        ComPtr<ID3D12CommandAllocator> commandAllocator;
+    };
+    std::vector<CommandListEntry> commandLists;
+#endif
+
     ComPtr<ID3D12CommandQueue> commandQueue;
     IncrementalFence fence;
     D3D12_COMMAND_LIST_TYPE commandListType;

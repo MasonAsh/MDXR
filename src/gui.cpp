@@ -261,11 +261,13 @@ void DrawStats(App& app)
     if (app.ImGui.showStats) {
         float frameTimeMS = (float)app.Stats.lastFrameTimeNS / (float)1E6;
         if (ImGui::Begin("Stats", &app.ImGui.showStats, windowFlags)) {
+            ImVec4 textColor = ImVec4(1.0f, 0.0f, 0.0f, 1.0f);
+
             ImGui::SetWindowPos({ 0.0f, 20.0f });
-            ImGui::Text("Frame time: %.2fms", frameTimeMS);
-            ImGui::Text("FPS: %.0f", 1000.0f / frameTimeMS);
-            ImGui::Text("Triangles: %d", app.Stats.triangleCount);
-            ImGui::Text("Draw calls: %d", app.Stats.drawCalls);
+            ImGui::TextColored(textColor, "Frame time: %.2fms", frameTimeMS);
+            ImGui::TextColored(textColor, "FPS: %.0f", 1000.0f / frameTimeMS);
+            ImGui::TextColored(textColor, "Triangles: %d", app.Stats.triangleCount);
+            ImGui::TextColored(textColor, "Draw calls: %d", app.Stats.drawCalls.load());
         }
         ImGui::End();
     }

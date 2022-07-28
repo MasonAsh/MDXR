@@ -7,21 +7,6 @@
 #include <directx/d3dx12.h>
 #include <pix3.h>
 
-void SetupCubemapData(App& app)
-{
-    auto resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(sizeof(PerPrimitiveConstantData) * CubeImage_Count);
-    D3D12MA::ALLOCATION_DESC allocDesc{};
-    allocDesc.HeapType = D3D12_HEAP_TYPE_DEFAULT;
-    ASSERT_HRESULT(app.mainAllocator->CreateResource(
-        &allocDesc,
-        &resourceDesc,
-        D3D12_RESOURCE_STATE_COMMON,
-        nullptr,
-        &app.cubemapPerPrimitiveBuffer,
-        IID_NULL, nullptr
-    ));
-}
-
 void SetupDepthStencil(App& app, bool isResize)
 {
     if (!isResize) {
@@ -189,8 +174,7 @@ void CreateMainRootSignature(App& app)
     ID3D12Device* device = app.device.Get();
     D3D12_FEATURE_DATA_ROOT_SIGNATURE featureData = {};
     featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_1;
-    if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &featureData, sizeof(featureData))))
-    {
+    if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &featureData, sizeof(featureData)))) {
         featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_0;
     }
 
@@ -203,20 +187,20 @@ void CreateMainRootSignature(App& app)
         D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
 
     // FIXME: This is going to have to be dynamic...
-    D3D12_STATIC_SAMPLER_DESC sampler = {};
-    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-    sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-    sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
-    sampler.MipLODBias = 0;
-    sampler.MaxAnisotropy = 8;
-    sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
-    sampler.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
-    sampler.MinLOD = 0.0f;
-    sampler.MaxLOD = D3D12_FLOAT32_MAX;
-    sampler.ShaderRegister = 0;
-    sampler.RegisterSpace = 0;
-    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_STATIC_SAMPLER_DESC defaultSampler = {};
+    defaultSampler.Filter = D3D12_FILTER_ANISOTROPIC;
+    defaultSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    defaultSampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    defaultSampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    defaultSampler.MipLODBias = 0;
+    defaultSampler.MaxAnisotropy = 8;
+    defaultSampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+    defaultSampler.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+    defaultSampler.MinLOD = 0.0f;
+    defaultSampler.MaxLOD = D3D12_FLOAT32_MAX;
+    defaultSampler.ShaderRegister = 0;
+    defaultSampler.RegisterSpace = 0;
+    defaultSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
     D3D12_STATIC_SAMPLER_DESC shadowMapSampler = {};
     shadowMapSampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -233,7 +217,7 @@ void CreateMainRootSignature(App& app)
     shadowMapSampler.RegisterSpace = 0;
     shadowMapSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-    D3D12_STATIC_SAMPLER_DESC samplers[] = { sampler, shadowMapSampler };
+    D3D12_STATIC_SAMPLER_DESC samplers[] = { defaultSampler, shadowMapSampler };
 
     CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rootSignatureDesc;
     rootSignatureDesc.Init_1_1(
@@ -438,7 +422,95 @@ void SetupPostProcessPass(App& app)
     );
 }
 
-void InitD3D(App& app)
+template<auto RenderFunc, unsigned threadType>
+void RenderWorker(App& app)
+{
+    auto& renderThread = app.renderThreads[threadType];
+    ID3D12CommandAllocator* commandAllocator = renderThread.commandAllocator.Get();
+    ID3D12GraphicsCommandList* commandList = renderThread.commandList.Get();
+
+    while (app.running) {
+        std::unique_lock lock(renderThread.mutex);
+        renderThread.beginWork.wait(lock, [&] { return renderThread.workIsAvailable || !app.running; });
+
+        if (!app.running) {
+            goto cleanup;
+        }
+
+        ASSERT_HRESULT(commandAllocator->Reset());
+        ASSERT_HRESULT(commandList->Reset(
+            commandAllocator,
+            nullptr
+        ));
+
+        RenderFunc(app, commandList);
+
+        commandList->Close();
+
+    cleanup:
+        renderThread.workIsAvailable = false;
+        lock.unlock();
+
+        renderThread.workFinished.notify_one();
+    }
+}
+
+void GBufferPass(App&, ID3D12GraphicsCommandList*);
+void ShadowPass(App&, ID3D12GraphicsCommandList*);
+void LightPass(App&, ID3D12GraphicsCommandList*);
+void AlphaBlendPass(App&, ID3D12GraphicsCommandList*);
+void PostProcessPass(App&, ID3D12GraphicsCommandList*);
+
+template<auto WorkerFunc, unsigned threadType>
+void StartRenderThread(App& app)
+{
+    auto& renderThread = app.renderThreads[threadType];
+
+    ASSERT_HRESULT(app.device->CreateCommandAllocator(
+        D3D12_COMMAND_LIST_TYPE_DIRECT,
+        IID_PPV_ARGS(&renderThread.commandAllocator)
+    ));
+
+    ASSERT_HRESULT(app.device->CreateCommandList(
+        0,
+        D3D12_COMMAND_LIST_TYPE_DIRECT,
+        renderThread.commandAllocator.Get(),
+        nullptr,
+        IID_PPV_ARGS(&renderThread.commandList)
+    ));
+    renderThread.commandList->Close();
+
+    renderThread.thread = std::thread(
+        &RenderWorker<WorkerFunc, threadType>,
+        std::ref(app)
+    );
+}
+
+void StartRenderThreads(App& app)
+{
+    StartRenderThread<GBufferPass, RenderThread_GBufferPass>(app);
+    StartRenderThread<ShadowPass, RenderThread_ShadowPass>(app);
+    StartRenderThread<LightPass, RenderThread_LightPass>(app);
+    StartRenderThread<AlphaBlendPass, RenderThread_AlphaBlendPass>(app);
+}
+
+void NotifyAndWaitRenderThreads(App& app)
+{
+    // Notify
+    for (auto& renderThread : app.renderThreads) {
+        renderThread.workIsAvailable = true;
+        renderThread.beginWork.notify_one();
+    }
+
+    // Wait
+    for (auto& renderThread : app.renderThreads) {
+        std::unique_lock lock(renderThread.mutex);
+        renderThread.workFinished.wait(lock, [&] { return !renderThread.workIsAvailable; });
+        lock.unlock();
+    }
+}
+
+void InitRenderer(App& app)
 {
     if (app.gpuDebug) {
         ComPtr<ID3D12Debug> debugController;
@@ -614,7 +686,18 @@ void InitD3D(App& app)
         ASSERT_HRESULT(app.copyCommandList->Close());
     }
 
-    SetupCubemapData(app);
+    StartRenderThreads(app);
+}
+
+void DestroyRenderer(App& app)
+{
+    CHECK(!app.running);
+
+    // Stop all the render threads
+    for (auto& renderThread : app.renderThreads) {
+        renderThread.beginWork.notify_one();
+        renderThread.thread.join();
+    }
 }
 
 void CreateGPUBufferWithData(
@@ -763,6 +846,8 @@ void DrawMeshesGBuffer(App& app, ID3D12GraphicsCommandList* commandList)
 
     commandList->OMSetStencilRef(0xFFFFFFFF);
 
+    ManagedPSORef lastUsedPSO = nullptr;
+
     while (meshIter) {
         if (!meshIter->isReadyForRender) {
             meshIter = app.meshPool.Next(meshIter);
@@ -786,7 +871,12 @@ void DrawMeshesGBuffer(App& app, ID3D12GraphicsCommandList* commandList)
             UINT constantValues[5] = { primitive->perPrimitiveDescriptor.index, materialDescriptor.index, 0, 0, primitive->miscDescriptorParameter.index };
             commandList->SetGraphicsRoot32BitConstants(0, _countof(constantValues), constantValues, 0);
             commandList->IASetPrimitiveTopology(primitive->primitiveTopology);
-            commandList->SetPipelineState(primitive->PSO->Get());
+
+            if (primitive->PSO != lastUsedPSO) {
+                commandList->SetPipelineState(primitive->PSO->Get());
+                lastUsedPSO = primitive->PSO;
+            }
+
             commandList->IASetVertexBuffers(0, (UINT)primitive->vertexBufferViews.size(), primitive->vertexBufferViews.data());
             commandList->IASetIndexBuffer(&primitive->indexBufferView);
             commandList->DrawIndexedInstanced(primitive->indexCount, 1, 0, 0, 0);
@@ -800,6 +890,8 @@ void DrawMeshesGBuffer(App& app, ID3D12GraphicsCommandList* commandList)
 void DrawAlphaBlendedMeshes(App& app, ID3D12GraphicsCommandList* commandList)
 {
     const UINT MaxLightsPerDraw = 8;
+
+    ManagedPSORef lastUsedPSO = nullptr;
 
     auto meshIter = app.meshPool.Begin();
     // FIXME: This seems like a bad looping order..
@@ -833,7 +925,12 @@ void DrawAlphaBlendedMeshes(App& app, ID3D12GraphicsCommandList* commandList)
                 };
                 commandList->SetGraphicsRoot32BitConstants(0, _countof(constantValues), constantValues, 0);
                 commandList->IASetPrimitiveTopology(primitive->primitiveTopology);
-                commandList->SetPipelineState(primitive->PSO->Get());
+
+                if (primitive->PSO != lastUsedPSO) {
+                    commandList->SetPipelineState(primitive->PSO->Get());
+                    lastUsedPSO = primitive->PSO;
+                }
+
                 commandList->IASetVertexBuffers(0, (UINT)primitive->vertexBufferViews.size(), primitive->vertexBufferViews.data());
                 commandList->IASetIndexBuffer(&primitive->indexBufferView);
                 commandList->DrawIndexedInstanced(primitive->indexCount, 1, 0, 0, 0);
@@ -904,6 +1001,9 @@ void GBufferPass(App& app, ID3D12GraphicsCommandList* commandList)
 {
     PIXScopedEvent(commandList, 0xC082FF, L"GBufferPass");
 
+    commandList->RSSetViewports(1, &app.viewport);
+    commandList->RSSetScissorRects(1, &app.scissorRect);
+
     TransitionResourcesForGBufferPass(app, commandList);
 
     BindAndClearGBufferRTVs(app, commandList);
@@ -920,6 +1020,14 @@ void GBufferPass(App& app, ID3D12GraphicsCommandList* commandList)
 void ShadowPass(App& app, ID3D12GraphicsCommandList* commandList)
 {
     PIXScopedEvent(commandList, 0xC1C1C1, L"ShadowPass");
+
+    commandList->SetGraphicsRootSignature(app.rootSignature.Get());
+
+    auto descriptorHeap = app.descriptorPool.Heap();
+    ID3D12DescriptorHeap* ppHeaps[] = { descriptorHeap };
+    commandList->SetDescriptorHeaps(_countof(ppHeaps), ppHeaps);
+
+    ManagedPSORef lastUsedPSO = nullptr;
 
     for (UINT i = 0; i < app.LightBuffer.count; i++) {
         auto& light = app.lights[i];
@@ -965,7 +1073,12 @@ void ShadowPass(App& app, ID3D12GraphicsCommandList* commandList)
 
                     commandList->SetGraphicsRoot32BitConstants(0, _countof(constantValues), constantValues, 0);
                     commandList->IASetPrimitiveTopology(primitive->primitiveTopology);
-                    commandList->SetPipelineState(primitive->directionalShadowPSO->Get());
+
+                    if (primitive->directionalShadowPSO != lastUsedPSO) {
+                        commandList->SetPipelineState(primitive->directionalShadowPSO->Get());
+                        lastUsedPSO = primitive->directionalShadowPSO;
+                    }
+
                     commandList->IASetVertexBuffers(0, (UINT)primitive->vertexBufferViews.size(), primitive->vertexBufferViews.data());
                     commandList->IASetIndexBuffer(&primitive->indexBufferView);
                     commandList->DrawIndexedInstanced(primitive->indexCount, 1, 0, 0, 0);
@@ -1008,6 +1121,9 @@ void TransitionResourcesForLightPass(const App& app, ID3D12GraphicsCommandList* 
 void LightPass(App& app, ID3D12GraphicsCommandList* commandList)
 {
     PIXScopedEvent(commandList, 0xFF9F82, L"LightPass");
+
+    commandList->RSSetViewports(1, &app.viewport);
+    commandList->RSSetScissorRects(1, &app.scissorRect);
 
     TransitionResourcesForLightPass(app, commandList);
 
@@ -1075,6 +1191,9 @@ void AlphaBlendPass(App& app, ID3D12GraphicsCommandList* commandList)
 {
     PIXScopedEvent(commandList, 0x93E9BE, L"AlphaBlendPass");
 
+    commandList->RSSetViewports(1, &app.viewport);
+    commandList->RSSetScissorRects(1, &app.scissorRect);
+
     // Transition depth buffer back to depth write for alpha blend
     auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(app.depthStencilBuffer.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_DEPTH_READ, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     commandList->ResourceBarrier(1, &barrier);
@@ -1102,6 +1221,14 @@ void PostProcessPass(App& app, ID3D12GraphicsCommandList* commandList)
 {
     PIXScopedEvent(commandList, 0x89E4F8, L"PostProcessPass");
 
+    commandList->RSSetViewports(1, &app.viewport);
+    commandList->RSSetScissorRects(1, &app.scissorRect);
+
+    ID3D12DescriptorHeap* mainDescriptorHeap = app.descriptorPool.Heap();
+    ID3D12DescriptorHeap* ppHeaps[] = { mainDescriptorHeap };
+    commandList->SetDescriptorHeaps(1, ppHeaps);
+    commandList->SetGraphicsRootSignature(app.rootSignature.Get());
+
     TransitionResourcesForPostProcessPass(app, commandList);
 
     auto rtvHandle = app.frameBufferRTVs[app.frameIdx].CPUHandle();
@@ -1123,7 +1250,7 @@ void PostProcessPass(App& app, ID3D12GraphicsCommandList* commandList)
     DrawFullscreenQuad(app, commandList);
 }
 
-void BuildCommandList(App& app)
+void BuildCommandLists(App& app)
 {
     ID3D12GraphicsCommandList* commandList = app.commandList.Get();
 
@@ -1135,15 +1262,8 @@ void BuildCommandList(App& app)
         commandList->Reset(app.commandAllocator.Get(), app.pipelineState.Get())
     );
 
-    commandList->SetGraphicsRootSignature(app.rootSignature.Get());
+    NotifyAndWaitRenderThreads(app);
 
-    commandList->RSSetViewports(1, &app.viewport);
-    commandList->RSSetScissorRects(1, &app.scissorRect);
-
-    GBufferPass(app, commandList);
-    ShadowPass(app, commandList);
-    LightPass(app, commandList);
-    AlphaBlendPass(app, commandList);
     PostProcessPass(app, commandList);
 
     auto linearRTV = app.nonSRGBFrameBufferRTVs[app.frameIdx].CPUHandle();
@@ -1172,13 +1292,26 @@ void RenderFrame(App& app)
     app.Stats.drawCalls = 0;
 
     bool tdrOccurred = false;
-    BuildCommandList(app);
+    BuildCommandLists(app);
+
+    std::array<ID3D12CommandList*, RenderThread_Count> commandLists;
+    for (int i = 0; i < RenderThread_Count; i++) {
+        commandLists[i] = app.renderThreads[i].commandList.Get();
+    }
+
+    // app.graphicsQueue.ExecuteCommandListsBlocking(commandLists);
+
+    for (auto& commandList : commandLists) {
+        app.graphicsQueue.ExecuteCommandListsBlocking({ commandList });
+    }
 
     FenceEvent renderEvent;
 
+    ID3D12CommandList* const presentCommandList = app.commandList.Get();
+
     // FIXME: multithreading
     HRESULT hr = app.graphicsQueue.ExecuteCommandListsAndPresentBlocking(
-        { app.commandList.Get() },
+        std::span<ID3D12CommandList* const>({ presentCommandList }),
         app.swapChain.Get(),
         0,
         DXGI_PRESENT_ALLOW_TEARING
