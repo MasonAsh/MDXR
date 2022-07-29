@@ -480,6 +480,8 @@ void StartRenderThread(App& app)
     ));
     renderThread.commandList->Close();
 
+    renderThread.commandList->SetName(convert_to_wstring(typeid(WorkerFunc).name()).c_str());
+
     renderThread.thread = std::thread(
         &RenderWorker<WorkerFunc, threadType>,
         std::ref(app)
@@ -728,7 +730,7 @@ void CreateGPUBufferWithData(
     memcpy(dataPtr, inData, dataSize);
 }
 
-void UpdatePerPrimitiveConstantBuffers(App& app, const glm::mat4& projection, const glm::mat4& view)
+void UpdatePerPrimitiveData(App& app, const glm::mat4& projection, const glm::mat4& view)
 {
     glm::mat4 viewProjection = projection * view;
 
@@ -755,7 +757,10 @@ void UpdatePerPrimitiveConstantBuffers(App& app, const glm::mat4& projection, co
             primitive->constantData->MVP = mvp;
             primitive->constantData->MV = mv;
             primitive->constantData->M = modelMatrix;
+            // primitive->worldBoundingBox.max = modelMatrix * glm::vec4(primitive->localBoundingBox.max, 1.0f);
+            // primitive->worldBoundingBox.min = modelMatrix * glm::vec4(primitive->localBoundingBox.min, 1.0f);
         }
+
         meshIter = app.meshPool.Next(meshIter);
     }
 }
@@ -834,10 +839,107 @@ void UpdateLightConstantBuffers(App& app, const glm::mat4& projection, const glm
     }
 }
 
+struct Plane
+{
+    glm::vec4 normal;
+};
+
+enum FrustumPlane
+{
+    FrustumPlane_Right,
+    FrustumPlane_Left,
+    FrustumPlane_Top,
+    FrustumPlane_Bottom,
+    FrustumPlane_Near,
+    FrustumPlane_Far,
+};
+
+struct Frustum
+{
+    glm::vec4 planes[6];
+};
+
+Frustum ComputeFrustum(const glm::mat4& viewProjection)
+{
+    // Thanks reddit <3
+    //https://www.reddit.com/r/gamedev/comments/xj47t/does_glm_support_frustum_plane_extraction/
+
+    glm::mat4 m = glm::transpose(viewProjection);
+    //glm::mat4 m = viewProjection;
+
+    Frustum result;
+
+    result.planes[FrustumPlane_Right] = glm::row(viewProjection, 3) - glm::row(viewProjection, 0);
+    result.planes[FrustumPlane_Left] = glm::row(viewProjection, 3) + glm::row(viewProjection, 0);
+    result.planes[FrustumPlane_Top] = glm::row(viewProjection, 3) - glm::row(viewProjection, 1);
+    result.planes[FrustumPlane_Bottom] = glm::row(viewProjection, 3) + glm::row(viewProjection, 1);
+    result.planes[FrustumPlane_Far] = glm::row(viewProjection, 3) - glm::row(viewProjection, 2);
+    result.planes[FrustumPlane_Near] = glm::row(viewProjection, 2);
+
+    for (auto& plane : result.planes) {
+        // normalize the planes
+        glm::vec3 xyz(plane);
+        float length = glm::length(xyz);
+        plane /= length;
+    }
+
+    return result;
+}
+
+bool IsAABBCulled(const Frustum& f, const AABB& box)
+{
+    // https://bruop.github.io/frustum_culling/
+    glm::vec4 corners[8] = {
+        {box.min.x, box.min.y, box.min.z, 1.0},
+        {box.max.x, box.min.y, box.min.z, 1.0},
+        {box.min.x, box.max.y, box.min.z, 1.0},
+        {box.max.x, box.max.y, box.min.z, 1.0},
+
+        {box.min.x, box.min.y, box.max.z, 1.0},
+        {box.max.x, box.min.y, box.max.z, 1.0},
+        {box.min.x, box.max.y, box.max.z, 1.0},
+        {box.max.x, box.max.y, box.max.z, 1.0},
+    };
+
+    for (const auto& plane : f.planes) {
+        int out = 0;
+        for (const auto& corner : corners) {
+            float d = glm::dot(plane, corner);
+            out += d < 0 ? 1 : 0;
+        }
+        if (out == 8) return true;
+    }
+
+    return false;
+}
+
+void DoFrustumCulling(PrimitivePool& primitivePool, const glm::mat4& viewProjection)
+{
+    PIXScopedEvent(0x93E9BE, __func__);
+
+    Frustum f = ComputeFrustum(viewProjection);
+
+    auto primitiveIter = primitivePool.Begin();
+    while (primitiveIter) {
+        if (!primitiveIter->constantData) {
+            continue;
+        }
+
+        AABB worldBB = primitiveIter->localBoundingBox;
+        worldBB.min = primitiveIter->constantData->M * glm::vec4(worldBB.min, 1.0f);
+        worldBB.max = primitiveIter->constantData->M * glm::vec4(worldBB.max, 1.0f);
+
+
+        primitiveIter->cull = IsAABBCulled(f, worldBB);
+        primitiveIter = primitivePool.Next(primitiveIter);
+    }
+}
+
 void UpdateRenderData(App& app, const glm::mat4& projection, const glm::mat4& view)
 {
     UpdateLightConstantBuffers(app, projection, view);
-    UpdatePerPrimitiveConstantBuffers(app, projection, view);
+    UpdatePerPrimitiveData(app, projection, view);
+    DoFrustumCulling(app.primitivePool, projection * view);
 }
 
 void DrawMeshesGBuffer(App& app, ID3D12GraphicsCommandList* commandList)
@@ -855,6 +957,10 @@ void DrawMeshesGBuffer(App& app, ID3D12GraphicsCommandList* commandList)
         }
 
         for (const auto& primitive : meshIter->primitives) {
+            if (primitive->cull) {
+                continue;
+            }
+
             const auto& material = primitive->material.get();
             // FIXME: if I am not lazy I will SORT by material type
             // Transparent materials drawn in different pass
@@ -947,6 +1053,14 @@ void DrawFullscreenQuad(App& app, ID3D12GraphicsCommandList* commandList)
     // NOTE: if this only draws one triangle, its because the primitive topology is not triangle strip
     commandList->IASetVertexBuffers(0, 0, nullptr);
     commandList->DrawInstanced(4, 1, 0, 0);
+
+    app.Stats.drawCalls++;
+}
+
+void DrawFullscreenQuadInstanced(App& app, ID3D12GraphicsCommandList* commandList, int count)
+{
+    commandList->IASetVertexBuffers(0, 0, nullptr);
+    commandList->DrawInstanced(4, count, 0, 0);
 
     app.Stats.drawCalls++;
 }
@@ -1144,8 +1258,36 @@ void LightPass(App& app, ID3D12GraphicsCommandList* commandList)
 
         commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 
+        // This define will bundle together light fullscreen quads into instanced draws.
+        // This is only helpful to the extent the lights are sorted by lightType.
+        //
+        // In practice this seems to barely help, so not worth to implement the sorting code
+        // as of now.
+#define USE_LIGHT_INSTANCING
+
         // Point lights
+        PIXBeginEvent(commandList, 0xFF9F82, L"PointLights");
         commandList->SetPipelineState(app.LightPass.pointLightPSO->Get());
+#ifdef USE_LIGHT_INSTANCING
+        for (UINT i = 0; i < app.LightBuffer.count; i++) {
+            int lightStartIdx = i;
+            int lightCount = 0;
+            // Group together the next N point lights
+            while (i < app.LightBuffer.count && app.lights[i].lightType == LightType_Point) {
+                lightCount++;
+                i++;
+            }
+
+            if (lightCount > 0) {
+                UINT constantValues[2] = {
+                    app.LightBuffer.cbvHandle.Index() + lightStartIdx + 1,
+                    app.LightBuffer.cbvHandle.Index()
+                };
+                commandList->SetGraphicsRoot32BitConstants(0, 2, constantValues, 2);
+                DrawFullscreenQuadInstanced(app, commandList, lightCount);
+            }
+        }
+#else
         for (UINT i = 0; i < app.LightBuffer.count; i++) {
             if (app.lights[i].lightType == LightType_Point) {
                 UINT constantValues[2] = {
@@ -1156,8 +1298,11 @@ void LightPass(App& app, ID3D12GraphicsCommandList* commandList)
                 DrawFullscreenQuad(app, commandList);
             }
         }
+#endif
+        PIXEndEvent(commandList);
 
         // Directional lights
+        PIXBeginEvent(commandList, 0xFF9F82, L"DirectionalLights");
         commandList->SetPipelineState(app.LightPass.directionalLightPso->Get());
         for (UINT i = 0; i < app.LightBuffer.count; i++) {
             if (app.lights[i].lightType == LightType_Directional) {
@@ -1169,9 +1314,11 @@ void LightPass(App& app, ID3D12GraphicsCommandList* commandList)
                 DrawFullscreenQuad(app, commandList);
             }
         }
+        PIXEndEvent(commandList);
 
         // Environment cubemap
         if (app.Skybox.prefilterMapSRV.IsValid()) {
+            PIXBeginEvent(commandList, 0xFF9F82, L"EnvironmentCubemap");
             commandList->SetPipelineState(app.LightPass.environentCubemapLightPso->Get());
             UINT constantValues[5] = {
                 UINT_MAX,
@@ -1182,6 +1329,7 @@ void LightPass(App& app, ID3D12GraphicsCommandList* commandList)
             };
             commandList->SetGraphicsRoot32BitConstants(0, _countof(constantValues), constantValues, 0);
             DrawFullscreenQuad(app, commandList);
+            PIXEndEvent(commandList);
         }
     }
 }
@@ -1292,6 +1440,9 @@ void RenderFrame(App& app)
     app.Stats.drawCalls = 0;
 
     bool tdrOccurred = false;
+
+    app.graphicsQueue.WaitForEventCPU(app.previousFrameEvent);
+
     BuildCommandLists(app);
 
     std::array<ID3D12CommandList*, RenderThread_Count> commandLists;
@@ -1299,22 +1450,22 @@ void RenderFrame(App& app)
         commandLists[i] = app.renderThreads[i].commandList.Get();
     }
 
-    // app.graphicsQueue.ExecuteCommandListsBlocking(commandLists);
-
+#ifdef EXECUTE_MULTI_COMMANDLISTS
+    app.graphicsQueue.ExecuteCommandListsBlocking(commandLists, app.previousFrameEvent);
+#else
     for (auto& commandList : commandLists) {
-        app.graphicsQueue.ExecuteCommandListsBlocking({ commandList });
+        app.graphicsQueue.ExecuteCommandListsBlocking({ commandList }, app.previousFrameEvent);
     }
-
-    FenceEvent renderEvent;
+#endif
 
     ID3D12CommandList* const presentCommandList = app.commandList.Get();
 
-    // FIXME: multithreading
-    HRESULT hr = app.graphicsQueue.ExecuteCommandListsAndPresentBlocking(
+    HRESULT hr = app.graphicsQueue.ExecuteCommandListsAndPresent(
         std::span<ID3D12CommandList* const>({ presentCommandList }),
         app.swapChain.Get(),
         0,
-        DXGI_PRESENT_ALLOW_TEARING
+        DXGI_PRESENT_ALLOW_TEARING,
+        app.previousFrameEvent
     );
 
     if (!SUCCEEDED(hr)) {
@@ -1322,8 +1473,6 @@ void RenderFrame(App& app)
         app.running = false;
         DebugLog() << "TDR occurred\n";
     }
-
-    app.graphicsQueue.WaitForEventCPU(renderEvent);
 
     app.frameIdx = app.swapChain->GetCurrentBackBufferIndex();
 }

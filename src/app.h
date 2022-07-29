@@ -133,6 +133,12 @@ struct Material
     }
 };
 
+struct AABB
+{
+    glm::vec3 min;
+    glm::vec3 max;
+};
+
 struct Primitive
 {
     std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout;
@@ -152,6 +158,9 @@ struct Primitive
     ManagedPSORef directionalShadowPSO;
 
     SharedPoolItem<Material> material = nullptr;
+
+    AABB localBoundingBox;
+    bool cull;
 };
 
 struct Mesh
@@ -442,6 +451,9 @@ struct RenderThread
     ComPtr<ID3D12CommandAllocator> commandAllocator;
 };
 
+typedef Pool<Primitive, 100> PrimitivePool;
+typedef Pool<Mesh, 32> MeshPool;
+
 struct App
 {
     // NOTE: DESTRUCTOR ORDER IS IMPORTANT ON THESE. LEAVE AT TOP.
@@ -474,8 +486,8 @@ struct App
 
     PSOManager psoManager;
 
-    Pool<Primitive, 100> primitivePool;
-    Pool<Mesh, 32> meshPool;
+    PrimitivePool primitivePool;
+    MeshPool meshPool;
     Pool<Material, 128> materials;
     ConstantBufferArena<MaterialConstantData> materialConstantBuffer;
 
@@ -507,6 +519,8 @@ struct App
     std::vector<Model> models;
 
     unsigned int frameIdx;
+
+    FenceEvent previousFrameEvent;
 
     DescriptorRef frameBufferRTVs[FrameBufferCount];
     DescriptorRef nonSRGBFrameBufferRTVs[FrameBufferCount];
@@ -564,7 +578,8 @@ struct App
 
     std::array<Light, MaxLightCount> lights;
 
-    struct {
+    struct
+    {
         ManagedPSORef toneMapPSO;
         float gamma = 2.2f;
         float exposure = 1.0f;

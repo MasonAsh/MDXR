@@ -82,7 +82,7 @@ target_compile_definitions(mdxr
         _CRT_SECURE_NO_WARNINGS
     PUBLIC
         $<$<CONFIG:Debug>:MDXR_DEBUG=1>
-        $<$<CONFIG:RelWithDebInfo>:MDXR_DEBUG=1>
+        $<$<CONFIG:RelWithDebInfo>:MDXR_DEBUG=1 USE_PIX=1>
 )
 
 target_link_libraries(mdxr 

@@ -4,9 +4,14 @@
 
 void InitializeCamera(App& app)
 {
+    // SPONZA cam
     app.camera.translation = glm::vec3(0.0f, 2.0f, 0.0f);
     app.camera.pitch = 0.0f;
     app.camera.yaw = -glm::pi<float>() / 2.0f;
+
+    // app.camera.translation = glm::vec3(0.0f, 1.0f, 2.0f);
+    // app.camera.pitch = 0.0f;
+    // app.camera.yaw = glm::pi<float>();
 }
 
 void InitializeLights(App& app)

@@ -4,6 +4,7 @@
 struct PSInput {
     float4 pos : SV_POSITION;
     float2 uv : TEXCOORD;
+    uint instance : SV_InstanceID;
 };
 
 float4 ClipToView(float4 clipCoord)
@@ -20,11 +21,12 @@ float4 ScreenToView(float4 screen)
     return ClipToView(clip);
 }
 
-PSInput VSMain(uint id : SV_VertexID)
+PSInput VSMain(uint id : SV_VertexID, uint instance : SV_InstanceID)
 {
     PSInput result;
     result.uv = float2(id % 2, (id % 4) >> 1);
     result.pos = float4((result.uv.x - 0.5f) * 2, -(result.uv.y - 0.5f) * 2, 0, 1);
+    result.instance = instance;
     return result;
 }
 
@@ -33,7 +35,7 @@ PSInput VSMain(uint id : SV_VertexID)
 float4 PSMain(PSInput input) : SV_TARGET
 {
     ConstantBuffer<LightPassConstantData> passData = GetLightPassData();
-    ConstantBuffer<LightConstantData> light = GetLight();
+    ConstantBuffer<LightConstantData> light = GetLightAtOffset(input.instance);
 
     Texture2D baseColorTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + GBUFFER_BASE_COLOR];
     Texture2D normalTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + GBUFFER_NORMAL];

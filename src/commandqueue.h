@@ -110,11 +110,12 @@ public:
     }
 
     // This is necessary because Present must happen before signaling the queue.
-    HRESULT ExecuteCommandListsAndPresentBlocking(
+    HRESULT ExecuteCommandListsAndPresent(
         std::span<ID3D12CommandList* const> commandLists,
         IDXGISwapChain* swapChain,
         UINT syncInterval,
         UINT presentFlags,
+        FenceEvent& fenceEvent,
         FenceEvent waitEvent = FenceEvent()
     )
     {
@@ -124,7 +125,6 @@ public:
         }
 #endif
 
-        FenceEvent fenceEvent;
         HRESULT hr;
         {
             // We must synchronize the calls to the queue, but don't want to keep the lock for
@@ -139,8 +139,6 @@ public:
             }
             fence.SignalQueue(commandQueue.Get(), fenceEvent);
         }
-
-        WaitForEventCPU(fenceEvent);
 
         return hr;
     }

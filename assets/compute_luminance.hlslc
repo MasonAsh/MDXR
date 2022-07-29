@@ -1,0 +1,20 @@
+#define BLOCK_SIZE 256
+
+cbuffer Indices : register(b0) {
+    uint inTextureSRV;
+    uint imageWidth;
+    uint imageHeight;
+};
+
+struct ComputeShaderInput {
+    uint3 groupID : SV_GroupID;
+    uint3 groupThreadID : SV_GroupThreadID;
+    uint3 dispatchThreadID : SV_DispatchThreadID;
+    uint groupIndex : SV_GroupIndex;
+};
+
+[numthreads(1, 1, 1)]
+void CSMain(ComputeShaderInput input)
+{
+
+}

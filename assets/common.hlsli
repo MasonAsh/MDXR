@@ -107,6 +107,11 @@ ConstantBuffer<LightConstantData> GetLight()
     return ResourceDescriptorHeap[g_LightIndex];
 }
 
+ConstantBuffer<LightConstantData> GetLightAtOffset(uint offset)
+{
+    return ResourceDescriptorHeap[g_LightIndex + offset];
+}
+
 ConstantBuffer<LightPassConstantData> GetLightPassData() 
 {
     return ResourceDescriptorHeap[g_LightPassDataIndex];

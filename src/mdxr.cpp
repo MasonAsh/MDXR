@@ -43,8 +43,8 @@ void InitWindow(App& app)
     SDL_SysWMinfo wmInfo = {};
     SDL_VERSION(&wmInfo.version);
     if (!SDL_GetWindowWMInfo(window, &wmInfo)) {
-        std::cout << "Failed to fetch window info from SDL\n";
-        std::cout << "SDL_GetError(): " << SDL_GetError() << std::endl;
+        DebugLog() << "Failed to fetch window info from SDL";
+        DebugLog() << "SDL_GetError(): " << SDL_GetError();
         abort();
     }
     app.hwnd = wmInfo.info.win.window;
@@ -86,8 +86,8 @@ void InitApp(App& app, int argc, char** argv)
     }
 
     if (app.dataDir.empty()) {
-        std::cout << "Error: no data directory specified\n";
-        std::cout << "The program will now exit" << std::endl;
+        DebugLog() << "Error: no data directory specified";
+        DebugLog() << "The program will now exit";
         abort();
     }
 
@@ -187,7 +187,7 @@ void ReloadIfShaderChanged(App& app)
 {
     auto status = WaitForSingleObject(app.shaderWatchHandle, 0);
     if (status == WAIT_OBJECT_0) {
-        std::cout << "Data directory changed. Reloading shaders.\n";
+        DebugLog() << "Data directory changed. Reloading shaders.";
         app.psoManager.Reload(app.device.Get());
         CreateDataDirWatchHandle(app);
     }
@@ -274,6 +274,7 @@ int RunApp(int argc, char** argv)
         app.mouseState.xrel = 0;
         app.mouseState.yrel = 0;
         app.mouseState.scrollDelta = 0;
+
         while (SDL_PollEvent(&e) > 0) {
             ImGui_ImplSDL2_ProcessEvent(&e);
             if (e.type == SDL_QUIT) {
@@ -357,7 +358,7 @@ int RunMDXR(int argc, char** argv)
         {
             dxgiDebug->ReportLiveObjects(DXGI_DEBUG_ALL, DXGI_DEBUG_RLO_FLAGS(DXGI_DEBUG_RLO_SUMMARY | DXGI_DEBUG_RLO_IGNORE_INTERNAL));
         }
-}
+    }
 #endif
 
     return status;

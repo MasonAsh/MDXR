@@ -103,6 +103,12 @@ void DrawMeshEditor(App& app)
             ImGui::DragFloat3("Scale", (float*)&selectedMesh->scale, 0.1f);
 
             selectedMesh->euler = glm::radians(eulerDegrees);
+
+            ImGui::Separator();
+            ImGui::Text("Culled primitives:");
+            for (const auto& prim : selectedMesh->primitives) {
+                ImGui::Text(prim->cull ? "True" : "False");
+            }
         }
     }
     ImGui::End();
@@ -260,6 +266,7 @@ void DrawStats(App& app)
 
     if (app.ImGui.showStats) {
         float frameTimeMS = (float)app.Stats.lastFrameTimeNS / (float)1E6;
+        ImGui::SetNextWindowSize(ImVec2(300, 200));
         if (ImGui::Begin("Stats", &app.ImGui.showStats, windowFlags)) {
             ImVec4 textColor = ImVec4(1.0f, 0.0f, 0.0f, 1.0f);
 

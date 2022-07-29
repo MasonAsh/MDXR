@@ -229,7 +229,6 @@ void CreateModelMaterials(
         app.materialConstantBuffer.CreateViews(app.device.Get(), constantBufferSlice, descriptor.CPUHandle());
 
         auto material = app.materials.AllocateShared();
-        // Material material;
         material->constantData = constantBufferSlice.data.data();
         material->materialType = materialType;
         material->textureDescriptors.baseColor = baseColorTextureDescriptor;
@@ -305,14 +304,10 @@ ComPtr<D3D12MA::Allocation> CopyResourceWithDifferentFlags(
 
 
 // Generates mip maps for a range of textures. The `textures` must have their
-// MipLevels already set. Textures must also be UAV compatible.
+// MipLevels already set.
 void GenerateMipMaps(App& app, const std::span<ComPtr<ID3D12Resource>>& textures, const std::vector<bool>& imageIsSRGB, FenceEvent& initialUploadEvent)
 {
     // This function is a damn mess...
-
-    // if (app.graphicsAnalysis) {
-    //     app.graphicsAnalysis->BeginCapture();
-    // }
 
     if (textures.size() == 0) {
         return;
@@ -527,10 +522,6 @@ void GenerateMipMaps(App& app, const std::span<ComPtr<ID3D12Resource>>& textures
     if (needsCopy) {
         app.copyQueue.ExecuteCommandListsBlocking({ copyFromCommandList.Get() });
     }
-
-    // if (app.graphicsAnalysis) {
-    //     app.graphicsAnalysis->EndCapture();
-    // }
 }
 
 
@@ -608,7 +599,8 @@ void LoadModelTextures(
         // require switching the model to use the D3D12MA system for placed resources.
         ComPtr<ID3D12Resource> destResource;
         CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
-        auto resourceDesc = GetImageResourceDesc(inputModel.images[textureIdx], imageIsSRGB[textureIdx]);
+        auto& inputImage = inputModel.images[textureIdx];
+        auto resourceDesc = GetImageResourceDesc(inputImage, imageIsSRGB[textureIdx]);
 
         auto allocInfo = app.device->GetResourceAllocationInfo(0, 1, &resourceDesc);
         if (pendingUploadBytes > 0 && allocInfo.SizeInBytes + pendingUploadBytes > maxUploadBytes) {
@@ -644,6 +636,15 @@ void LoadModelTextures(
         );
 
         pendingUploadBytes += allocInfo.SizeInBytes;
+
+#ifdef MDXR_DEBUG
+        {
+            std::wstring bufName = convert_to_wstring(
+                "Texture#" + std::to_string(textureIdx) + " " + inputImage.name + ":" + inputImage.uri
+            );
+            destResource->SetName(bufName.c_str());
+        }
+#endif
 
         commandList->CopyResource(destResource.Get(), stagingTexturesForMipMaps[textureIdx].Get());
         outputModel.buffers.push_back(destResource);
@@ -741,6 +742,13 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
         );
 
         uploadBatch.AddBuffer(geometryBuffer.Get(), 0, (void*)gltfBuffer.data.data(), gltfBuffer.data.size());
+
+#ifdef MDXR_DEBUG
+        {
+            std::wstring bufName = convert_to_wstring(progress->assetName + " Buffer#" + std::to_string(bufferIdx));
+            geometryBuffer->SetName(bufName.c_str());
+        }
+#endif
 
         resourceBarriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(
             geometryBuffer.Get(),
@@ -960,6 +968,19 @@ PoolItem<Primitive> CreateModelPrimitive(
             byteStride = 4 * 4;
             break;
         };
+
+        // Extract bounding box
+        if (*semanticName == "POSITION") {
+            CHECK(accessor.maxValues.size() >= 3);
+            double maxX = accessor.maxValues[0];
+            double maxY = accessor.maxValues[1];
+            double maxZ = accessor.maxValues[2];
+            double minX = accessor.minValues[0];
+            double minY = accessor.minValues[1];
+            double minZ = accessor.minValues[2];
+            primitive->localBoundingBox.max = glm::vec3(maxX, maxY, maxZ);
+            primitive->localBoundingBox.min = glm::vec3(minX, minY, minZ);
+        }
 
         // Accessors can be linked to the same bufferview, so here we keep
         // track of what input slot is linked to a bufferview.
@@ -1691,6 +1712,9 @@ void CreateSkybox(App& app, const SkyboxAssets& asset, AssetLoadProgress* progre
     primitive->indexCount = _countof(indices);
 
     primitive->miscDescriptorParameter = app.Skybox.texcubeSRV.Ref();
+
+    // Exclude skybox from frustum culling.
+    primitive->localBoundingBox = AABB{ glm::vec4(-FLT_MAX), glm::vec4(FLT_MAX) };
 
     perPrimitiveBuffer->GetResource()->Map(0, nullptr, reinterpret_cast<void**>(&primitive->constantData));
 
