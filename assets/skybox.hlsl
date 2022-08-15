@@ -16,7 +16,7 @@ TextureCube GetSkyboxTexture()
 
 PSInput VSMain(Vertex input)
 {
-    ConstantBuffer<PrimitiveData> primitive = GetPrimitiveData();
+    ConstantBuffer<PrimitiveInstanceData> primitive = GetPrimitiveData();
 
     PSInput output;
     // Keep skybox at the far plane by locking Z to W

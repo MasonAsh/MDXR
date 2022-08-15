@@ -1,7 +1,8 @@
 #include "common.hlsli"
 #include "pbr.hlsli"
 
-struct PSInput {
+struct PSInput 
+{
     float4 pos : SV_POSITION;
     float2 uv : TEXCOORD;
     uint instance : SV_InstanceID;

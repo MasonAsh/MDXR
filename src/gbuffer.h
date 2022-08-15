@@ -36,7 +36,9 @@ inline D3D12_RESOURCE_DESC GBufferResourceDesc(GBufferTarget target, int windowW
         desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         break;
     case GBuffer_Normal:
-        desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        // 32 bit textures can have a significant performance impact in scenes with lots of lights.
+        //desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         break;
     case GBuffer_Depth:
         desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;

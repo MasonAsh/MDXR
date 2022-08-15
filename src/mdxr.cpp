@@ -238,7 +238,6 @@ void ToggleBorderlessWindow(App& app)
     SDL_GetWindowSize(app.window, &width, &height);
     HandleResize(app, width, height);
 
-
     app.borderlessFullscreen = !app.borderlessFullscreen;
 }
 
@@ -252,8 +251,6 @@ int RunApp(int argc, char** argv)
     InitController(app);
     InitRenderer(app);
     InitImGui(app);
-
-    StartAssetThread(app);
 
     {
         StartSceneAssetLoad(app);
@@ -331,6 +328,7 @@ int RunApp(int argc, char** argv)
     }
 
 quit:
+    // Notify asset thread so it picks up app.running = false and terminates itself
     NotifyAssetThread(app);
     app.AssetThread.thread.join();
 

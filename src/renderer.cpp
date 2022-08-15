@@ -342,6 +342,8 @@ void SetupLightBuffer(App& app)
         // Link convenient light structures back to the constant buffer
         app.lights[i].constantData = &app.LightBuffer.lightConstantData[i];
     }
+
+    // app.LightBuffer.pointSphereConstantData.Initialize(app.mainAllocator.Get());
 }
 
 void SetupMaterialBuffer(App& app)
@@ -490,6 +492,7 @@ void StartRenderThread(App& app)
 
 void StartRenderThreads(App& app)
 {
+    StartAssetThread(app);
     StartRenderThread<GBufferPass, RenderThread_GBufferPass>(app);
     StartRenderThread<ShadowPass, RenderThread_ShadowPass>(app);
     StartRenderThread<LightPass, RenderThread_LightPass>(app);
@@ -510,6 +513,17 @@ void NotifyAndWaitRenderThreads(App& app)
         renderThread.workFinished.wait(lock, [&] { return !renderThread.workIsAvailable; });
         lock.unlock();
     }
+}
+
+void LoadInternalModels(App& app)
+{
+    // EnqueueGLTF(
+    //     app,
+    //     app.dataDir + "/InternalModels/sphere.gltf",
+    //     [](App& app, Model& model) {
+    //         app.LightBuffer.pointLightSphere = model.meshes[0].get();
+    //     }
+    // );
 }
 
 void InitRenderer(App& app)
@@ -689,6 +703,7 @@ void InitRenderer(App& app)
     }
 
     StartRenderThreads(app);
+    LoadInternalModels(app);
 }
 
 void DestroyRenderer(App& app)
@@ -825,15 +840,26 @@ void SetupDirectionalLightShadowMap(App& app, Light& light)
     }
 }
 
+// void SetupPointLightSphere(App& app, Light& light)
+// {
+//     light.sphereInstanceData = app.LightBuffer.pointSphereConstantData.AllocateUnique();
+//     app.LightBuffer.pointLightSphere->primitives[0]->instanceCount++;
+// }
+
 void UpdateLightConstantBuffers(App& app, const glm::mat4& projection, const glm::mat4& view)
 {
     app.LightBuffer.passData->inverseProjectionMatrix = glm::inverse(projection);
     app.LightBuffer.passData->inverseViewMatrix = glm::inverse(view);
 
     for (UINT i = 0; i < app.LightBuffer.count; i++) {
-        if (app.lights[i].lightType == LightType_Directional && app.lights[i].directionalShadowMap == nullptr) {
-            SetupDirectionalLightShadowMap(app, app.lights[i]);
+        Light& light = app.lights[i];
+        if (light.lightType == LightType_Directional && light.directionalShadowMap == nullptr) {
+            SetupDirectionalLightShadowMap(app, light);
         }
+
+        // if (app.lights[i].lightType == LightType_Point) {
+        //     SetupPointLightSphere(app, light);
+        // }
 
         app.lights[i].UpdateConstantData(view);
     }
@@ -942,21 +968,33 @@ void UpdateRenderData(App& app, const glm::mat4& projection, const glm::mat4& vi
     DoFrustumCulling(app.primitivePool, projection * view);
 }
 
+std::vector<Mesh*> PickSceneMeshes(Scene& scene)
+{
+    std::vector<Mesh*> meshes;
+
+    for (auto& node : scene.nodes) {
+        if (node.nodeType == NodeType_Mesh) {
+            meshes.push_back(node.mesh);
+        }
+    }
+
+    return meshes;
+}
+
 void DrawMeshesGBuffer(App& app, ID3D12GraphicsCommandList* commandList)
 {
-    auto meshIter = app.meshPool.Begin();
-
     commandList->OMSetStencilRef(0xFFFFFFFF);
 
     ManagedPSORef lastUsedPSO = nullptr;
 
-    while (meshIter) {
-        if (!meshIter->isReadyForRender) {
-            meshIter = app.meshPool.Next(meshIter);
+    auto meshes = PickSceneMeshes(app.scene);
+
+    for (auto& mesh : meshes) {
+        if (!mesh->isReadyForRender) {
             continue;
         }
 
-        for (const auto& primitive : meshIter->primitives) {
+        for (const auto& primitive : mesh->primitives) {
             if (primitive->cull) {
                 continue;
             }
@@ -985,11 +1023,10 @@ void DrawMeshesGBuffer(App& app, ID3D12GraphicsCommandList* commandList)
 
             commandList->IASetVertexBuffers(0, (UINT)primitive->vertexBufferViews.size(), primitive->vertexBufferViews.data());
             commandList->IASetIndexBuffer(&primitive->indexBufferView);
-            commandList->DrawIndexedInstanced(primitive->indexCount, 1, 0, 0, 0);
+            commandList->DrawIndexedInstanced(primitive->indexCount, primitive->instanceCount, 0, 0, 0);
 
             app.Stats.drawCalls++;
         }
-        meshIter = app.meshPool.Next(meshIter);
     }
 }
 
@@ -999,12 +1036,10 @@ void DrawAlphaBlendedMeshes(App& app, ID3D12GraphicsCommandList* commandList)
 
     ManagedPSORef lastUsedPSO = nullptr;
 
-    auto meshIter = app.meshPool.Begin();
-    // FIXME: This seems like a bad looping order..
-    while (meshIter) {
-        auto& mesh = meshIter.item;
+    auto meshes = PickSceneMeshes(app.scene);
+
+    for (auto& mesh : meshes) {
         if (!mesh->isReadyForRender) {
-            meshIter = app.meshPool.Next(meshIter);
             continue;
         }
 
@@ -1039,12 +1074,11 @@ void DrawAlphaBlendedMeshes(App& app, ID3D12GraphicsCommandList* commandList)
 
                 commandList->IASetVertexBuffers(0, (UINT)primitive->vertexBufferViews.size(), primitive->vertexBufferViews.data());
                 commandList->IASetIndexBuffer(&primitive->indexBufferView);
-                commandList->DrawIndexedInstanced(primitive->indexCount, 1, 0, 0, 0);
+                commandList->DrawIndexedInstanced(primitive->indexCount, primitive->instanceCount, 0, 0, 0);
 
                 app.Stats.drawCalls++;
             }
         }
-        meshIter = app.meshPool.Next(meshIter);
     }
 }
 
@@ -1143,6 +1177,8 @@ void ShadowPass(App& app, ID3D12GraphicsCommandList* commandList)
 
     ManagedPSORef lastUsedPSO = nullptr;
 
+    auto meshes = PickSceneMeshes(app.scene);
+
     for (UINT i = 0; i < app.LightBuffer.count; i++) {
         auto& light = app.lights[i];
         if (light.lightType == LightType_Directional && light.directionalShadowMap != nullptr) {
@@ -1162,15 +1198,13 @@ void ShadowPass(App& app, ID3D12GraphicsCommandList* commandList)
             CD3DX12_RECT scissorRect(0, 0, static_cast<LONG>(light.directionalShadowMapSize), static_cast<LONG>(light.directionalShadowMapSize));
             commandList->RSSetScissorRects(1, &scissorRect);
 
-            auto meshIter = app.meshPool.Begin();
 
-            while (meshIter) {
-                if (!meshIter->isReadyForRender) {
-                    meshIter = app.meshPool.Next(meshIter);
+            for (auto& mesh : meshes) {
+                if (!mesh->isReadyForRender) {
                     continue;
                 }
 
-                for (const auto& primitive : meshIter->primitives) {
+                for (const auto& primitive : mesh->primitives) {
                     const auto& material = primitive->material.get();
                     if (!material || !material->castsShadow) {
                         continue;
@@ -1195,11 +1229,10 @@ void ShadowPass(App& app, ID3D12GraphicsCommandList* commandList)
 
                     commandList->IASetVertexBuffers(0, (UINT)primitive->vertexBufferViews.size(), primitive->vertexBufferViews.data());
                     commandList->IASetIndexBuffer(&primitive->indexBufferView);
-                    commandList->DrawIndexedInstanced(primitive->indexCount, 1, 0, 0, 0);
+                    commandList->DrawIndexedInstanced(primitive->indexCount, primitive->instanceCount, 0, 0, 0);
 
                     app.Stats.drawCalls++;
                 }
-                meshIter = app.meshPool.Next(meshIter);
             }
         }
     }
@@ -1299,6 +1332,25 @@ void LightPass(App& app, ID3D12GraphicsCommandList* commandList)
             }
         }
 #endif
+
+        // auto& lightSpherePrimitive = app.LightBuffer.pointLightSphere->primitives[0];
+        // commandList->IASetPrimitiveTopology(lightSpherePrimitive->primitiveTopology);
+        // commandList->IASetVertexBuffers(0, (UINT)lightSpherePrimitive->vertexBufferViews.size(), lightSpherePrimitive->vertexBufferViews.data());
+        // for (UINT i = 0; i < app.LightBuffer.count; i++) {
+        //     auto& light = app.lights[i];
+        //     if (light.lightType == LightType_Point) {
+        //         UINT constantValues[2] = {
+        //             app.LightBuffer.cbvHandle.Index() + i + 1,
+        //             app.LightBuffer.cbvHandle.Index()
+        //         };
+        //         commandList->SetGraphicsRoot32BitConstants(0, 2, constantValues, 2);
+
+        //         commandList->IASetIndexBuffer(&lightSpherePrimitive->indexBufferView);
+
+        //         commandList->DrawIndexedInstanced(lightSpherePrimitive->indexCount, 1, 0, 0, 0);
+        //     }
+        // }
+
         PIXEndEvent(commandList);
 
         // Directional lights
@@ -1450,6 +1502,7 @@ void RenderFrame(App& app)
         commandLists[i] = app.renderThreads[i].commandList.Get();
     }
 
+#define EXECUTE_MULTI_COMMANDLISTS
 #ifdef EXECUTE_MULTI_COMMANDLISTS
     app.graphicsQueue.ExecuteCommandListsBlocking(commandLists, app.previousFrameEvent);
 #else

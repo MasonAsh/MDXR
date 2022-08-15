@@ -2,6 +2,7 @@
 #include "pbr.hlsli"
 
 struct VSInput {
+    uint instance : SV_InstanceID;
     float3 position : POSITION;
     float3 normal : NORMAL;
     float3 tangent : TANGENT;
@@ -25,7 +26,7 @@ PSInput VSMain(VSInput input)
 {
     PSInput result;
 
-    ConstantBuffer<PrimitiveData> primitive = GetPrimitiveData();
+    ConstantBuffer<PrimitiveInstanceData> primitive = GetPrimitiveInstanceData(input.instance);
 
     result.position = mul(primitive.MVP, float4(input.position, 1.0f));
 

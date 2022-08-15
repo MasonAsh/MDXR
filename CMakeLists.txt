@@ -60,6 +60,9 @@ add_executable(mdxr WIN32
     src/commandqueue.h
     src/descriptorpool.h
     src/crc32.h
+    src/constantbufferstructures.h
+    src/internalmeshes.h
+    src/internalmeshes.cpp
 
     # third party
     thirdparty/tiny_gltf_impl.cpp

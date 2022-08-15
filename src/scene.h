@@ -1,8 +1,8 @@
 #pragma once
 
-#include "app.h"
 #include "assets.h"
 
+void AddModelToScene(App& app, Model& model);
 void InitializeCamera(App& app);
 void InitializeLights(App& app);
 void InitializeScene(App& app);

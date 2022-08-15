@@ -3,6 +3,7 @@
 #include <memory>
 #include <vector>
 #include <mutex>
+#include <functional>
 
 namespace internal
 {
@@ -25,18 +26,36 @@ using PoolItem = std::unique_ptr<T, internal::PoolItemDeleter<T>>;
 template<typename T>
 using SharedPoolItem = std::shared_ptr<T>;
 
-template<typename T, size_t N>
+template<typename BlockData>
+using BlockDataAllocator = std::function<void(BlockData*)>;
+
+// Wraps block data 
+template<class BlockData>
+struct OptionalBlockData
+{
+    BlockData blockData;
+};
+
+template<>
+struct OptionalBlockData<void>
+{
+    OptionalBlockData() {}
+};
+
+template<typename T, size_t N, typename BlockData = std::monostate>
 class PoolBlock
 {
 public:
-    PoolBlock() : liveItems{ false }, deleterContext(new internal::PoolItemDeleterContext<T>) {
+    PoolBlock() : liveItems{ false }, deleterContext(new internal::PoolItemDeleterContext<T>)
+    {
         deleterContext->items = items;
         deleterContext->liveItems = liveItems.data();
         deleterContext->firstFreeIndex = &firstFreeIndex;
         deleterContext->mutex = &mutex;
     }
 
-    ~PoolBlock() {
+    ~PoolBlock()
+    {
         for (size_t i = 0; i < N; i++) {
             if (liveItems[i]) {
                 items[i].~T();
@@ -86,6 +105,11 @@ public:
 
         return nullptr;
     }
+
+    BlockData* GetBlockData()
+    {
+        return &blockData;
+    }
 private:
     template<typename... Args>
     T* Allocate(Args... constructorArgs)
@@ -120,6 +144,8 @@ private:
     union { T items[N]; };
     std::array<bool, N> liveItems;
     size_t firstFreeIndex = 0;
+
+    BlockData blockData;
 
     std::shared_ptr<internal::PoolItemDeleterContext<T>> deleterContext;
 
@@ -158,9 +184,15 @@ namespace internal {
 }
 
 // A memory pool which allocates into fixed size blocks with reliable memory
-// addresses. Items in the pool are returned in unique pointer PoolItem, which
-// will reclaim the spot in the pool when the pointer goes out of scope.
-template<typename T, size_t BlockSize>
+// addresses. Items in the pool can either be unique pointers, with PoolItem,
+// or shared pointers, using SharedPoolItem. These smart pointers will reclaim 
+// the spot in the pool when the pointer goes out of scope.
+// 
+// Blocks can have additional data tied to them using the BlockData template
+// parameter in conjunction with a BlockDataAllocator function. An example use
+// case for this is to have dynamically allocated constant buffers with a
+// ID3D12Resource* for each block.
+template<typename T, size_t BlockSize, typename BlockData = std::monostate>
 class Pool
 {
 public:
@@ -179,9 +211,13 @@ public:
     };
 
     Pool()
+        : activeAllocationBlock(nullptr)
     {
-        blocks.emplace_back(new PoolBlock<T, BlockSize>);
-        activeAllocationBlock = blocks.back().get();
+    }
+
+    void SetBlockDataAllocator(BlockDataAllocator<BlockData> blockDataAllocator)
+    {
+        this->blockDataAllocator = blockDataAllocator;
     }
 
     template<typename... Args>
@@ -196,6 +232,33 @@ public:
     {
         UpdateActiveBlock();
         return activeAllocationBlock->AllocateShared(constructorArgs...);
+    }
+
+    bool GetItemBlockData(T* item, BlockData** blockData, int* itemIndex)
+    {
+        int blockIndex = 0;
+
+        if (LocateItem(item, &blockIndex, itemIndex)) {
+            *blockData = &blocks[blockIndex].blockData;
+            return true;
+        }
+
+        return false;
+    }
+
+    bool LocateItem(T* item, int* blockIndex, int* indexInBlock)
+    {
+        *blockIndex = 0;
+        for (const auto& block : blocks) {
+            size_t distance = item - &block.items[0];
+            if (distance >= 0 && distance < BlockSize) {
+                *indexInBlock = distance;
+                return true;
+            }
+            *blockIndex++;
+        }
+
+        return false;
     }
 
     PoolIter Begin()
@@ -231,7 +294,7 @@ private:
     {
         // If we don't have an active block it's a developer error.
         // We can handle it in release builds however.
-        assert(activeAllocationBlock);
+        assert(activeAllocationBlock || blocks.empty());
 
         if (activeAllocationBlock == nullptr || !activeAllocationBlock->HasFreeSpace()) {
             // Current block is out of space, see if any other blocks have freed space.
@@ -245,11 +308,17 @@ private:
 
         if (activeAllocationBlock == nullptr) {
             // No active blocks have free space, so create another block.
-            blocks.emplace_back(new PoolBlock<T, BlockSize>);
+            blocks.emplace_back(new PoolBlock<T, BlockSize, BlockData>);
             activeAllocationBlock = blocks.back().get();
+
+            if (blockDataAllocator) {
+                blockDataAllocator(activeAllocationBlock->GetBlockData());
+            }
         }
     }
 
-    std::vector<std::unique_ptr<PoolBlock<T, BlockSize>>> blocks;
-    PoolBlock<T, BlockSize>* activeAllocationBlock;
+    std::vector<std::unique_ptr<PoolBlock<T, BlockSize, BlockData>>> blocks;
+    PoolBlock<T, BlockSize, BlockData>* activeAllocationBlock;
+
+    BlockDataAllocator<BlockData> blockDataAllocator;
 };

@@ -118,9 +118,9 @@ ManagedPSORef CreatePSO(
 
     auto mPso = std::make_shared<ManagedPSO>();
     mPso->desc = psoDesc;
-    mPso->inputLayoutMemory = inputLayout;
+    mPso->inputLayout = inputLayout;
     mPso->desc.pRootSignature = rootSignature;
-    mPso->desc.InputLayout = { mPso->inputLayoutMemory.data(), (UINT)mPso->inputLayoutMemory.size() };
+    mPso->desc.InputLayout = { mPso->inputLayout.data(), (UINT)mPso->inputLayout.size() };
     mPso->shaderPaths = paths;
 
     CHECK(mPso->Load(manager.shaderByteCodeCache));
@@ -294,14 +294,39 @@ ManagedPSORef CreateMeshUnlitPSO(
     auto psoDesc = DefaultGraphicsPSODesc();
 
     psoDesc.NumRenderTargets = GBuffer_RTVCount + 1;
-    for (UINT i = 1; i < psoDesc.NumRenderTargets; i++) {
-        psoDesc.RTVFormats[i] = GBufferResourceDesc((GBufferTarget)(i - 1), 0, 0).Format;
+    for (UINT i = 0; i < psoDesc.NumRenderTargets; i++) {
+        psoDesc.RTVFormats[i] = GBufferResourceDesc((GBufferTarget)i, 0, 0).Format;
     }
 
     return SimpleCreateGraphicsPSO(
         manager,
         device,
         dataDir + "mesh_gbuffer_unlit",
+        rootSignature,
+        inputLayout,
+        psoDesc
+    );
+}
+
+ManagedPSORef CreateMeshUnlitTexturedPSO(
+    PSOManager& manager,
+    ID3D12Device2* device,
+    const std::string& dataDir,
+    ID3D12RootSignature* rootSignature,
+    const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
+)
+{
+    auto psoDesc = DefaultGraphicsPSODesc();
+
+    psoDesc.NumRenderTargets = GBuffer_RTVCount + 1;
+    for (UINT i = 0; i < psoDesc.NumRenderTargets; i++) {
+        psoDesc.RTVFormats[i] = GBufferResourceDesc((GBufferTarget)i, 0, 0).Format;
+    }
+
+    return SimpleCreateGraphicsPSO(
+        manager,
+        device,
+        dataDir + "mesh_gbuffer_unlit_textured",
         rootSignature,
         inputLayout,
         psoDesc

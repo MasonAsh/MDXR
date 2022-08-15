@@ -62,7 +62,7 @@ float4 PSMain(PSInput input) : SV_TARGET
     // Direction from fragment to eye
     float3 Wo = normalize(-viewPos.xyz);
     
-    float4 lightPos = mul(light.directionalLightViewProjection, float4(worldPos.xyz, 1.0f));
+    float4 lightPos = mul(light.MVP, float4(worldPos.xyz, 1.0f));
 
     float3 projCoords = lightPos.xyz / lightPos.w;
     projCoords.xy = projCoords.xy * 0.5f + 0.5f;

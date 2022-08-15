@@ -6,6 +6,7 @@
 #include "incrementalfence.h"
 #include "commandqueue.h"
 #include "descriptorpool.h"
+#include "constantbufferstructures.h"
 
 #include <SDL.h>
 
@@ -28,6 +29,7 @@
 #include <span>
 #include <string>
 #include <deque>
+#include <variant>
 
 const UINT FrameBufferCount = 2;
 const UINT MaxLightCount = 512;
@@ -61,37 +63,12 @@ struct SkyboxImagePaths
     std::array<std::string, CubeImage_Count> paths;
 };
 
-struct PerPrimitiveConstantData
-{
-    // MVP & MV are PerMesh, but most meshes only have one primitive.
-    glm::mat4 MVP;
-    glm::mat4 MV;
-    glm::mat4 M;
-    float padding[16];
-};
-static_assert((sizeof(PerPrimitiveConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
-
 enum MaterialType
 {
     MaterialType_Unlit,
     MaterialType_PBR,
     MaterialType_AlphaBlendPBR,
 };
-
-struct MaterialConstantData
-{
-    glm::vec4 baseColorFactor;
-    glm::vec4 metalRoughnessFactor;
-
-    UINT baseColorTextureIdx;
-    UINT normalTextureIdx;
-    UINT metalRoughnessTextureIdx;
-
-    UINT materialType;
-
-    float padding[52];
-};
-static_assert((sizeof(MaterialConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
 
 struct MaterialTextureDescriptors
 {
@@ -141,7 +118,7 @@ struct AABB
 
 struct Primitive
 {
-    std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout;
+    // FIXME: Lot of duplicated data
     std::vector<D3D12_VERTEX_BUFFER_VIEW> vertexBufferViews;
     D3D12_INDEX_BUFFER_VIEW indexBufferView;
     D3D12_PRIMITIVE_TOPOLOGY primitiveTopology;
@@ -149,7 +126,8 @@ struct Primitive
     UINT indexCount;
     UINT materialIndex;
     DescriptorRef perPrimitiveDescriptor;
-    PerPrimitiveConstantData* constantData;
+    PrimitiveInstanceConstantData* constantData;
+    int instanceCount;
 
     // Optional custom descriptor for special primitive shaders. Can be anything.
     // For example, the skybox uses this for the texcube shader parameter.
@@ -194,7 +172,7 @@ struct Model
     Model(Model&& mesh) = default;
     Model(const Model& mesh) = delete;
 
-    std::vector<ComPtr<ID3D12Resource>> buffers;
+    std::vector<ComPtr<ID3D12Resource>> resources;
     std::vector<PoolItem<Mesh>> meshes;
 
     UniqueDescriptors primitiveDataDescriptors;
@@ -203,7 +181,7 @@ struct Model
 
     // All of the child mesh constant buffers stored in this constant buffer
     ComPtr<ID3D12Resource> perPrimitiveConstantBuffer;
-    PerPrimitiveConstantData* perPrimitiveBufferPtr;
+    PrimitiveInstanceConstantData* perPrimitiveBufferPtr;
 };
 
 struct Camera
@@ -237,39 +215,6 @@ struct ControllerState {
     // X is left trigger and Y is right trigger
     glm::vec2 triggerState;
 };
-
-struct LightPassConstantData
-{
-    glm::mat4 inverseProjectionMatrix;
-    glm::mat4 inverseViewMatrix;
-    glm::vec4 environmentIntensity;
-    UINT baseGBufferIndex;
-    UINT debug;
-    float pad[26];
-};
-static_assert((sizeof(LightPassConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
-
-struct LightConstantData
-{
-    glm::vec4 position;
-    glm::vec4 direction;
-
-    glm::vec4 positionViewSpace;
-    glm::vec4 directionViewSpace;
-
-    glm::vec4 colorIntensity;
-
-    // NOTE: This might be better off in a separate constant buffer.
-    // Point lights will potentially need 6 of these.
-    glm::mat4 directionalLightViewProjection;
-
-    float range;
-    UINT directionalShadowMapDescriptorIdx;
-    UINT lightType;
-
-    float pad[25];
-};
-static_assert((sizeof(LightConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
 
 // Store descriptor sizes globally for convenience
 struct IncrementSizes
@@ -363,68 +308,75 @@ struct ConstantBufferArena
     UINT64 offset;
 };
 
+template<class T, size_t BlockSize>
+class ConstantBufferVec
+{
+    static_assert((sizeof(T) % 256) == 0, "T must be 256-byte aligned");
+public:
+    ConstantBufferVec()
+    {
+        pool.SetBlockDataAllocator(
+            std::bind(&ConstantBufferVec::CreateBlockData, this, std::placeholders::_1)
+        );
+    }
+
+    void Initialize(D3D12MA::Allocator* allocator)
+    {
+        this->allocator = allocator;
+    }
+
+    PoolItem<T> AllocateUnique()
+    {
+        return pool.AllocateUnique();
+    }
+
+    SharedPoolItem<T> AllocateShared()
+    {
+        return pool.AllocateShared();
+    }
+private:
+    struct CBVBlockData
+    {
+        ComPtr<D3D12MA::Allocation> allocation;
+        void* mappedPtr;
+    };
+
+    void CreateBlockData(CBVBlockData* blockData)
+    {
+        blockData->allocation = CreateUploadBufferWithData(
+            allocator,
+            nullptr,
+            0,
+            sizeof(T) * BlockSize,
+            &blockData->mappedPtr
+        );
+    }
+
+    Pool<T, BlockSize, CBVBlockData> pool;
+    D3D12MA::Allocator* allocator;
+};
+
 enum LightType
 {
     LightType_Point,
     LightType_Directional,
 };
 
-struct Light
+struct App;
+
+typedef std::function<void(App& app, Model& model)> ModelFinishCallback;
+
+struct GLTFLoadEntry
 {
-    LightConstantData* constantData;
-    glm::vec3 position;
-    glm::vec3 direction;
-
-    glm::vec3 color;
-    float intensity;
-    float range;
-
-    LightType lightType;
-
-    ComPtr<D3D12MA::Allocation> directionalShadowMap;
-    UniqueDescriptors directionalShadowMapSRV;
-    UniqueDescriptors directionalShadowMapDSV;
-
-    UINT directionalShadowMapSize = 4096;
-    float frustumSize = 30.0f;
-
-    void UpdateConstantData(glm::mat4 viewMatrix)
-    {
-        glm::vec3 normalizedDirection = glm::normalize(direction);
-        constantData->position = glm::vec4(position, 1.0f);
-        constantData->direction = glm::vec4(normalizedDirection, 0.0f);
-        constantData->positionViewSpace = viewMatrix * constantData->position;
-        constantData->directionViewSpace = viewMatrix * glm::normalize(constantData->direction);
-        constantData->colorIntensity = glm::vec4(color * intensity, 1.0f);
-        constantData->range = range;
-        constantData->directionalShadowMapDescriptorIdx = directionalShadowMapSRV.Index();
-        constantData->lightType = (UINT)lightType;
-
-        if (lightType == LightType_Directional) {
-            DirectX::XMMATRIX mat = DirectX::XMMatrixOrthographicRH(frustumSize, frustumSize, -frustumSize, frustumSize);
-            //glm::mat4 directionalProjection = glm::transpose(glm::make_mat4(reinterpret_cast<float*>(&mat.r)));
-            glm::mat4 directionalProjection = glm::ortho(-frustumSize, frustumSize, -frustumSize, frustumSize, 0.1f, frustumSize * 2.0f);
-            //glm::mat4 directionalProjection = glm::perspective(0.628319f, 1.0f, 0.1f, 10.0f);
-            glm::vec3 eye = -normalizedDirection * frustumSize * 1.2f;
-
-            glm::vec3 up(0.0f, 1.0f, 0.0f);
-            if (abs(glm::dot(up, normalizedDirection)) > 0.99f) {
-                // If the light is pointing straight up or down, we can't use the normal up vector
-                up = glm::vec3(1.0f, 0.0f, 0.0f);
-            }
-
-            glm::mat4 directionalView = glm::lookAt(eye, glm::vec3(0, 0, 0), up);
-            constantData->directionalLightViewProjection = directionalProjection * directionalView;
-        }
-    }
+    std::string assetPath;
+    ModelFinishCallback finishCB;
 };
 
-struct AssetLoadProgress
+struct AssetLoadContext
 {
-    std::string assetName;
+    std::string assetPath;
     std::string currentTask;
     float overallPercent;
-
     std::atomic<bool> isFinished{ false };
 };
 
@@ -449,6 +401,98 @@ struct RenderThread
 
     ComPtr<ID3D12GraphicsCommandList> commandList;
     ComPtr<ID3D12CommandAllocator> commandAllocator;
+};
+
+struct Light
+{
+    LightConstantData* constantData;
+    glm::vec3 position;
+    glm::vec3 direction;
+
+    glm::vec3 color;
+    float intensity;
+    float range;
+
+    LightType lightType;
+
+    ComPtr<D3D12MA::Allocation> directionalShadowMap;
+    UniqueDescriptors directionalShadowMapSRV;
+    UniqueDescriptors directionalShadowMapDSV;
+
+    UINT directionalShadowMapSize = 4096;
+    float frustumSize = 30.0f;
+
+    PoolItem<PrimitiveInstanceConstantData> sphereInstanceData;
+
+    float radianceThreshold = 0.001;
+
+    // Point lights follow the inverse square law and don't have a radius.
+    // But for optimization purposes we need to limit the range of the light.
+    // So we compute the effective radius using radianceThreshold^
+    //
+    // float radiance = attenuation * colorIntensity
+    // radiance = (1.0f / (distance * distance)) * colorIntensity
+    // let effectiveRadius = distance
+    // let radianceThreshold = radiance
+    // radianceThreshold = (1.0f / (effectiveRadius * effectiveRadius))
+    // effectiveRadius = sqrt(1.0f / (radianceThreshold * colorIntensity)) 
+    float effectiveRadius;
+
+    void UpdateConstantData(glm::mat4 viewMatrix)
+    {
+        glm::vec3 normalizedDirection = glm::normalize(direction);
+        constantData->position = glm::vec4(position, 1.0f);
+        constantData->direction = glm::vec4(normalizedDirection, 0.0f);
+        constantData->positionViewSpace = viewMatrix * constantData->position;
+        constantData->directionViewSpace = viewMatrix * glm::normalize(constantData->direction);
+        constantData->colorIntensity = glm::vec4(color * intensity, 1.0f);
+        constantData->range = range;
+        constantData->directionalShadowMapDescriptorIdx = directionalShadowMapSRV.Index();
+        constantData->lightType = (UINT)lightType;
+
+        if (lightType == LightType_Point) {
+            float CI = glm::length(color * intensity);
+            effectiveRadius = sqrtf(1.0f / (radianceThreshold * CI));
+        }
+
+        if (lightType == LightType_Directional) {
+            DirectX::XMMATRIX mat = DirectX::XMMatrixOrthographicRH(frustumSize, frustumSize, -frustumSize, frustumSize);
+            //glm::mat4 directionalProjection = glm::transpose(glm::make_mat4(reinterpret_cast<float*>(&mat.r)));
+            glm::mat4 directionalProjection = glm::ortho(-frustumSize, frustumSize, -frustumSize, frustumSize, 0.1f, frustumSize * 2.0f);
+            //glm::mat4 directionalProjection = glm::perspective(0.628319f, 1.0f, 0.1f, 10.0f);
+            glm::vec3 eye = -normalizedDirection * frustumSize * 1.2f;
+
+            glm::vec3 up(0.0f, 1.0f, 0.0f);
+            if (abs(glm::dot(up, normalizedDirection)) > 0.99f) {
+                // If the light is pointing straight up or down, we can't use the normal up vector
+                up = glm::vec3(1.0f, 0.0f, 0.0f);
+            }
+
+            glm::mat4 directionalView = glm::lookAt(eye, glm::vec3(0, 0, 0), up);
+            constantData->MVP = directionalProjection * directionalView;
+        }
+    }
+};
+
+enum NodeType
+{
+    NodeType_Mesh,
+    NodeType_Light,
+};
+
+struct Node
+{
+    NodeType nodeType;
+    union
+    {
+        Mesh* mesh;
+        Light* light;
+    };
+};
+
+struct Scene
+{
+    std::vector<Node> nodes;
 };
 
 typedef Pool<Primitive, 100> PrimitivePool;
@@ -516,6 +560,7 @@ struct App
     ComPtr<ID3D12CommandAllocator> copyCommandAllocator;
     ComPtr<ID3D12GraphicsCommandList> copyCommandList;
 
+    Scene scene;
     std::vector<Model> models;
 
     unsigned int frameIdx;
@@ -573,6 +618,9 @@ struct App
 
         UniqueDescriptors cbvHandle;
 
+        // Mesh* pointLightSphere;
+        // ConstantBufferVec<PrimitiveInstanceConstantData, MaxLightCount> pointSphereConstantData;
+
         UINT count;
     } LightBuffer;
 
@@ -616,10 +664,10 @@ struct App
 
     struct
     {
-        std::deque<std::string> gltfFilesToLoad;
+        std::deque<GLTFLoadEntry> gltfLoadEntries;
         std::optional<SkyboxImagePaths> skyboxToLoad;
 
-        std::vector<std::unique_ptr<AssetLoadProgress>> assetLoadInfo;
+        std::vector<std::unique_ptr<AssetLoadContext>> assetLoadInfo;
 
         std::mutex mutex;
         std::thread thread;

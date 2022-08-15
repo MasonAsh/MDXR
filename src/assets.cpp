@@ -139,7 +139,7 @@ void CreateModelDescriptors(
         CreateConstantBufferAndViews(
             app.device.Get(),
             perPrimitiveConstantBuffer,
-            sizeof(PerPrimitiveConstantData),
+            sizeof(PrimitiveInstanceConstantData),
             numConstantBuffers,
             cpuHandle
         );
@@ -647,10 +647,10 @@ void LoadModelTextures(
 #endif
 
         commandList->CopyResource(destResource.Get(), stagingTexturesForMipMaps[textureIdx].Get());
-        outputModel.buffers.push_back(destResource);
+        outputModel.resources.push_back(destResource);
 
         resourceBarriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(
-            outputModel.buffers.back().Get(),
+            outputModel.resources.back().Get(),
             D3D12_RESOURCE_STATE_COPY_DEST,
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
         ));
@@ -707,15 +707,15 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
     std::span<ComPtr<ID3D12Resource>>& outTextureResources,
     FenceEvent& fenceEvent,
     ImageLoadContext& imageLoadContext,
-    AssetLoadProgress* progress
+    AssetLoadContext* context
 )
 {
-    progress->currentTask = "Uploading model buffers";
-    progress->overallPercent = 0.15f;
+    context->currentTask = "Uploading model buffers";
+    context->overallPercent = 0.15f;
 
     std::vector<bool> imageIsSRGB = DetermineSRGBTextures(inputModel);
 
-    std::vector<ComPtr<ID3D12Resource>>& resourceBuffers = outputModel.buffers;
+    std::vector<ComPtr<ID3D12Resource>>& resourceBuffers = outputModel.resources;
     resourceBuffers.reserve(inputModel.buffers.size() + inputModel.images.size());
 
     UploadBatch uploadBatch;
@@ -745,7 +745,7 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
 
 #ifdef MDXR_DEBUG
         {
-            std::wstring bufName = convert_to_wstring(progress->assetName + " Buffer#" + std::to_string(bufferIdx));
+            std::wstring bufName = convert_to_wstring(context->assetPath + " Buffer#" + std::to_string(bufferIdx));
             geometryBuffer->SetName(bufName.c_str());
         }
 #endif
@@ -761,8 +761,8 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
 
     uploadBatch.Finish();
 
-    progress->currentTask = "Loading model textures";
-    progress->overallPercent = 0.30f;
+    context->currentTask = "Loading model textures";
+    context->overallPercent = 0.30f;
 
     WaitForModelImages(imageLoadContext);
 
@@ -781,7 +781,7 @@ std::vector<ComPtr<ID3D12Resource>> UploadModelBuffers(
     outGeometryResources = std::span(resourceBuffers.begin(), endGeometryBuffer);
     outTextureResources = std::span(endGeometryBuffer, resourceBuffers.end());
 
-    progress->overallPercent = 0.6f;
+    context->overallPercent = 0.6f;
 
     return resourceBuffers;
 }
@@ -878,6 +878,78 @@ void ResolveModelTransforms(
 }
 
 
+void AssignPSOToPrimitive(
+    App& app,
+    const tinygltf::Model& inputModel,
+    const tinygltf::Primitive& inputPrimitive,
+    const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout,
+    Primitive* primitive,
+    bool hasUVs
+)
+{
+    Material* material = primitive->material.get();
+    if (inputPrimitive.material != -1) {
+        // FIXME: NO! I should not be creating a PSO for every single Primitive
+        if (material->materialType == MaterialType_PBR) {
+            primitive->PSO = CreateMeshPBRPSO(
+                app.psoManager,
+                app.device.Get(),
+                app.dataDir,
+                app.rootSignature.Get(),
+                inputLayout
+            );
+        } else if (material->materialType == MaterialType_AlphaBlendPBR) {
+            primitive->PSO = CreateMeshAlphaBlendedPBRPSO(
+                app.psoManager,
+                app.device.Get(),
+                app.dataDir,
+                app.rootSignature.Get(),
+                inputLayout
+            );
+        } else if (material->materialType == MaterialType_Unlit) {
+            if (hasUVs) {
+                primitive->PSO = CreateMeshUnlitTexturedPSO(
+                    app.psoManager,
+                    app.device.Get(),
+                    app.dataDir,
+                    app.rootSignature.Get(),
+                    inputLayout
+                );
+            } else {
+                primitive->PSO = CreateMeshUnlitPSO(
+                    app.psoManager,
+                    app.device.Get(),
+                    app.dataDir,
+                    app.rootSignature.Get(),
+                    inputLayout
+                );
+            }
+        } else {
+            // Unimplemented MaterialType
+            abort();
+        }
+    } else {
+        // Just pray this will work
+        primitive->materialIndex = -1;
+        primitive->PSO = CreateMeshUnlitPSO(
+            app.psoManager,
+            app.device.Get(),
+            app.dataDir,
+            app.rootSignature.Get(),
+            inputLayout
+        );
+    }
+
+    primitive->directionalShadowPSO = CreateDirectionalLightShadowMapPSO(
+        app.psoManager,
+        app.device.Get(),
+        app.dataDir,
+        app.rootSignature.Get(),
+        inputLayout
+    );
+}
+
+
 PoolItem<Primitive> CreateModelPrimitive(
     App& app,
     Model& outputModel,
@@ -911,7 +983,7 @@ PoolItem<Primitive> CreateModelPrimitive(
         }
     };
 
-    const std::vector<ComPtr<ID3D12Resource>>& resourceBuffers = outputModel.buffers;
+    const std::vector<ComPtr<ID3D12Resource>>& resourceBuffers = outputModel.resources;
 
     auto primitive = app.primitivePool.AllocateUnique();
 
@@ -933,8 +1005,10 @@ PoolItem<Primitive> CreateModelPrimitive(
 
     // Build per drawcall data 
     // input layout and vertex buffer views
-    std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout = primitive->inputLayout;
+    std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout;
     inputLayout.reserve(inputPrimitive.attributes.size());
+
+    bool hasUVs = false;
 
     for (const auto& attrib : inputPrimitive.attributes) {
         auto [targetSemantic, semanticIndex] = ParseAttribToSemantic(attrib.first);
@@ -943,6 +1017,10 @@ PoolItem<Primitive> CreateModelPrimitive(
         if (semanticName == SEMANTIC_NAMES.end()) {
             DebugLog() << "Unsupported semantic in " << inputMesh.name << " " << targetSemantic << "\n";
             continue;
+        }
+
+        if (*semanticName == "TEXCOORD") {
+            hasUVs = true;
         }
 
         D3D12_INPUT_ELEMENT_DESC desc;
@@ -1055,56 +1133,20 @@ PoolItem<Primitive> CreateModelPrimitive(
 
     }
 
+    primitive->instanceCount = 1;
+
     if (inputPrimitive.material != -1) {
         auto& material = modelMaterials[inputPrimitive.material];
         primitive->material = material;
-        // FIXME: NO! I should not be creating a PSO for every single Primitive
-        if (material->materialType == MaterialType_PBR) {
-            primitive->PSO = CreateMeshPBRPSO(
-                app.psoManager,
-                app.device.Get(),
-                app.dataDir,
-                app.rootSignature.Get(),
-                primitive->inputLayout
-            );
-        } else if (material->materialType == MaterialType_AlphaBlendPBR) {
-            primitive->PSO = CreateMeshAlphaBlendedPBRPSO(
-                app.psoManager,
-                app.device.Get(),
-                app.dataDir,
-                app.rootSignature.Get(),
-                primitive->inputLayout
-            );
-        } else if (material->materialType == MaterialType_Unlit) {
-            primitive->PSO = CreateMeshUnlitPSO(
-                app.psoManager,
-                app.device.Get(),
-                app.dataDir,
-                app.rootSignature.Get(),
-                primitive->inputLayout
-            );
-        } else {
-            // Unimplemented MaterialType
-            abort();
-        }
-    } else {
-        // Just pray this will work
-        primitive->materialIndex = -1;
-        primitive->PSO = CreateMeshUnlitPSO(
-            app.psoManager,
-            app.device.Get(),
-            app.dataDir,
-            app.rootSignature.Get(),
-            primitive->inputLayout
-        );
     }
 
-    primitive->directionalShadowPSO = CreateDirectionalLightShadowMapPSO(
-        app.psoManager,
-        app.device.Get(),
-        app.dataDir,
-        app.rootSignature.Get(),
-        primitive->inputLayout
+    AssignPSOToPrimitive(
+        app,
+        inputModel,
+        inputPrimitive,
+        inputLayout,
+        primitive.get(),
+        hasUVs
     );
 
     D3D12_INDEX_BUFFER_VIEW& ibv = primitive->indexBufferView;
@@ -1184,7 +1226,7 @@ void FinalizeModel(
     const std::vector<SharedPoolItem<Material>>& modelMaterials
 )
 {
-    const std::vector<ComPtr<ID3D12Resource>>& resourceBuffers = outputModel.buffers;
+    const std::vector<ComPtr<ID3D12Resource>>& resourceBuffers = outputModel.resources;
 
     int perPrimitiveDescriptorIdx = 0;
 
@@ -1226,19 +1268,18 @@ void FinalizeModel(
 
 
 // For the time being we cannot handle GLTF meshes without normals, tangents and UVs.
-bool ValidateGLTFModel(const tinygltf::Model& model)
+bool ValidateGLTFModel(tinygltf::Model& model)
 {
-    for (const auto& mesh : model.meshes)
-    {
-        for (const auto& primitive : mesh.primitives)
-        {
-            const auto& attributes = primitive.attributes;
-            bool hasNormals = primitive.attributes.contains("NORMAL");
-            bool hasTangents = primitive.attributes.contains("TANGENT");
-            bool hasTexcoords = primitive.attributes.contains("TEXCOORD") || primitive.attributes.contains("TEXCOORD_0");
+    for (auto& mesh : model.meshes) {
+        for (auto& primitive : mesh.primitives) {
+            auto& attributes = primitive.attributes;
+            bool hasNormals = attributes.contains("NORMAL");
+            bool hasTangents = attributes.contains("TANGENT");
+            bool hasTexcoords = attributes.contains("TEXCOORD") || attributes.contains("TEXCOORD_0");
             if (!hasNormals || !hasTangents || !hasTexcoords) {
-                DebugLog() << "Model with mesh " << mesh.name << " is missing required vertex attributes and will be skipped\n";
-                return false;
+                DebugLog() << "Model with mesh " << mesh.name << " is missing required vertex attributes and will default to being unlit\n";
+                attributes.erase(std::string("NORMAL"));
+                attributes.erase(std::string("TANGENT"));
             }
         }
     }
@@ -1263,14 +1304,14 @@ bool ValidateSkyboxAssets(const SkyboxAssets& assets)
 
 // Renders all the lighting maps for the skybox, including diffuse irradiance,
 // prefilter map, and the BRDF lut.
-void RenderSkyboxEnvironmentLightMaps(App& app, const SkyboxAssets& assets, FenceEvent& cubemapUploadEvent, AssetLoadProgress* progress)
+void RenderSkyboxEnvironmentLightMaps(App& app, const SkyboxAssets& assets, FenceEvent& cubemapUploadEvent, AssetLoadContext* context)
 {
     // IMPORTANT: If this gets changed, PREFILTER_MAP_MIPCOUNT in common.hlsli must also be changed
     const UINT PrefilterMipCount = 5;
 
     ScopedPerformanceTracker perf(__func__, PerformancePrecision::Milliseconds);
 
-    progress->currentTask = "Rendering diffuse irradiance map";
+    context->currentTask = "Rendering diffuse irradiance map";
 
     if (app.graphicsAnalysis) {
         app.graphicsAnalysis->BeginCapture();
@@ -1370,7 +1411,7 @@ void RenderSkyboxEnvironmentLightMaps(App& app, const SkyboxAssets& assets, Fenc
 
     for (UINT i = 0; i < CubeImage_Count; i++)
     {
-        progress->currentTask = "Diffuse Irradiance Image " + std::to_string(i);
+        context->currentTask = "Diffuse Irradiance Image " + std::to_string(i);
 
         PIXScopedEvent(commandList.Get(), 0, ("CubeImage#" + std::to_string(i)).c_str());
 
@@ -1498,14 +1539,14 @@ void LoadBRDFLUT(App& app, UploadBatch& uploadBatch)
 }
 
 
-void CreateSkybox(App& app, const SkyboxAssets& asset, AssetLoadProgress* progress)
+void CreateSkybox(App& app, const SkyboxAssets& asset, AssetLoadContext* context)
 {
     if (!ValidateSkyboxAssets(asset)) {
         return;
     }
 
-    progress->currentTask = "Uploading cubemap";
-    progress->overallPercent = 0.15f;
+    context->currentTask = "Uploading cubemap";
+    context->overallPercent = 0.15f;
 
     ComPtr<D3D12MA::Allocation> cubemap;
     ComPtr<D3D12MA::Allocation> vertexBuffer;
@@ -1531,7 +1572,7 @@ void CreateSkybox(App& app, const SkyboxAssets& asset, AssetLoadProgress* progre
     }
 
     {
-        auto resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(sizeof(PerPrimitiveConstantData));
+        auto resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(sizeof(PrimitiveInstanceConstantData));
 
         D3D12MA::ALLOCATION_DESC allocDesc{};
         allocDesc.HeapType = D3D12_HEAP_TYPE_UPLOAD;
@@ -1550,7 +1591,7 @@ void CreateSkybox(App& app, const SkyboxAssets& asset, AssetLoadProgress* progre
     UniqueDescriptors perPrimitiveCBV = AllocateDescriptorsUnique(app.descriptorPool, 1, "Skybox PerPrimitive CBV");
     D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
     cbvDesc.BufferLocation = perPrimitiveBuffer->GetResource()->GetGPUVirtualAddress();
-    cbvDesc.SizeInBytes = sizeof(PerPrimitiveConstantData);
+    cbvDesc.SizeInBytes = sizeof(PrimitiveInstanceConstantData);
     app.device->CreateConstantBufferView(&cbvDesc, perPrimitiveCBV.CPUHandle());
 
     UploadBatch uploadBatch;
@@ -1691,6 +1732,7 @@ void CreateSkybox(App& app, const SkyboxAssets& asset, AssetLoadProgress* progre
     primitive->indexBufferView.Format = DXGI_FORMAT_R16_UINT;
     primitive->indexBufferView.SizeInBytes = sizeof(indices);
     primitive->material = material;
+    primitive->instanceCount = 1;
 
     D3D12_VERTEX_BUFFER_VIEW vertexView;
     vertexView.BufferLocation = vertexBuffer->GetResource()->GetGPUVirtualAddress();
@@ -1731,7 +1773,7 @@ void CreateSkybox(App& app, const SkyboxAssets& asset, AssetLoadProgress* progre
 
     app.Skybox.mesh->isReadyForRender = true;
 
-    RenderSkyboxEnvironmentLightMaps(app, asset, cubemapUpload, progress);
+    RenderSkyboxEnvironmentLightMaps(app, asset, cubemapUpload, context);
 }
 
 
@@ -1788,8 +1830,10 @@ bool TinyGLTFImageLoader(
 }
 
 
-void LoadGLTFThread(App& app, const std::string& gltfFile, AssetLoadProgress* progress)
+void LoadGLTFThread(App& app, const GLTFLoadEntry& loadEntry, AssetLoadContext* context)
 {
+    const auto& gltfFile = loadEntry.assetPath;
+
     auto perfName = "Loading " + gltfFile;
     ScopedPerformanceTracker perf(perfName.c_str(), PerformancePrecision::Milliseconds);
 
@@ -1803,10 +1847,10 @@ void LoadGLTFThread(App& app, const std::string& gltfFile, AssetLoadProgress* pr
         nullptr
     );
 
-    progress->assetName = gltfFile;
+    context->assetPath = gltfFile;
 
-    progress->currentTask = "Loading GLTF file";
-    progress->overallPercent = 0.0f;
+    context->currentTask = "Loading GLTF file";
+    context->overallPercent = 0.0f;
 
     if (!loader.LoadASCIIFromFile(&gltfModel, &err, &warn, gltfFile)) {
         DebugLog() << "Failed to load GLTF file " << gltfFile << ":";
@@ -1816,48 +1860,21 @@ void LoadGLTFThread(App& app, const std::string& gltfFile, AssetLoadProgress* pr
     DebugLog() << warn;
 
     if (!ValidateGLTFModel(gltfModel)) {
+        context->isFinished = true;
         return;
     }
 
     auto imageLoadContext = BeginModelImageLoad(gltfModel);
 
     std::vector<UINT64> uploadOffsets;
-
     std::span<ComPtr<ID3D12Resource>> geometryBuffers;
     std::span<ComPtr<ID3D12Resource>> textureBuffers;
-
     Model model;
 
-    // FIXME: command lists and command allocators should be reused
-    ComPtr<ID3D12CommandAllocator> commandAllocator;
-    ASSERT_HRESULT(app.device->CreateCommandAllocator(
-        D3D12_COMMAND_LIST_TYPE_DIRECT,
-        IID_PPV_ARGS(&commandAllocator)
-    ));
-
-    ComPtr<ID3D12CommandAllocator> copyCommandAllocator;
-    ASSERT_HRESULT(app.device->CreateCommandAllocator(
-        D3D12_COMMAND_LIST_TYPE_COPY,
-        IID_PPV_ARGS(&copyCommandAllocator)
-    ));
-
-    ComPtr<ID3D12GraphicsCommandList> commandList;
-    ASSERT_HRESULT(app.device->CreateCommandList(
-        0,
-        D3D12_COMMAND_LIST_TYPE_DIRECT,
-        commandAllocator.Get(),
-        nullptr,
-        IID_PPV_ARGS(&commandList)
-    ));
-
-    ComPtr<ID3D12GraphicsCommandList> copyCommandList;
-    ASSERT_HRESULT(app.device->CreateCommandList(
-        0,
-        D3D12_COMMAND_LIST_TYPE_COPY,
-        copyCommandAllocator.Get(),
-        nullptr,
-        IID_PPV_ARGS(&copyCommandList)
-    ));
+    auto [copyCommandList, copyCommandAllocator] = EasyCreateGraphicsCommandList(
+        app,
+        D3D12_COMMAND_LIST_TYPE_COPY
+    );
 
     FenceEvent fenceEvent;
 
@@ -1874,23 +1891,24 @@ void LoadGLTFThread(App& app, const std::string& gltfFile, AssetLoadProgress* pr
         textureBuffers,
         fenceEvent,
         imageLoadContext,
-        progress
+        context
     );
 
     std::vector<SharedPoolItem<Material>> modelMaterials;
 
-    progress->currentTask = "Finalizing";
+    context->currentTask = "Finalizing";
     CreateModelDescriptors(app, gltfModel, model, textureBuffers);
     CreateModelMaterials(app, gltfModel, model, modelMaterials);
     FinalizeModel(model, app, gltfModel, modelMaterials);
 
-    progress->overallPercent = 1.0f;
+    context->overallPercent = 1.0f;
 
     app.models.push_back(std::move(model));
 
     app.copyQueue.WaitForEventCPU(fenceEvent);
 
-    progress->isFinished = true;
+    context->isFinished = true;
+    loadEntry.finishCB(app, app.models.back());
 }
 
 
@@ -1907,27 +1925,36 @@ void NotifyAssetThread(App& app)
 }
 
 
-void EnqueueGLTF(App& app, const std::string& filePath)
+void EnqueueGLTF(App& app, const std::string& filePath, ModelFinishCallback finishCB)
 {
-    std::lock_guard<std::mutex> lock(app.AssetThread.mutex);
-    app.AssetThread.gltfFilesToLoad.push_front(filePath);
+    GLTFLoadEntry loadEntry;
+    loadEntry.assetPath = filePath;
+    loadEntry.finishCB = finishCB;
+
+    {
+        std::lock_guard<std::mutex> lock(g_assetMutex);
+        app.AssetThread.gltfLoadEntries.push_front(loadEntry);
+    }
+
     NotifyAssetThread(app);
 }
 
 
 void EnqueueSkybox(App& app, const SkyboxImagePaths& assetPaths)
 {
-    std::lock_guard<std::mutex> lock(app.AssetThread.mutex);
-    app.AssetThread.skyboxToLoad = assetPaths;
+    {
+        std::lock_guard<std::mutex> lock(g_assetMutex);
+        app.AssetThread.skyboxToLoad = assetPaths;
+    }
     NotifyAssetThread(app);
 }
 
 
-void LoadSkyboxThread(App& app, const SkyboxImagePaths& paths, AssetLoadProgress* progress)
+void LoadSkyboxThread(App& app, const SkyboxImagePaths& paths, AssetLoadContext* context)
 {
-    progress->assetName = paths.paths[0];
-    progress->currentTask = "Loading skybox images";
-    progress->overallPercent = 0.0f;
+    context->assetPath = paths.paths[0];
+    context->currentTask = "Loading skybox images";
+    context->overallPercent = 0.0f;
 
     SkyboxAssets assets;
 
@@ -1951,19 +1978,19 @@ void LoadSkyboxThread(App& app, const SkyboxImagePaths& paths, AssetLoadProgress
     }
 
     if (fail) {
-        progress->isFinished = true;
+        context->isFinished = true;
         return;
     }
 
-    CreateSkybox(app, assets, progress);
+    CreateSkybox(app, assets, context);
 
-    progress->isFinished = true;
+    context->isFinished = true;
 }
 
 
 bool AreAssetsPendingLoad(const App& app)
 {
-    return !app.AssetThread.gltfFilesToLoad.empty() || app.AssetThread.skyboxToLoad.has_value();
+    return !app.AssetThread.gltfLoadEntries.empty() || app.AssetThread.skyboxToLoad.has_value();
 }
 
 
@@ -1973,7 +2000,7 @@ void StartLoadThread(App& app, std::vector<std::thread>& loadThreads, Args... ar
     // If one of the previous load threads finished, use it
     for (int i = 0; i < app.AssetThread.assetLoadInfo.size(); i++) {
         if (app.AssetThread.assetLoadInfo[i]->isFinished) {
-            app.AssetThread.assetLoadInfo[i] = std::unique_ptr<AssetLoadProgress>(new AssetLoadProgress);
+            app.AssetThread.assetLoadInfo[i] = std::unique_ptr<AssetLoadContext>(new AssetLoadContext);
             loadThreads[i].join();
             loadThreads[i] = std::thread(
                 args...,
@@ -1984,11 +2011,11 @@ void StartLoadThread(App& app, std::vector<std::thread>& loadThreads, Args... ar
     }
 
     // otherwise allocate a new thread
-    app.AssetThread.assetLoadInfo.emplace_back(new AssetLoadProgress);
-    AssetLoadProgress* progress = app.AssetThread.assetLoadInfo.back().get();
+    app.AssetThread.assetLoadInfo.emplace_back(new AssetLoadContext);
+    AssetLoadContext* context = app.AssetThread.assetLoadInfo.back().get();
     loadThreads.emplace_back(
         args...,
-        progress
+        context
     );
 }
 
@@ -2016,16 +2043,16 @@ void AssetLoadThread(App& app)
                 app,
                 loadThreads,
                 // I have absolutely no idea why this God forsaken cast is necessary
-                static_cast<void(*)(App&, const SkyboxImagePaths&, AssetLoadProgress*)>(LoadSkyboxThread),
+                static_cast<void(*)(App&, const SkyboxImagePaths&, AssetLoadContext*)>(LoadSkyboxThread),
                 std::ref(app),
                 app.AssetThread.skyboxToLoad.value()
             );
         }
         app.AssetThread.skyboxToLoad = {};
 
-        while (!app.AssetThread.gltfFilesToLoad.empty()) {
-            auto gltfFile = app.AssetThread.gltfFilesToLoad.front();
-            app.AssetThread.gltfFilesToLoad.pop_front();
+        while (!app.AssetThread.gltfLoadEntries.empty()) {
+            auto gltfFile = app.AssetThread.gltfLoadEntries.front();
+            app.AssetThread.gltfLoadEntries.pop_front();
 
             StartLoadThread(
                 app,

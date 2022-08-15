@@ -37,7 +37,7 @@ void ProcessAssets(App& app, AssetBundle& assets);
 
 void StartAssetThread(App& app);
 void NotifyAssetThread(App& app);
-void EnqueueGLTF(App& app, const std::string& filePath);
+void EnqueueGLTF(App& app, const std::string& filePath, ModelFinishCallback finishCB);
 void EnqueueSkybox(App& app, const SkyboxImagePaths& assetPaths);
 
 void LoadSkyboxThread(App& app, const SkyboxImagePaths& assets);

@@ -3,10 +3,14 @@
 struct VSInput {
     uint instance : SV_InstanceID;
     float3 position : POSITION;
+    float3 normal : NORMAL;
+    float3 tangent : TANGENT;
+    float2 uv : TEXCOORD;
 };
 
 struct PSInput {
     float4 position : SV_POSITION;
+    float2 uv : TEXCOORD;
 };
 
 struct PSOutput {
@@ -20,6 +24,7 @@ PSInput VSMain(VSInput input)
     ConstantBuffer<PrimitiveInstanceData> primitiveData = GetPrimitiveInstanceData(input.instance);
 
     result.position = mul(primitiveData.MVP, float4(input.position, 1.0f));
+    result.uv = input.uv;
 
     return result;
 }
@@ -28,14 +33,15 @@ PSOutput PSMain(PSInput input)
 {
     PSOutput result;
 
-    float4 color = float4(1.0f, 0.07, 0.57, 1.0);
+    MaterialData mat = GetMaterial();
 
-    if (g_MaterialDataIndex != -1) {
-        MaterialData mat = GetMaterial();
-        color = mat.baseColorFactor;
+    // TODO: these checks be done through preprocessor and shader permutations instead
+    if (mat.baseColorTextureIdx != -1) {
+        Texture2D baseColorTexture = GetBaseColorTexture(mat);
+        result.backBuffer = baseColorTexture.Sample(g_sampler, input.uv);
+    } else {
+        result.backBuffer = float4(1.0f, 0.07, 0.57, 1.0);
     }
-
-    result.backBuffer = color;
 
     return result;
 }

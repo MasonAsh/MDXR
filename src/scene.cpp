@@ -46,6 +46,18 @@ void InitializeScene(App& app)
     app.PostProcessPass.exposure = 0.1f;
 }
 
+void AddModelToScene(App& app, Model& model)
+{
+    for (const auto& mesh : model.meshes) {
+        app.scene.nodes.emplace_back(
+            Node{
+                NodeType_Mesh,
+                mesh.get()
+            }
+        );
+    }
+}
+
 void StartSceneAssetLoad(App& app)
 {
     tinygltf::TinyGLTF loader;
@@ -58,9 +70,9 @@ void StartSceneAssetLoad(App& app)
     // EnqueueGLTF(app, dataDir + "/LightTest/LightTest.gltf");
     // EnqueueGLTF(app, dataDir + "/metallicsphere.gltf");
     // EnqueueGLTF(app, dataDir + "/FlightHelmet/FlightHelmet.gltf");
-    EnqueueGLTF(app, "C:\\Users\\mason\\dev\\glTF-Sample-Models\\Main\\tangified\\sponza_tangents.gltf");
-    EnqueueGLTF(app, "C:/Users/mason/dev/glTF-Sample-Models/Main/PKG_A_Curtains/NewSponza_Curtains_glTF_with_tangents.gltf");
-    EnqueueGLTF(app, "C:/Users/mason/dev/glTF-Sample-Models/Main/PKG_D_Candles/NewSponza_100sOfCandles_glTF_OmniLights_with_tangents.gltf");
+    EnqueueGLTF(app, "C:\\Users\\mason\\dev\\glTF-Sample-Models\\Main\\tangified\\sponza_tangents.gltf", AddModelToScene);
+    // EnqueueGLTF(app, "C:/Users/mason/dev/glTF-Sample-Models/Main/PKG_A_Curtains/NewSponza_Curtains_glTF_with_tangents.gltf");
+    EnqueueGLTF(app, "C:/Users/mason/dev/glTF-Sample-Models/Main/PKG_D_Candles/NewSponza_100sOfCandles_glTF_OmniLights_with_tangents.gltf", AddModelToScene);
 
     SkyboxImagePaths images;
     const std::string skyboxDir = "/Forest/";

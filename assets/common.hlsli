@@ -1,4 +1,4 @@
-struct PrimitiveData
+struct PrimitiveInstanceData
 {
     float4x4 MVP;
     float4x4 MV;
@@ -24,7 +24,7 @@ struct LightConstantData
 
     float4 colorIntensity;
 
-    float4x4 directionalLightViewProjection;
+    float4x4 MVP;
 
     float range;
     uint directionalShadowMapDescriptorIdx;
@@ -92,9 +92,14 @@ float4 DoNormalMap(Texture2D normalMap, float3x3 TBN, float2 uv)
     return normalize(float4(normal, 0.0f));
 }
 
-ConstantBuffer<PrimitiveData> GetPrimitiveData() 
+ConstantBuffer<PrimitiveInstanceData> GetPrimitiveInstanceData(uint instance) 
 {
-    return ResourceDescriptorHeap[g_PrimitiveDataIndex];
+    return ResourceDescriptorHeap[g_PrimitiveDataIndex + instance];
+}
+
+ConstantBuffer<PrimitiveInstanceData> GetPrimitiveData()
+{
+    return GetPrimitiveInstanceData(0);
 }
 
 ConstantBuffer<MaterialData> GetMaterial()

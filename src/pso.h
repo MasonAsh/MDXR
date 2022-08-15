@@ -64,7 +64,7 @@ struct ShaderPaths
 struct ManagedPSO
 {
     ShaderPaths shaderPaths;
-    std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayoutMemory;
+    std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout;
     CD3DX12_PIPELINE_STATE_STREAM desc;
     UINT hash;
     ComPtr<ID3D12PipelineState> PSO;
@@ -154,7 +154,7 @@ struct ManagedPSO
             crc32b(reinterpret_cast<unsigned char*>(&desc.SampleDesc), sizeof(desc.SampleDesc)) +
             crc32b(reinterpret_cast<unsigned char*>(&desc.SampleMask), sizeof(desc.SampleMask));
 
-        for (const auto& inputLayoutElement : inputLayoutMemory) {
+        for (const auto& inputLayoutElement : inputLayout) {
             hash += crc32b(
                 reinterpret_cast<const unsigned char* const>(&inputLayoutElement.SemanticName),
                 strlen(inputLayoutElement.SemanticName)
@@ -259,6 +259,14 @@ ManagedPSORef CreateMeshAlphaBlendedPBRPSO(
 );
 
 ManagedPSORef CreateMeshUnlitPSO(
+    PSOManager& manager,
+    ID3D12Device2* device,
+    const std::string& dataDir,
+    ID3D12RootSignature* rootSignature,
+    const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
+);
+
+ManagedPSORef CreateMeshUnlitTexturedPSO(
     PSOManager& manager,
     ID3D12Device2* device,
     const std::string& dataDir,

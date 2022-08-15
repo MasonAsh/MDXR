@@ -299,7 +299,7 @@ void DrawMenuBar(App& app)
                 if (gltfFile != nullptr) {
                     AssetBundle assets;
                     tinygltf::TinyGLTF loader;
-                    EnqueueGLTF(app, gltfFile);
+                    EnqueueGLTF(app, gltfFile, AddModelToScene);
                 }
             }
             ImGui::EndMenu();
@@ -357,7 +357,7 @@ void DrawGeekMenu(App& app)
             if (loadInfo->isFinished) {
                 continue;
             }
-            ImGui::Text("Loading %s %c", loadInfo->assetName.c_str(), "|/-\\"[(int)(ImGui::GetTime() / 0.05f) & 3]);
+            ImGui::Text("Loading %s %c", loadInfo->assetPath.c_str(), "|/-\\"[(int)(ImGui::GetTime() / 0.05f) & 3]);
             ImGui::Indent();
             ImGui::Text("%f%% %s", loadInfo->overallPercent * 100.0f, loadInfo->currentTask.c_str());
             ImGui::Unindent();
