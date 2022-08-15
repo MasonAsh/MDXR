@@ -542,7 +542,7 @@ ManagedPSORef CreateToneMapPSO(
     psoDesc.RasterizerState = rasterizerState;
 
     // Blend settings for accumulation buffer
-    D3D12_RENDER_TARGET_BLEND_DESC blendDesc;
+    D3D12_RENDER_TARGET_BLEND_DESC blendDesc = {};
     blendDesc.BlendEnable = TRUE;
     blendDesc.LogicOpEnable = FALSE;
     blendDesc.SrcBlend = D3D12_BLEND_ONE;

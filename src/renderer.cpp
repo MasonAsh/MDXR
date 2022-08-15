@@ -1291,65 +1291,29 @@ void LightPass(App& app, ID3D12GraphicsCommandList* commandList)
 
         commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 
-        // This define will bundle together light fullscreen quads into instanced draws.
-        // This is only helpful to the extent the lights are sorted by lightType.
-        //
-        // In practice this seems to barely help, so not worth to implement the sorting code
-        // as of now.
-#define USE_LIGHT_INSTANCING
-
         // Point lights
         PIXBeginEvent(commandList, 0xFF9F82, L"PointLights");
         commandList->SetPipelineState(app.LightPass.pointLightPSO->Get());
-#ifdef USE_LIGHT_INSTANCING
+
         for (UINT i = 0; i < app.LightBuffer.count; i++) {
-            int lightStartIdx = i;
+            // Group together as many point lights as possible into one draw
             int lightCount = 0;
-            // Group together the next N point lights
+            int lightStartIdx = 0;
             while (i < app.LightBuffer.count && app.lights[i].lightType == LightType_Point) {
                 lightCount++;
                 i++;
             }
 
             if (lightCount > 0) {
-                UINT constantValues[2] = {
+                UINT constantValues[3] = {
                     app.LightBuffer.cbvHandle.Index() + lightStartIdx + 1,
-                    app.LightBuffer.cbvHandle.Index()
+                    app.LightBuffer.cbvHandle.Index(),
+                    lightCount,
                 };
-                commandList->SetGraphicsRoot32BitConstants(0, 2, constantValues, 2);
-                DrawFullscreenQuadInstanced(app, commandList, lightCount);
-            }
-        }
-#else
-        for (UINT i = 0; i < app.LightBuffer.count; i++) {
-            if (app.lights[i].lightType == LightType_Point) {
-                UINT constantValues[2] = {
-                    app.LightBuffer.cbvHandle.Index() + i + 1,
-                    app.LightBuffer.cbvHandle.Index()
-                };
-                commandList->SetGraphicsRoot32BitConstants(0, 2, constantValues, 2);
+                commandList->SetGraphicsRoot32BitConstants(0, _countof(constantValues), constantValues, 2);
                 DrawFullscreenQuad(app, commandList);
             }
         }
-#endif
-
-        // auto& lightSpherePrimitive = app.LightBuffer.pointLightSphere->primitives[0];
-        // commandList->IASetPrimitiveTopology(lightSpherePrimitive->primitiveTopology);
-        // commandList->IASetVertexBuffers(0, (UINT)lightSpherePrimitive->vertexBufferViews.size(), lightSpherePrimitive->vertexBufferViews.data());
-        // for (UINT i = 0; i < app.LightBuffer.count; i++) {
-        //     auto& light = app.lights[i];
-        //     if (light.lightType == LightType_Point) {
-        //         UINT constantValues[2] = {
-        //             app.LightBuffer.cbvHandle.Index() + i + 1,
-        //             app.LightBuffer.cbvHandle.Index()
-        //         };
-        //         commandList->SetGraphicsRoot32BitConstants(0, 2, constantValues, 2);
-
-        //         commandList->IASetIndexBuffer(&lightSpherePrimitive->indexBufferView);
-
-        //         commandList->DrawIndexedInstanced(lightSpherePrimitive->indexCount, 1, 0, 0, 0);
-        //     }
-        // }
 
         PIXEndEvent(commandList);
 
