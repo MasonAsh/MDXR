@@ -1238,6 +1238,8 @@ void ShadowPass(App& app, ID3D12GraphicsCommandList* commandList)
     }
 }
 
+const D3D12_RESOURCE_STATES LightPassDepthResourceState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_DEPTH_READ;
+
 void TransitionResourcesForLightPass(const App& app, ID3D12GraphicsCommandList* commandList)
 {
     // Transition GBuffer to being shader resource views so that they can be used in the lighting shaders.
@@ -1249,7 +1251,7 @@ void TransitionResourcesForLightPass(const App& app, ID3D12GraphicsCommandList* 
     }
 
     // Depth buffer is special
-    barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(app.depthStencilBuffer.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_DEPTH_READ));
+    barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(app.depthStencilBuffer.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, LightPassDepthResourceState));
 
     // Transition any directional light shadow maps to being pixel resources
     for (UINT i = 0; i < app.LightBuffer.count; i++) {
@@ -1319,9 +1321,15 @@ void LightPass(App& app, ID3D12GraphicsCommandList* commandList)
 
         // Directional lights
         PIXBeginEvent(commandList, 0xFF9F82, L"DirectionalLights");
-        commandList->SetPipelineState(app.LightPass.directionalLightPso->Get());
+        bool hasSetPSO = false;
         for (UINT i = 0; i < app.LightBuffer.count; i++) {
             if (app.lights[i].lightType == LightType_Directional) {
+                // avoid setting PSO if no directional lights
+                if (!hasSetPSO) {
+                    commandList->SetPipelineState(app.LightPass.directionalLightPso->Get());
+                    hasSetPSO = true;
+                }
+
                 UINT constantValues[2] = {
                     app.LightBuffer.cbvHandle.Index() + i + 1,
                     app.LightBuffer.cbvHandle.Index()
@@ -1359,7 +1367,7 @@ void AlphaBlendPass(App& app, ID3D12GraphicsCommandList* commandList)
     commandList->RSSetScissorRects(1, &app.scissorRect);
 
     // Transition depth buffer back to depth write for alpha blend
-    auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(app.depthStencilBuffer.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_DEPTH_READ, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(app.depthStencilBuffer.Get(), LightPassDepthResourceState, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     commandList->ResourceBarrier(1, &barrier);
 
     auto rtvHandle = app.GBuffer.rtvs[GBuffer_Radiance].CPUHandle();

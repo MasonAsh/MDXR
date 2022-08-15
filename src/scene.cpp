@@ -66,13 +66,13 @@ void StartSceneAssetLoad(App& app)
 
     const std::string& dataDir = app.dataDir;
 
-    // EnqueueGLTF(app, dataDir + "/floor/floor.gltf");
-    // EnqueueGLTF(app, dataDir + "/LightTest/LightTest.gltf");
+    EnqueueGLTF(app, dataDir + "/floor/floor.gltf", AddModelToScene);
+    EnqueueGLTF(app, dataDir + "/LightTest/LightTest.gltf", AddModelToScene);
     // EnqueueGLTF(app, dataDir + "/metallicsphere.gltf");
     // EnqueueGLTF(app, dataDir + "/FlightHelmet/FlightHelmet.gltf");
-    EnqueueGLTF(app, "C:\\Users\\mason\\dev\\glTF-Sample-Models\\Main\\tangified\\sponza_tangents.gltf", AddModelToScene);
+    // EnqueueGLTF(app, "C:\\Users\\mason\\dev\\glTF-Sample-Models\\Main\\tangified\\sponza_tangents.gltf", AddModelToScene);
     // EnqueueGLTF(app, "C:/Users/mason/dev/glTF-Sample-Models/Main/PKG_A_Curtains/NewSponza_Curtains_glTF_with_tangents.gltf");
-    EnqueueGLTF(app, "C:/Users/mason/dev/glTF-Sample-Models/Main/PKG_D_Candles/NewSponza_100sOfCandles_glTF_OmniLights_with_tangents.gltf", AddModelToScene);
+    // EnqueueGLTF(app, "C:/Users/mason/dev/glTF-Sample-Models/Main/PKG_D_Candles/NewSponza_100sOfCandles_glTF_OmniLights_with_tangents.gltf", AddModelToScene);
 
     SkyboxImagePaths images;
     const std::string skyboxDir = "/Forest/";

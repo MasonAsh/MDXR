@@ -1773,6 +1773,13 @@ void CreateSkybox(App& app, const SkyboxAssets& asset, AssetLoadContext* context
 
     app.Skybox.mesh->isReadyForRender = true;
 
+    app.scene.nodes.emplace_back(
+        Node{
+            NodeType_Mesh,
+            app.Skybox.mesh.get()
+        }
+    );
+
     RenderSkyboxEnvironmentLightMaps(app, asset, cubemapUpload, context);
 }
 
