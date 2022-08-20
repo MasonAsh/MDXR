@@ -584,10 +584,7 @@ struct App
     struct
     {
         DescriptorPool srvHeap;
-        bool lightsOpen = true;
-        bool meshesOpen = true;
-        bool materialsOpen = false;
-        bool geekOpen = true;
+        bool toolsOpen = true;
         bool demoOpen = false;
         bool showStats = true;
 

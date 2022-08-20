@@ -44,7 +44,7 @@ void InitializeScene(App& app)
     InitializeCamera(app);
     InitializeLights(app);
 
-    app.PostProcessPass.exposure = 0.1f;
+    app.PostProcessPass.exposure = 1.0f;
 }
 
 void AddModelToScene(App& app, Model& model)

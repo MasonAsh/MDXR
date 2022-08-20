@@ -62,10 +62,7 @@ void CleanImGui()
 void DrawMeshEditor(App& app)
 {
     static int selectedMeshIdx = -1;
-    if (!app.ImGui.meshesOpen) {
-        return;
-    }
-    if (ImGui::Begin("Mesh Editor", &app.ImGui.meshesOpen, ImGuiWindowFlags_AlwaysAutoResize)) {
+    if (ImGui::CollapsingHeader("Mesh Editor")) {
         Mesh* selectedMesh = nullptr;
 
         if (ImGui::BeginListBox("Meshes")) {
@@ -98,6 +95,8 @@ void DrawMeshEditor(App& app)
         if (selectedMesh != nullptr) {
             glm::vec3 eulerDegrees = glm::degrees(selectedMesh->euler);
 
+            ImGui::PushID("Mesh");
+
             ImGui::DragFloat3("Position", (float*)&selectedMesh->translation, 0.1f);
             ImGui::DragFloat3("Euler", (float*)&eulerDegrees, 0.1f);
             ImGui::DragFloat3("Scale", (float*)&selectedMesh->scale, 0.1f);
@@ -109,20 +108,17 @@ void DrawMeshEditor(App& app)
             for (const auto& prim : selectedMesh->primitives) {
                 ImGui::Text(prim->cull ? "True" : "False");
             }
+
+            ImGui::PopID();
         }
     }
-    ImGui::End();
 }
 
 void DrawMaterialEditor(App& app)
 {
-    if (!app.ImGui.materialsOpen) {
-        return;
-    }
-
     static int selectedMaterialIdx = -1;
 
-    if (ImGui::Begin("Material Editor", &app.ImGui.materialsOpen, 0)) {
+    if (ImGui::CollapsingHeader("Material Editor")) {
         Material* selectedMaterial = nullptr;
 
         if (ImGui::BeginListBox("Materials")) {
@@ -176,19 +172,13 @@ void DrawMaterialEditor(App& app)
             }
         }
     }
-
-    ImGui::End();
 }
 
 void DrawLightEditor(App& app)
 {
     static int selectedLightIdx = 0;
 
-    if (!app.ImGui.lightsOpen) {
-        return;
-    }
-
-    if (ImGui::Begin("Lights", &app.ImGui.lightsOpen, 0)) {
+    if (ImGui::CollapsingHeader("Lights")) {
         // const char* const* pLabels = (const char* const*)labels;
         if (ImGui::BeginListBox("Lights")) {
             for (UINT i = 0; i < app.LightBuffer.count; i++) {
@@ -225,6 +215,8 @@ void DrawLightEditor(App& app)
                 "Directional"
             };
 
+            ImGui::PushID("Light");
+
             if (ImGui::BeginCombo("Light Type", LightTypeLabels[light.lightType])) {
                 for (int i = 0; i < _countof(LightTypeLabels); i++) {
                     if (ImGui::Selectable(LightTypeLabels[i], i == light.lightType)) {
@@ -233,6 +225,7 @@ void DrawLightEditor(App& app)
                 }
                 ImGui::EndCombo();
             }
+
 
             ImGui::ColorEdit3("Color", (float*)&light.color, ImGuiColorEditFlags_PickerHueWheel);
             if (light.lightType == LightType_Point) {
@@ -243,17 +236,21 @@ void DrawLightEditor(App& app)
             }
             ImGui::DragFloat("Range", &light.range, 0.1f, 0.0f, 1000.0f, nullptr, 1.0f);
             ImGui::DragFloat("Intensity", &light.intensity, 0.05f, 0.0f, 100.0f, nullptr, 1.0f);
+
+            ImGui::PopID();
         } else {
             ImGui::Text("No light selected");
         }
+    }
+}
 
-        ImGui::Separator();
+void DrawEnvironmentEditor(App& app)
+{
+    if (ImGui::CollapsingHeader("Environment")) {
         ImGui::DragFloat3("Environment Intensity", &app.LightBuffer.passData->environmentIntensity[0]);
         ImGui::DragFloat("Gamma", &app.PostProcessPass.gamma, 0.1f, 0.0f, 3.0f, nullptr, 1.0f);
         ImGui::DragFloat("Exposure", &app.PostProcessPass.exposure, 0.1f, 0.0f, 2.0f, nullptr, 1.0f);
     }
-
-    ImGui::End();
 }
 
 void DrawStats(App& app)
@@ -317,10 +314,7 @@ void DrawMenuBar(App& app)
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Windows")) {
-            ImGui::Checkbox("Lights", &app.ImGui.lightsOpen);
-            ImGui::Checkbox("Meshes", &app.ImGui.meshesOpen);
-            ImGui::Checkbox("Materials", &app.ImGui.materialsOpen);
-            ImGui::Checkbox("Geek Menu", &app.ImGui.geekOpen);
+            ImGui::Checkbox("Tools", &app.ImGui.toolsOpen);
             ImGui::Checkbox("ImGui Demo Window", &app.ImGui.demoOpen);
             ImGui::Checkbox("Show stats", &app.ImGui.showStats);
             ImGui::EndMenu();
@@ -331,11 +325,8 @@ void DrawMenuBar(App& app)
 
 void DrawGeekMenu(App& app)
 {
-    if (!app.ImGui.geekOpen) {
-        return;
-    }
-
-    if (ImGui::Begin("Geek Menu", &app.ImGui.geekOpen)) {
+    static bool geekOpen = false;
+    if (ImGui::CollapsingHeader("Nerd Stuff", &geekOpen)) {
         static bool debugSkybox = false;
         if (ImGui::Checkbox("Debug Diffuse IBL", &debugSkybox)) {
             if (app.Skybox.mesh && app.Skybox.mesh->isReadyForRender) {
@@ -367,8 +358,6 @@ void DrawGeekMenu(App& app)
 
         ImGui::Checkbox("Disable Shadows", &app.RenderSettings.disableShadows);
     }
-
-    ImGui::End();
 }
 
 void BeginGUI(App& app)
@@ -377,12 +366,17 @@ void BeginGUI(App& app)
     ImGui_ImplSDL2_NewFrame();
     ImGui::NewFrame();
 
-    DrawLightEditor(app);
-    DrawMaterialEditor(app);
-    DrawMeshEditor(app);
+    if (ImGui::Begin("Tools", &app.ImGui.toolsOpen)) {
+        DrawLightEditor(app);
+        DrawEnvironmentEditor(app);
+        DrawMaterialEditor(app);
+        DrawMeshEditor(app);
+        DrawGeekMenu(app);
+    }
+    ImGui::End();
+
     DrawStats(app);
     DrawMenuBar(app);
-    DrawGeekMenu(app);
 
     if (app.ImGui.demoOpen) {
         ImGui::ShowDemoWindow(&app.ImGui.demoOpen);
