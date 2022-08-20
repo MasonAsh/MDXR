@@ -64,7 +64,7 @@ public:
     }
 #endif
 
-    void ExecuteCommandLists(std::span<ID3D12CommandList* const> commandLists, FenceEvent& fenceEvent, FenceEvent waitEvent = FenceEvent())
+    void ExecuteCommandLists(std::span<ID3D12CommandList* const> commandLists, FenceEvent& fenceEvent, std::initializer_list<FenceEvent> waitEvents = {})
     {
 #ifdef MDXR_DEBUG
         for (auto& commandList : commandLists) {
@@ -86,17 +86,19 @@ public:
         }
 #endif
 
-        waitEvent.sourceFence->WaitQueue(commandQueue.Get(), waitEvent);
+        for (const FenceEvent& waitEvent : waitEvents) {
+            waitEvent.sourceFence->WaitQueue(commandQueue.Get(), waitEvent);
+        }
         commandQueue->ExecuteCommandLists(assert_cast<UINT>(commandLists.size()), &commandLists[0]);
         fence.SignalQueue(commandQueue.Get(), fenceEvent);
     }
 
-    void ExecuteCommandLists(std::initializer_list<ID3D12CommandList* const> commandLists, FenceEvent& fenceEvent, FenceEvent waitEvent = FenceEvent())
+    void ExecuteCommandLists(std::initializer_list<ID3D12CommandList* const> commandLists, FenceEvent& fenceEvent, std::initializer_list<FenceEvent> waitEvents = {})
     {
-        ExecuteCommandLists(std::span<ID3D12CommandList* const>(commandLists), fenceEvent, waitEvent);
+        ExecuteCommandLists(std::span<ID3D12CommandList* const>(commandLists), fenceEvent, waitEvents);
     }
 
-    void ExecuteCommandListsBlocking(std::span<ID3D12CommandList* const> commandLists, FenceEvent waitEvent = FenceEvent())
+    void ExecuteCommandListsBlocking(std::span<ID3D12CommandList* const> commandLists, std::initializer_list<FenceEvent> waitEvents = {})
     {
 #ifdef MDXR_DEBUG
         for (auto& commandList : commandLists) {
@@ -105,7 +107,7 @@ public:
 #endif
 
         FenceEvent fenceEvent;
-        ExecuteCommandLists(commandLists, fenceEvent);
+        ExecuteCommandLists(commandLists, fenceEvent, waitEvents);
         WaitForEventCPU(fenceEvent);
     }
 
@@ -143,9 +145,9 @@ public:
         return hr;
     }
 
-    void ExecuteCommandListsBlocking(std::initializer_list<ID3D12CommandList* const> commandLists, FenceEvent waitEvent = FenceEvent())
+    void ExecuteCommandListsBlocking(std::initializer_list<ID3D12CommandList* const> commandLists, std::initializer_list<FenceEvent> waitEvents = {})
     {
-        ExecuteCommandListsBlocking(std::span<ID3D12CommandList* const>(commandLists), waitEvent);
+        ExecuteCommandListsBlocking(std::span<ID3D12CommandList* const>(commandLists), waitEvents);
     }
 
     void WaitForEventCPU(FenceEvent& fenceEvent)

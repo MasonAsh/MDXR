@@ -8,6 +8,18 @@
 #include <iostream>
 #include <algorithm>
 
+#include <tiny_gltf.h>
+
+// Store descriptor sizes globally for convenience
+struct IncrementSizes
+{
+    int CbvSrvUav;
+    int Rtv;
+};
+extern IncrementSizes G_IncrementSizes;
+
+typedef ID3D12GraphicsCommandList4 GraphicsCommandList;
+
 inline void PrintCapabilities(ID3D12Device* device, IDXGIAdapter1* adapter)
 {
     D3D12_FEATURE_DATA_D3D12_OPTIONS featureSupport;
@@ -196,8 +208,13 @@ inline ComPtr<D3D12MA::Allocation> CreateUploadBufferWithData(D3D12MA::Allocator
         bufferSize = dataSize;
     }
 
+    if (bufferSize == 0) {
+        return nullptr;
+    }
+
     ComPtr<D3D12MA::Allocation> uploadBuffer;
     auto resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(bufferSize);
+
     D3D12MA::ALLOCATION_DESC allocDesc{};
     allocDesc.HeapType = D3D12_HEAP_TYPE_UPLOAD;
     ASSERT_HRESULT(
@@ -217,4 +234,81 @@ inline ComPtr<D3D12MA::Allocation> CreateUploadBufferWithData(D3D12MA::Allocator
     memcpy(*mapped, srcData, dataSize);
 
     return uploadBuffer;
+}
+
+// Creates an upload buffer with the specified data, or reallocates an existing one if not big enough.
+// The data will be updated if a suitable allocation already exists.
+inline void CreateOrReallocateUploadBufferWithData(D3D12MA::Allocator* allocator, ComPtr<D3D12MA::Allocation>& allocation, void* srcData, size_t dataSize, UINT64 bufferSize = SIZE_MAX, void** mappedPtr = nullptr)
+{
+    if (bufferSize == SIZE_MAX) {
+        bufferSize = dataSize;
+    }
+
+    if (bufferSize == 0) {
+        return;
+    }
+
+    bool needsAlloc = !allocation || allocation->GetResource()->GetDesc().Width < bufferSize;
+    if (needsAlloc) {
+        allocation = CreateUploadBufferWithData(allocator, srcData, dataSize, bufferSize, mappedPtr);
+    } else {
+        void* dest;
+        void** mapped = mappedPtr ? mappedPtr : &dest;
+        allocation->GetResource()->Map(0, nullptr, mapped);
+
+        memcpy(*mapped, srcData, dataSize);
+    }
+}
+
+inline void CreateAccelerationStructureBuffers(
+    D3D12MA::Allocator* allocator,
+    const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO& prebuildInfo,
+    ComPtr<D3D12MA::Allocation>& scratch,
+    ComPtr<D3D12MA::Allocation>& result
+)
+{
+    D3D12MA::ALLOCATION_DESC allocDesc = {};
+    allocDesc.HeapType = D3D12_HEAP_TYPE_DEFAULT;
+
+    {
+        CD3DX12_RESOURCE_DESC resDesc = CD3DX12_RESOURCE_DESC::Buffer(prebuildInfo.ScratchDataSizeInBytes);
+        resDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+        bool needsAlloc = !scratch || scratch->GetResource()->GetDesc().Width < prebuildInfo.ScratchDataSizeInBytes;
+
+        if (needsAlloc) {
+            allocator->CreateResource(
+                &allocDesc,
+                &resDesc,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                nullptr,
+                &scratch,
+                IID_NULL, nullptr
+            );
+        }
+    }
+
+    {
+        CD3DX12_RESOURCE_DESC resDesc = CD3DX12_RESOURCE_DESC::Buffer(prebuildInfo.ResultDataMaxSizeInBytes);
+        resDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+        bool needsAlloc = !result || result->GetResource()->GetDesc().Width < prebuildInfo.ResultDataMaxSizeInBytes;
+
+        if (needsAlloc) {
+            allocator->CreateResource(
+                &allocDesc,
+                &resDesc,
+                D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
+                nullptr,
+                &result,
+                IID_NULL, nullptr
+            );
+        }
+    }
+}
+
+template<class T>
+inline T Align(T size, T alignment)
+{
+    return (size + (alignment - 1)) & ~(alignment - 1);
 }

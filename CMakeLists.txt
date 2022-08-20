@@ -80,30 +80,30 @@ include_directories(thirdparty/D3D12MemoryAllocator/include)
 
 target_compile_definitions(mdxr
     PRIVATE
-        GLM_FORCE_RADIANS
-        GLM_FORCE_DEPTH_ZERO_TO_ONE
-        _CRT_SECURE_NO_WARNINGS
+    GLM_FORCE_RADIANS
+    GLM_FORCE_DEPTH_ZERO_TO_ONE
+    _CRT_SECURE_NO_WARNINGS
+    GLM_FORCE_XYZW_ONLY
     PUBLIC
-        $<$<CONFIG:Debug>:MDXR_DEBUG=1>
-        $<$<CONFIG:RelWithDebInfo>:MDXR_DEBUG=1 USE_PIX=1>
+    $<$<CONFIG:Debug>:MDXR_DEBUG=1>
+    $<$<CONFIG:RelWithDebInfo>:MDXR_DEBUG=1 USE_PIX=1>
 )
 
-target_link_libraries(mdxr 
+target_link_libraries(mdxr
     ${SDL2_LIBRARY}
-    ${SDL2MAIN_LIBRARY} 
-    DirectX-Headers 
-    DirectX-Guids 
-    D3d12 
-    DXGI 
-    D3DCompiler 
+    ${SDL2MAIN_LIBRARY}
+    DirectX-Headers
+    DirectX-Guids
+    D3d12
+    DXGI
+    D3DCompiler
     DXGuid
     ${NsightAftermath_LIBRARY}
     WinPixEventRuntime::WinPixEventRuntime
 )
 
 # file(COPY ${CMAKE_SOURCE_DIR}/D3D12 DESTINATION ${TARGET_FILE_DIR})
-
-add_custom_command(TARGET mdxr POST_BUILD 
-               COMMAND ${CMAKE_COMMAND} -E copy_directory
-               "${CMAKE_SOURCE_DIR}/D3D12"              
-                $<TARGET_FILE_DIR:mdxr>/D3D12)
+add_custom_command(TARGET mdxr POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+    "${CMAKE_SOURCE_DIR}/D3D12"
+    $<TARGET_FILE_DIR:mdxr>/D3D12)

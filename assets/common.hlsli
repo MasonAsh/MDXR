@@ -27,10 +27,12 @@ struct LightConstantData
     float4x4 MVP;
 
     float range;
-    uint directionalShadowMapDescriptorIdx;
+    uint shadowMapDescriptorIdx;
     uint type;
 
-    float pad[25];
+    uint castsShadow;
+
+    float pad[24];
 };
 
 #define LIGHT_POINT 0

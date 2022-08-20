@@ -180,7 +180,7 @@ void UpdateScene(App& app)
         app.Skybox.mesh->translation = app.camera.translation;
     }
 
-    UpdateRenderData(app, projection, view);
+    UpdateRenderData(app, projection, view, app.camera.translation);
 }
 
 void ReloadIfShaderChanged(App& app)

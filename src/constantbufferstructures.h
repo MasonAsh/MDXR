@@ -52,9 +52,22 @@ struct LightConstantData
     glm::mat4 MVP;
 
     float range;
-    UINT directionalShadowMapDescriptorIdx;
+    UINT shadowMapDescriptorIdx;
     UINT lightType;
 
-    float pad[25];
+    UINT castsShadow;
+
+    float pad[24];
 };
 static_assert((sizeof(LightConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
+
+struct RayTraceInfoConstantData
+{
+    glm::vec3 camPosWorld;
+    glm::mat4 projectionToWorld;
+    float tMin;
+    float tMax;
+
+    float pad[43];
+};
+static_assert((sizeof(RayTraceInfoConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");

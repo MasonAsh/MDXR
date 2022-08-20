@@ -28,6 +28,40 @@ PSInput VSMain(uint id : SV_VertexID)
     return result;
 }
 
+RaytracingAccelerationStructure GetSceneAccelStruct()
+{
+    return ResourceDescriptorHeap[g_MaterialDataIndex];
+}
+
+float ComputeShadow(LightConstantData light, float3 worldPos)
+{
+    if (!light.castsShadow) {
+        return 0.0f;
+    }
+
+    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_CULL_BACK_FACING_TRIANGLES>
+        rayQuery;
+
+    float3 hitToLight = -light.direction.xyz;
+
+    RayDesc ray;
+    ray.Origin = worldPos;
+    ray.Direction = normalize(hitToLight);
+    ray.TMin = 0.05;
+    ray.TMax = 1000.0f;
+
+    rayQuery.TraceRayInline(
+        GetSceneAccelStruct(),
+        0,
+        0xFF,
+        ray
+    );
+
+    rayQuery.Proceed();
+
+    return rayQuery.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 1.0f : 0.0f;
+}
+
 // P = position of point being shaded in view space
 // N = normal of point being shaded in view space
 float4 PSMain(PSInput input) : SV_TARGET
@@ -39,7 +73,6 @@ float4 PSMain(PSInput input) : SV_TARGET
     Texture2D normalTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + GBUFFER_NORMAL];
     Texture2D metalRoughnessTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + GBUFFER_METAL_ROUGHNESS];
     Texture2D depthTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + GBUFFER_DEPTH];
-    Texture2D shadowMap = ResourceDescriptorHeap[light.directionalShadowMapDescriptorIdx];
 
     float3 baseColor = baseColorTexture.Sample(g_sampler, input.uv).rgb;
     float depth = depthTexture.Sample(g_sampler, input.uv).r;
@@ -51,7 +84,8 @@ float4 PSMain(PSInput input) : SV_TARGET
 
     float4 viewPos = ScreenToView(float4(input.uv, depth, 1.0f));
 
-    float4 worldPos = mul(passData.inverseView, viewPos);
+    float3 worldPos = mul(passData.inverseView, viewPos).xyz;
+    float shadow = ComputeShadow(light, worldPos);
 
     float attenuation = 1.0f;
 
@@ -61,19 +95,6 @@ float4 PSMain(PSInput input) : SV_TARGET
     float3 Wi = normalize(-light.directionViewSpace.xyz);
     // Direction from fragment to eye
     float3 Wo = normalize(-viewPos.xyz);
-    
-    float4 lightPos = mul(light.MVP, float4(worldPos.xyz, 1.0f));
-
-    float3 projCoords = lightPos.xyz / lightPos.w;
-    projCoords.xy = projCoords.xy * 0.5f + 0.5f;
-    // DirectX UVs are vertically flipped from OpenGL
-    projCoords.y *= -1;
-    float closestDepth = shadowMap.Sample(g_sampler, projCoords.xy).r;
-    float currentDepth = projCoords.z;
-    float shadow = currentDepth > closestDepth ? 1.0f : 0.0f;
-
-    //if (passData.debug) return float4(projCoords.xy, 0.0f, 1.0f);
-    if (passData.debug) return (float4)closestDepth;
 
     float4 color = ShadePBR(
         light.colorIntensity.xyz,

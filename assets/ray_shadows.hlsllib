@@ -1,0 +1,144 @@
+#define NO_DEFAULT_RESOURCES
+#include "common.hlsli"
+
+#define PRIMARY_HIT_GROUP 0
+#define SHADOW_HIT_GROUP 1
+#define NUM_HIT_GROUPS 2
+#define MISS_SHADER 0
+
+cbuffer Indices : register(b0)
+{
+    uint g_RayTraceInfoIndex;
+    uint g_OutTexIndex;
+    uint g_LightIndex;
+    uint g_SceneAccelStruct;
+};
+
+struct RayTraceInfo
+{
+    float3 camPosWorld;
+    // float3 camForward;
+    // float3 camRight;
+    // float3 camUp;
+    float4x4 projectionToWorld;
+
+    float tMin;
+    float tMax;
+};
+
+struct ShadowPayload
+{
+    float shade;
+};
+
+ConstantBuffer<RayTraceInfo> GetRayTraceInfo()
+{
+    return ResourceDescriptorHeap[g_RayTraceInfoIndex];
+}
+
+RWTexture2D<float4> GetOutTex()
+{
+    return ResourceDescriptorHeap[g_OutTexIndex];
+}
+
+ConstantBuffer<LightConstantData> GetLight()
+{
+    return ResourceDescriptorHeap[g_LightIndex];
+}
+
+RaytracingAccelerationStructure GetSceneAccelStruct()
+{
+    return ResourceDescriptorHeap[g_SceneAccelStruct];
+}
+
+float3 GetRayDirection(RayTraceInfo rtInfo, uint2 rayIndex)
+{
+    float2 xy = rayIndex + 0.5f;
+    float2 screenPos = xy / DispatchRaysDimensions().xy * 2.0f - 1.0f;
+    screenPos.y = -screenPos.y;
+
+    float4 world = mul(float4(screenPos, 0, 1), rtInfo.projectionToWorld);
+    world.xyz /= world.w;
+
+    return normalize(world.xyz - rtInfo.camPosWorld);
+}
+
+[shader("raygeneration")]
+void RTRayGen()
+{
+    ConstantBuffer<RayTraceInfo> rtInfo = GetRayTraceInfo();
+
+    uint2 outPixel = DispatchRaysIndex().xy;
+
+    // float2 pixelLocation = outPixel + float2(0.5f, 0.5f);
+    // float2 pixelCenter = pixelLocation / (float2)DispatchRaysDimensions().xy;
+    // float2 ndc = float2(2, -2) * pixelCenter + float2(-1, 1);
+    // float3 rayDir = normalize(ndc.x * rtInfo.camRight + ndc.y * rtInfo.camUp + rtInfo.camForward);
+    float3 rayDir = GetRayDirection(rtInfo, outPixel);
+
+    uint rayFlags = 0;//RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH;
+
+    RayDesc ray;
+    ray.Origin = rtInfo.camPosWorld;
+    ray.Direction = rayDir;
+    ray.TMin = rtInfo.tMin;
+    ray.TMax = rtInfo.tMax;
+
+    ShadowPayload payload;
+
+    TraceRay(
+        GetSceneAccelStruct(),
+        rayFlags,
+        0xFF,
+        PRIMARY_HIT_GROUP,
+        NUM_HIT_GROUPS,
+        MISS_SHADER,
+        ray,
+        payload
+    );
+
+    GetOutTex()[outPixel] = payload.shade;
+}
+
+[shader("miss")]
+void RTMiss(inout ShadowPayload payload)
+{
+    payload.shade = 0.0f;
+}
+
+[shader("closesthit")]
+void RTPrimaryRayClosestHit(inout ShadowPayload payload : SV_RayPayload, BuiltInTriangleIntersectionAttributes attribs : SV_IntersectionAttributes)
+{
+    ConstantBuffer<LightConstantData> light = GetLight();
+
+    float3 hitPos = ObjectRayOrigin() + ObjectRayDirection() * RayTCurrent();
+    float3 hitToLight = light.position.xyz - hitPos;
+    float tMax = length(hitToLight);
+    float tMin = 0.05f;
+
+    uint rayFlags = 0;//RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH;
+
+    RayDesc ray;
+    ray.Origin = hitPos;
+    ray.Direction = normalize(hitToLight);
+    ray.TMin = tMin;
+    ray.TMax = tMax;
+
+    TraceRay(
+        GetSceneAccelStruct(),
+        rayFlags,
+        0xFF,
+        SHADOW_HIT_GROUP,
+        NUM_HIT_GROUPS,
+        MISS_SHADER,
+        ray,
+        payload
+    );
+}
+
+
+[shader("closesthit")]
+void RTShadowRayClosestHit(inout ShadowPayload payload : SV_RayPayload, BuiltInTriangleIntersectionAttributes attribs : SV_IntersectionAttributes)
+{
+    payload.shade = 1000.0f;
+}

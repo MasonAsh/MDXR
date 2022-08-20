@@ -7,7 +7,9 @@
 
 #include <d3dcompiler.h>
 
-void PSOManager::Reload(ID3D12Device2* device)
+#include "d3dutils.h"
+
+void PSOManager::Reload(ID3D12Device5* device)
 {
     shaderByteCodeCache.Invalidate();
 
@@ -107,7 +109,7 @@ std::mutex g_PSOMutex;
 
 ManagedPSORef CreatePSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const ShaderPaths& paths,
     ID3D12RootSignature* rootSignature,
     std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout,
@@ -140,7 +142,7 @@ ManagedPSORef CreatePSO(
 
 ManagedPSORef SimpleCreateGraphicsPSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const std::string& baseShaderPath,
     ID3D12RootSignature* rootSignature,
     std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout,
@@ -166,7 +168,7 @@ ManagedPSORef SimpleCreateGraphicsPSO(
 
 ManagedPSORef CreateComputePSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const std::string& baseShaderPath,
     ID3D12RootSignature* rootSignature,
     D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc
@@ -187,7 +189,7 @@ ManagedPSORef CreateComputePSO(
 
 ManagedPSORef CreateMipMapGeneratorPSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature
 )
@@ -204,7 +206,7 @@ ManagedPSORef CreateMipMapGeneratorPSO(
 
 ManagedPSORef CreateMeshPBRPSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -245,7 +247,7 @@ ManagedPSORef CreateMeshPBRPSO(
 
 ManagedPSORef CreateMeshAlphaBlendedPBRPSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -285,7 +287,7 @@ ManagedPSORef CreateMeshAlphaBlendedPBRPSO(
 
 ManagedPSORef CreateMeshUnlitPSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -310,7 +312,7 @@ ManagedPSORef CreateMeshUnlitPSO(
 
 ManagedPSORef CreateMeshUnlitTexturedPSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -335,7 +337,7 @@ ManagedPSORef CreateMeshUnlitTexturedPSO(
 
 ManagedPSORef CreateDirectionalLightPSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -355,7 +357,7 @@ ManagedPSORef CreateDirectionalLightPSO(
 
 ManagedPSORef CreateDirectionalLightShadowMapPSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -368,8 +370,8 @@ ManagedPSORef CreateDirectionalLightShadowMapPSO(
     psoDesc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
 
     float depthBias = -0.0005f;
-    psoDesc.RasterizerState.DepthBias = -(depthBias / (1.0f / pow(2.0, 23.0)));
-    psoDesc.RasterizerState.SlopeScaledDepthBias = -0.005;
+    psoDesc.RasterizerState.DepthBias = static_cast<int>(-(depthBias / (1.0f / pow(2.0f, 23.0f))));
+    psoDesc.RasterizerState.SlopeScaledDepthBias = -0.005f;
     psoDesc.RasterizerState.DepthBiasClamp = -0.05f;
 
     // No RTVs
@@ -395,7 +397,7 @@ ManagedPSORef CreateDirectionalLightShadowMapPSO(
 
 ManagedPSORef CreateEnvironmentCubemapLightPSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -415,7 +417,7 @@ ManagedPSORef CreateEnvironmentCubemapLightPSO(
 
 ManagedPSORef CreatePointLightPSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -436,7 +438,7 @@ ManagedPSORef CreatePointLightPSO(
 
 ManagedPSORef CreateSkyboxPSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -460,7 +462,7 @@ ManagedPSORef CreateSkyboxPSO(
 
 ManagedPSORef CreateSkyboxDiffuseIrradiancePSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -485,7 +487,7 @@ ManagedPSORef CreateSkyboxDiffuseIrradiancePSO(
 
 ManagedPSORef CreateSkyboxLightMapsPSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -510,7 +512,7 @@ ManagedPSORef CreateSkyboxLightMapsPSO(
 
 ManagedPSORef CreateSkyboxComputeLightMapsPSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -528,7 +530,7 @@ ManagedPSORef CreateSkyboxComputeLightMapsPSO(
 
 ManagedPSORef CreateToneMapPSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -569,3 +571,187 @@ ManagedPSORef CreateToneMapPSO(
         psoDesc
     );
 }
+
+/// Wrote this before learning about DXR 1.1
+/// Leaving it here for reference in case old style ray tracing is needed in the future.
+
+// struct ShaderRecord
+// {
+//     void* identifier;
+//     UINT size;
+// };
+// RayTraceStateObjectRef CreateRTShadowSO(
+//     PSOManager& manager,
+//     ID3D12Device5* device,
+//     D3D12MA::Allocator* allocator,
+//     const std::string& dataDir,
+//     ID3D12RootSignature* rootSignature,
+//     RTShaderTable* shaderTable
+// )
+// {
+//     RayTraceStateObjectRef obj = RayTraceStateObjectRef(new RayTraceStateObject);
+
+//     {
+//         auto rtConfig = obj->desc.CreateSubobject<CD3DX12_RAYTRACING_PIPELINE_CONFIG_SUBOBJECT>();
+//         UINT maxRecursionDepth = 2; // Primary and shadow rays
+//         rtConfig->Config(maxRecursionDepth);
+//     }
+
+//     const auto RTRayGenName = L"RTRayGen";
+//     const auto RTMissName = L"RTMiss";
+//     const auto RTPrimaryRayClosestHitName = L"RTPrimaryRayClosestHit";
+//     const auto RTShadowRayClosestHitName = L"RTShadowRayClosestHit";
+//     const auto PrimaryHitGroupName = L"PrimaryHitGroup";
+//     const auto ShadowHitGroupName = L"ShadowHitGroup";
+
+//     // Configure DXIL library
+//     {
+//         obj->dxilLibPath = dataDir + "ray_shadows.clib";
+//         auto DXIL = manager.shaderByteCodeCache.Fetch(obj->dxilLibPath);
+//         auto dxilLib = obj->desc.CreateSubobject<CD3DX12_DXIL_LIBRARY_SUBOBJECT>();
+//         dxilLib->SetDXILLibrary(
+//             &DXIL
+//         );
+
+//         dxilLib->DefineExport(
+//             RTRayGenName
+//         );
+
+//         dxilLib->DefineExport(
+//             RTMissName
+//         );
+
+//         dxilLib->DefineExport(
+//             RTPrimaryRayClosestHitName
+//         );
+
+//         dxilLib->DefineExport(
+//             RTShadowRayClosestHitName
+//         );
+//     }
+
+//     // Shader config
+//     {
+//         auto shaderConfig = obj->desc.CreateSubobject<CD3DX12_RAYTRACING_SHADER_CONFIG_SUBOBJECT>();
+//         UINT payloadSize = sizeof(float); // float shade;
+//         UINT attributeSize = 2 * sizeof(float); // built in triangle intersection
+//         shaderConfig->Config(payloadSize, attributeSize);
+//     }
+
+//     const int NUM_HIT_GROUPS = 2;
+
+//     {
+//         auto primaryHitGroup = obj->desc.CreateSubobject<CD3DX12_HIT_GROUP_SUBOBJECT>();
+//         primaryHitGroup->SetClosestHitShaderImport(
+//             RTPrimaryRayClosestHitName
+//         );
+//         primaryHitGroup->SetHitGroupExport(
+//             PrimaryHitGroupName
+//         );
+//         primaryHitGroup->SetHitGroupType(
+//             D3D12_HIT_GROUP_TYPE_TRIANGLES
+//         );
+//     }
+
+//     {
+//         auto shadowHitGroup = obj->desc.CreateSubobject<CD3DX12_HIT_GROUP_SUBOBJECT>();
+//         shadowHitGroup->SetClosestHitShaderImport(
+//             RTShadowRayClosestHitName
+//         );
+//         shadowHitGroup->SetHitGroupExport(
+//             ShadowHitGroupName
+//         );
+//         shadowHitGroup->SetHitGroupType(
+//             D3D12_HIT_GROUP_TYPE_TRIANGLES
+//         );
+//     }
+
+//     // Seems we can use the same graphics root signature here.
+//     {
+//         auto globalRootSignature = obj->desc.CreateSubobject<CD3DX12_GLOBAL_ROOT_SIGNATURE_SUBOBJECT>();
+//         globalRootSignature->SetRootSignature(rootSignature);
+//     }
+
+//     ASSERT_HRESULT(obj->Compile(device));
+
+//     ComPtr<ID3D12StateObjectProperties> stateObjectProperties;
+//     ASSERT_HRESULT(obj->SO.As(&stateObjectProperties));
+
+//     void* rayGenIdentifier = stateObjectProperties->GetShaderIdentifier(
+//         RTRayGenName
+//     );
+
+//     void* primaryHitIdentifier = stateObjectProperties->GetShaderIdentifier(
+//         PrimaryHitGroupName
+//     );
+
+//     void* shadowHitIdentifier = stateObjectProperties->GetShaderIdentifier(
+//         ShadowHitGroupName
+//     );
+
+//     void* missIdentifier = stateObjectProperties->GetShaderIdentifier(
+//         RTMissName
+//     );
+
+//     const int NUM_MISS_SHADERS = 1;
+
+//     const void* identifiers[] = {
+//         rayGenIdentifier,
+//         primaryHitIdentifier,
+//         shadowHitIdentifier,
+//         missIdentifier
+//     };
+
+//     UINT shaderIdentifierSize = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES;
+
+//     UINT8* destPtr;
+//     shaderTable->allocation = CreateUploadBufferWithData(
+//         allocator,
+//         nullptr,
+//         0,
+//         shaderIdentifierSize * (_countof(identifiers) + 4),
+//         reinterpret_cast<void**>(&destPtr)
+//     );
+
+//     // for (int i = 0; i < _countof(identifiers); i++) {
+//     //     memcpy(destPtr + i * shaderIdentifierSize, identifiers[i], shaderIdentifierSize);
+//     // }
+
+//     // Copy ray gen identifier
+//     UINT8* target = destPtr;
+//     memcpy(target, identifiers[0], shaderIdentifierSize);
+//     target += shaderIdentifierSize;
+//     target = reinterpret_cast<UINT8*>(
+//         Align<UINT64>(reinterpret_cast<UINT64>(target), D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT)
+//         );
+
+//     // Hit groups
+//     memcpy(target, identifiers[1], shaderIdentifierSize);
+//     target += shaderIdentifierSize;
+//     memcpy(target, identifiers[2], shaderIdentifierSize);
+//     target += shaderIdentifierSize;
+//     target = reinterpret_cast<UINT8*>(
+//         Align<UINT64>(reinterpret_cast<UINT64>(target), D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT)
+//         );
+
+//     memcpy(target, identifiers[3], shaderIdentifierSize);
+
+//     shaderTable->RayGenerationShaderRecord.StartAddress = shaderTable->allocation->GetResource()->GetGPUVirtualAddress();
+//     shaderTable->RayGenerationShaderRecord.SizeInBytes = shaderIdentifierSize;
+
+//     shaderTable->HitGroupTable.StrideInBytes = shaderIdentifierSize;
+//     shaderTable->HitGroupTable.SizeInBytes = NUM_HIT_GROUPS * shaderIdentifierSize;
+//     shaderTable->HitGroupTable.StartAddress =
+//         Align<UINT64>(shaderTable->RayGenerationShaderRecord.StartAddress + shaderTable->RayGenerationShaderRecord.SizeInBytes, D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT);
+
+//     shaderTable->MissShaderTable.StartAddress =
+//         Align<UINT64>(shaderTable->HitGroupTable.StartAddress + shaderTable->HitGroupTable.SizeInBytes, D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT);
+//     shaderTable->MissShaderTable.StrideInBytes = shaderIdentifierSize;
+//     shaderTable->MissShaderTable.SizeInBytes = shaderIdentifierSize * NUM_MISS_SHADERS;
+
+//     shaderTable->CallableShaderTable.SizeInBytes = 0;
+//     shaderTable->CallableShaderTable.StartAddress = 0;
+//     shaderTable->CallableShaderTable.StrideInBytes = 0;
+
+//     return obj;
+// }

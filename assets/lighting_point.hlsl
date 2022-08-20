@@ -29,6 +29,42 @@ PSInput VSMain(uint id : SV_VertexID)
     return result;
 }
 
+RaytracingAccelerationStructure GetSceneAccelStruct()
+{
+    return ResourceDescriptorHeap[g_MaterialDataIndex];
+}
+
+float ComputeShadow(LightConstantData light, float3 worldPos)
+{
+    if (!light.castsShadow) {
+        return 0.0f;
+    }
+
+    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_CULL_BACK_FACING_TRIANGLES>
+        rayQuery;
+
+    float3 hitToLight = light.position.xyz -  worldPos.xyz;
+
+    float tMax = length(hitToLight);
+
+    RayDesc ray;
+    ray.Origin = worldPos;
+    ray.Direction = normalize(hitToLight);
+    ray.TMin = 0.05;
+    ray.TMax = tMax;
+
+    rayQuery.TraceRayInline(
+        GetSceneAccelStruct(),
+        0,
+        0xFF,
+        ray
+    );
+
+    rayQuery.Proceed();
+
+    return rayQuery.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 1.0f : 0.0f;
+}
+
 // P = position of point being shaded in view space
 // N = normal of point being shaded in view space
 float4 PSMain(PSInput input) : SV_TARGET
@@ -37,24 +73,27 @@ float4 PSMain(PSInput input) : SV_TARGET
 
     float4 finalColor = (float4)0;
 
+    ConstantBuffer<LightPassConstantData> passData = GetLightPassData();
+    Texture2D baseColorTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + GBUFFER_BASE_COLOR];
+    Texture2D normalTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + GBUFFER_NORMAL];
+    Texture2D metalRoughnessTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + GBUFFER_METAL_ROUGHNESS];
+    Texture2D depthTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + GBUFFER_DEPTH];
+
+    float3 baseColor = baseColorTexture.Sample(g_sampler, input.uv).rgb;
+    float depth = depthTexture.Sample(g_sampler, input.uv).r;
+    float4 normal = normalTexture.Sample(g_sampler, input.uv);
+    float4 metalRoughness = metalRoughnessTexture.Sample(g_sampler, input.uv);
+
+    float4 viewPos = ScreenToView(float4(input.uv, depth, 1.0f));
+    float3 worldPos = mul(passData.inverseView, viewPos).xyz;
+
     for (uint i = 0; i < lightCount; i++) {
-        ConstantBuffer<LightPassConstantData> passData = GetLightPassData();
         ConstantBuffer<LightConstantData> light = GetLightAtOffset(i);
 
-        Texture2D baseColorTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + GBUFFER_BASE_COLOR];
-        Texture2D normalTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + GBUFFER_NORMAL];
-        Texture2D metalRoughnessTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + GBUFFER_METAL_ROUGHNESS];
-        Texture2D depthTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + GBUFFER_DEPTH];
-
-        float3 baseColor = baseColorTexture.Sample(g_sampler, input.uv).rgb;
-        float depth = depthTexture.Sample(g_sampler, input.uv).r;
-        float4 normal = normalTexture.Sample(g_sampler, input.uv);
-        float4 metalRoughness = metalRoughnessTexture.Sample(g_sampler, input.uv);
+        float shadow = ComputeShadow(light, worldPos);
 
         float roughness = metalRoughness.g;
         float metallic = metalRoughness.b;
-
-        float4 viewPos = ScreenToView(float4(input.uv, depth, 1.0f));
 
         float3 lightToFragment = (-viewPos.xyz) -  (-light.positionViewSpace.xyz);
         float distance = length(lightToFragment);
@@ -67,7 +106,7 @@ float4 PSMain(PSInput input) : SV_TARGET
         // Direction from fragment to eye
         float3 Wo = normalize(-viewPos.xyz);
 
-        finalColor += ShadePBR(
+        float4 color = ShadePBR(
             light.colorIntensity.xyz,
             float4(baseColor, 1.0f),
             N,
@@ -76,7 +115,9 @@ float4 PSMain(PSInput input) : SV_TARGET
             Wi,
             Wo,
             attenuation
-        );
+        ); 
+        color.rgb *= 1.0f - shadow;
+        finalColor += color;
     }
 
     return finalColor;

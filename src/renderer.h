@@ -9,6 +9,6 @@ void HandleResize(App& app, int newWidth, int newHeight);
 void InitRenderer(App& app);
 void DestroyRenderer(App& app);
 
-void UpdateRenderData(App& app, const glm::mat4& projection, const glm::mat4& view);
+void UpdateRenderData(App& app, const glm::mat4& projection, const glm::mat4& view, const glm::vec3& camPos);
 void WaitForPreviousFrame(App& app);
 void RenderFrame(App& app);

@@ -19,6 +19,7 @@
 #include <string>
 #include <limits>
 #include <sstream>
+#include <fstream>
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_access.hpp>
@@ -118,6 +119,9 @@ public:
     ~DebugLog()
     {
         OutputDebugStringA(ss.str().c_str());
+        std::ofstream outlog;
+        outlog.open("debug.txt", std::ios_base::app);
+        outlog << ss.str().c_str() << "\n";
     }
 
     template<class T>

@@ -10,6 +10,7 @@ using namespace Microsoft::WRL;
 #include "util.h"
 
 #include "d3dcompiler.h"
+#include <D3D12MemAlloc.h>
 
 #include <mutex>
 #include <map>
@@ -105,7 +106,7 @@ struct ManagedPSO
         return true;
     }
 
-    void Reload(ID3D12Device2* device, ShaderByteCodeCache& cache)
+    void Reload(ID3D12Device5* device, ShaderByteCodeCache& cache)
     {
         auto oldVS = desc.VS;
         auto oldPS = desc.PS;
@@ -122,7 +123,7 @@ struct ManagedPSO
         }
     }
 
-    HRESULT Compile(ID3D12Device2* device)
+    HRESULT Compile(ID3D12Device5* device)
     {
         D3D12_PIPELINE_STATE_STREAM_DESC streamDesc{};
         streamDesc.SizeInBytes = sizeof(desc);
@@ -198,20 +199,55 @@ struct ManagedPSO
     }
 };
 
+// Managed ID3D12StateObject for DXR.
+//
+// At this point, DX12 does not support using state objects for graphics and compute
+// pipelines, so we need this completely different system for ray tracing pipelines :/
+struct RayTraceStateObject
+{
+    ComPtr<ID3D12StateObject> SO;
+    std::string dxilLibPath;
+    CD3DX12_STATE_OBJECT_DESC desc{ D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE };
+
+    bool Load(ShaderByteCodeCache& cache)
+    {
+        auto DXIL = cache.Fetch(dxilLibPath);
+        if (!DXIL.pShaderBytecode) {
+            return false;
+        }
+
+        auto DXILLib = desc.CreateSubobject<CD3DX12_DXIL_LIBRARY_SUBOBJECT>();
+        DXILLib->SetDXILLibrary(&DXIL);
+
+        return true;
+    }
+
+    HRESULT Compile(
+        ID3D12Device5* device
+    )
+    {
+        return device->CreateStateObject(
+            desc,
+            IID_PPV_ARGS(&SO)
+        );
+    }
+};
+
 typedef std::shared_ptr<ManagedPSO> ManagedPSORef;
+typedef std::shared_ptr<RayTraceStateObject> RayTraceStateObjectRef;
 
 struct PSOManager
 {
     std::vector<std::weak_ptr<ManagedPSO>> PSOs;
     ShaderByteCodeCache shaderByteCodeCache;
 
-    void Reload(ID3D12Device2* device);
+    void Reload(ID3D12Device5* device);
     ManagedPSORef FindPSO(UINT hash);
 };
 
 ManagedPSORef CreatePSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const ShaderPaths& paths,
     ID3D12RootSignature* rootSignature,
     std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout,
@@ -220,7 +256,7 @@ ManagedPSORef CreatePSO(
 
 ManagedPSORef SimpleCreateGraphicsPSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const std::string& baseShaderPath,
     ID3D12RootSignature* rootSignature,
     std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout,
@@ -229,7 +265,7 @@ ManagedPSORef SimpleCreateGraphicsPSO(
 
 ManagedPSORef CreateComputePSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const std::string& baseShaderPath,
     ID3D12RootSignature* rootSignature,
     D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc
@@ -237,14 +273,14 @@ ManagedPSORef CreateComputePSO(
 
 ManagedPSORef CreateMipMapGeneratorPSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature
 );
 
 ManagedPSORef CreateMeshPBRPSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -252,7 +288,7 @@ ManagedPSORef CreateMeshPBRPSO(
 
 ManagedPSORef CreateMeshAlphaBlendedPBRPSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -260,7 +296,7 @@ ManagedPSORef CreateMeshAlphaBlendedPBRPSO(
 
 ManagedPSORef CreateMeshUnlitPSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -268,7 +304,7 @@ ManagedPSORef CreateMeshUnlitPSO(
 
 ManagedPSORef CreateMeshUnlitTexturedPSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -276,7 +312,7 @@ ManagedPSORef CreateMeshUnlitTexturedPSO(
 
 ManagedPSORef CreateDirectionalLightPSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -284,7 +320,7 @@ ManagedPSORef CreateDirectionalLightPSO(
 
 ManagedPSORef CreateDirectionalLightShadowMapPSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -292,7 +328,7 @@ ManagedPSORef CreateDirectionalLightShadowMapPSO(
 
 ManagedPSORef CreateEnvironmentCubemapLightPSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -300,7 +336,7 @@ ManagedPSORef CreateEnvironmentCubemapLightPSO(
 
 ManagedPSORef CreatePointLightPSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -308,7 +344,7 @@ ManagedPSORef CreatePointLightPSO(
 
 ManagedPSORef CreateSkyboxPSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -316,7 +352,7 @@ ManagedPSORef CreateSkyboxPSO(
 
 ManagedPSORef CreateSkyboxDiffuseIrradiancePSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -324,7 +360,7 @@ ManagedPSORef CreateSkyboxDiffuseIrradiancePSO(
 
 ManagedPSORef CreateSkyboxLightMapsPSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -332,7 +368,7 @@ ManagedPSORef CreateSkyboxLightMapsPSO(
 
 ManagedPSORef CreateSkyboxComputeLightMapsPSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
@@ -340,8 +376,27 @@ ManagedPSORef CreateSkyboxComputeLightMapsPSO(
 
 ManagedPSORef CreateToneMapPSO(
     PSOManager& manager,
-    ID3D12Device2* device,
+    ID3D12Device5* device,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
+);
+
+struct RTShaderTable
+{
+    ComPtr<D3D12MA::Allocation> allocation;
+
+    D3D12_GPU_VIRTUAL_ADDRESS_RANGE RayGenerationShaderRecord;
+    D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE MissShaderTable;
+    D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE HitGroupTable;
+    D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE CallableShaderTable;
+};
+
+RayTraceStateObjectRef CreateRTShadowSO(
+    PSOManager& manager,
+    ID3D12Device5* device,
+    D3D12MA::Allocator* allocator,
+    const std::string& dataDir,
+    ID3D12RootSignature* rootSignature,
+    RTShaderTable* shaderTable
 );

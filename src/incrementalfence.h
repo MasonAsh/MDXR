@@ -60,7 +60,7 @@ public:
         event.sourceFence = this;
     }
 
-    void WaitQueue(ID3D12CommandQueue* commandQueue, FenceEvent& event)
+    void WaitQueue(ID3D12CommandQueue* commandQueue, const FenceEvent& event)
     {
         CHECK(event.sourceFence == this || event.fenceValue == UINT64_MAX);
 

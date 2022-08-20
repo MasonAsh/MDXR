@@ -7,6 +7,7 @@
 #include "commandqueue.h"
 #include "descriptorpool.h"
 #include "constantbufferstructures.h"
+#include "d3dutils.h"
 
 #include <SDL.h>
 
@@ -133,12 +134,13 @@ struct Primitive
     // For example, the skybox uses this for the texcube shader parameter.
     DescriptorRef miscDescriptorParameter;
 
-    ManagedPSORef directionalShadowPSO;
-
     SharedPoolItem<Material> material = nullptr;
 
     AABB localBoundingBox;
     bool cull;
+
+    ComPtr<D3D12MA::Allocation> blasResult;
+    ComPtr<D3D12MA::Allocation> blasScratch;
 };
 
 struct Mesh
@@ -177,7 +179,6 @@ struct Model
 
     UniqueDescriptors primitiveDataDescriptors;
     UniqueDescriptors baseTextureDescriptor;
-    DescriptorRef baseMaterialDescriptor;
 
     // All of the child mesh constant buffers stored in this constant buffer
     ComPtr<ID3D12Resource> perPrimitiveConstantBuffer;
@@ -215,14 +216,6 @@ struct ControllerState {
     // X is left trigger and Y is right trigger
     glm::vec2 triggerState;
 };
-
-// Store descriptor sizes globally for convenience
-struct IncrementSizes
-{
-    int CbvSrvUav;
-    int Rtv;
-};
-extern IncrementSizes G_IncrementSizes;
 
 template<class T>
 struct ConstantBufferSlice
@@ -383,9 +376,9 @@ struct AssetLoadContext
 enum RenderThreadType
 {
     RenderThread_GBufferPass,
-    RenderThread_ShadowPass,
     RenderThread_LightPass,
     RenderThread_AlphaBlendPass,
+    //RenderThread_ShadowPass,
     RenderThread_Count,
 };
 
@@ -399,7 +392,7 @@ struct RenderThread
     std::condition_variable beginWork;
     std::condition_variable workFinished;
 
-    ComPtr<ID3D12GraphicsCommandList> commandList;
+    ComPtr<GraphicsCommandList> commandList;
     ComPtr<ID3D12CommandAllocator> commandAllocator;
 };
 
@@ -415,17 +408,22 @@ struct Light
 
     LightType lightType;
 
-    ComPtr<D3D12MA::Allocation> directionalShadowMap;
-    UniqueDescriptors directionalShadowMapSRV;
-    UniqueDescriptors directionalShadowMapDSV;
+    bool castsShadow = true;
 
-    UINT directionalShadowMapSize = 4096;
-    float frustumSize = 30.0f;
+    // Screen space ray-traced shadow
+    struct {
+        ComPtr<D3D12MA::Allocation> texture;
+        UniqueDescriptors SRV;
+        UniqueDescriptors UAV;
+        UniqueDescriptors DSV;
+    } RayTracedShadow;
 
-    PoolItem<PrimitiveInstanceConstantData> sphereInstanceData;
+    UINT shadowMapSize = 4096;
 
     float radianceThreshold = 0.001;
 
+    // FIXME: CURRENTLY UNUSED
+    //
     // Point lights follow the inverse square law and don't have a radius.
     // But for optimization purposes we need to limit the range of the light.
     // So we compute the effective radius using radianceThreshold^
@@ -447,30 +445,31 @@ struct Light
         constantData->directionViewSpace = viewMatrix * glm::normalize(constantData->direction);
         constantData->colorIntensity = glm::vec4(color * intensity, 1.0f);
         constantData->range = range;
-        constantData->directionalShadowMapDescriptorIdx = directionalShadowMapSRV.Index();
+        constantData->shadowMapDescriptorIdx = RayTracedShadow.SRV.Index();
         constantData->lightType = (UINT)lightType;
+        constantData->castsShadow = castsShadow;
 
         if (lightType == LightType_Point) {
             float CI = glm::length(color * intensity);
             effectiveRadius = sqrtf(1.0f / (radianceThreshold * CI));
         }
 
-        if (lightType == LightType_Directional) {
-            DirectX::XMMATRIX mat = DirectX::XMMatrixOrthographicRH(frustumSize, frustumSize, -frustumSize, frustumSize);
-            //glm::mat4 directionalProjection = glm::transpose(glm::make_mat4(reinterpret_cast<float*>(&mat.r)));
-            glm::mat4 directionalProjection = glm::ortho(-frustumSize, frustumSize, -frustumSize, frustumSize, 0.1f, frustumSize * 2.0f);
-            //glm::mat4 directionalProjection = glm::perspective(0.628319f, 1.0f, 0.1f, 10.0f);
-            glm::vec3 eye = -normalizedDirection * frustumSize * 1.2f;
+        // if (lightType == LightType_Directional) {
+        //     DirectX::XMMATRIX mat = DirectX::XMMatrixOrthographicRH(frustumSize, frustumSize, -frustumSize, frustumSize);
+        //     //glm::mat4 directionalProjection = glm::transpose(glm::make_mat4(reinterpret_cast<float*>(&mat.r)));
+        //     glm::mat4 directionalProjection = glm::ortho(-frustumSize, frustumSize, -frustumSize, frustumSize, 0.1f, frustumSize * 2.0f);
+        //     //glm::mat4 directionalProjection = glm::perspective(0.628319f, 1.0f, 0.1f, 10.0f);
+        //     glm::vec3 eye = -normalizedDirection * frustumSize * 1.2f;
 
-            glm::vec3 up(0.0f, 1.0f, 0.0f);
-            if (abs(glm::dot(up, normalizedDirection)) > 0.99f) {
-                // If the light is pointing straight up or down, we can't use the normal up vector
-                up = glm::vec3(1.0f, 0.0f, 0.0f);
-            }
+        //     glm::vec3 up(0.0f, 1.0f, 0.0f);
+        //     if (abs(glm::dot(up, normalizedDirection)) > 0.99f) {
+        //         // If the light is pointing straight up or down, we can't use the normal up vector
+        //         up = glm::vec3(1.0f, 0.0f, 0.0f);
+        //     }
 
-            glm::mat4 directionalView = glm::lookAt(eye, glm::vec3(0, 0, 0), up);
-            constantData->MVP = directionalProjection * directionalView;
-        }
+        //     glm::mat4 directionalView = glm::lookAt(eye, glm::vec3(0, 0, 0), up);
+        //     constantData->MVP = directionalProjection * directionalView;
+        // }
     }
 };
 
@@ -504,6 +503,7 @@ struct App
     DescriptorPool descriptorPool;
     DescriptorPool rtvDescriptorPool;
     DescriptorPool dsvDescriptorPool;
+    ComPtr<D3D12MA::Allocator> mainAllocator;
 
     std::string dataDir;
     std::wstring wDataDir;
@@ -535,14 +535,14 @@ struct App
     Pool<Material, 128> materials;
     ConstantBufferArena<MaterialConstantData> materialConstantBuffer;
 
-    ComPtr<ID3D12Device2> device;
+    ComPtr<ID3D12Device5> device;
     CommandQueue graphicsQueue;
     ComPtr<ID3D12CommandAllocator> commandAllocator;
     ComPtr<IDXGISwapChain3> swapChain;
     ComPtr<ID3D12Resource> renderTargets[FrameBufferCount];
     ComPtr<ID3D12RootSignature> rootSignature;
     ComPtr<ID3D12PipelineState> pipelineState;
-    ComPtr<ID3D12GraphicsCommandList> commandList;
+    ComPtr<GraphicsCommandList> commandList;
     CD3DX12_VIEWPORT viewport;
     CD3DX12_RECT scissorRect;
 
@@ -558,7 +558,7 @@ struct App
 
     CommandQueue copyQueue;
     ComPtr<ID3D12CommandAllocator> copyCommandAllocator;
-    ComPtr<ID3D12GraphicsCommandList> copyCommandList;
+    ComPtr<GraphicsCommandList> copyCommandList;
 
     Scene scene;
     std::vector<Model> models;
@@ -566,6 +566,7 @@ struct App
     unsigned int frameIdx;
 
     FenceEvent previousFrameEvent;
+    FenceEvent shadowComputeEvent;
 
     DescriptorRef frameBufferRTVs[FrameBufferCount];
     DescriptorRef nonSRGBFrameBufferRTVs[FrameBufferCount];
@@ -590,8 +591,6 @@ struct App
         UniqueDescriptors debugSRV;
     } ImGui;
 
-
-    ComPtr<D3D12MA::Allocator> mainAllocator;
 
     struct
     {
@@ -632,6 +631,25 @@ struct App
         float gamma = 2.2f;
         float exposure = 1.0f;
     } PostProcessPass;
+
+    struct
+    {
+        ComPtr<D3D12MA::Allocation> scratch;
+        ComPtr<D3D12MA::Allocation> result;
+        ComPtr<D3D12MA::Allocation> instancesUploadBuffer;
+        UniqueDescriptors descriptor;
+    } TLAS;
+
+    // DXR 1.0
+    // struct
+    // {
+    //     RayTraceStateObjectRef rtShadowSO;
+    //     RTShaderTable rtShadowShaderTable;
+
+    //     RayTraceInfoConstantData* rtInfoPtr;
+    //     ComPtr<D3D12MA::Allocation> rtInfoAllocation;
+    //     UniqueDescriptors rtInfoDescriptor;
+    // } ShadowPass;
 
     struct
     {

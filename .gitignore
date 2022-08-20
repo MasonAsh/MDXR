@@ -2,3 +2,4 @@ build/
 .vscode/
 data/*.pdb
 imgui.ini
+.debug

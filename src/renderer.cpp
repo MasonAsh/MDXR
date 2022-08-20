@@ -255,7 +255,7 @@ void CreateMainRootSignature(App& app)
 
 void SetupMipMapGenerator(App& app)
 {
-    ID3D12Device2* device = app.device.Get();
+    ID3D12Device5* device = app.device.Get();
     D3D12_FEATURE_DATA_ROOT_SIGNATURE featureData = {};
     featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_1;
     if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &featureData, sizeof(featureData))))
@@ -410,6 +410,40 @@ void SetupLightPass(App& app)
     );
 }
 
+// void SetupShadowPass(App& app)
+// {
+//     app.ShadowPass.rtShadowSO = CreateRTShadowSO(
+//         app.psoManager,
+//         app.device.Get(),
+//         app.mainAllocator.Get(),
+//         app.dataDir,
+//         app.rootSignature.Get(),
+//         &app.ShadowPass.rtShadowShaderTable
+//     );
+
+//     app.ShadowPass.rtInfoAllocation = CreateUploadBufferWithData(
+//         app.mainAllocator.Get(),
+//         nullptr,
+//         0,
+//         sizeof(RayTraceInfoConstantData),
+//         reinterpret_cast<void**>(&app.ShadowPass.rtInfoPtr)
+//     );
+//     app.ShadowPass.rtInfoAllocation->GetResource()->SetName(L"RayTraceInfoConstantData");
+
+//     app.ShadowPass.rtInfoDescriptor = AllocateDescriptorsUnique(app.descriptorPool, 1, "ShadowPass RTInfo");
+
+//     {
+//         D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
+//         cbvDesc.BufferLocation = app.ShadowPass.rtInfoAllocation->GetResource()->GetGPUVirtualAddress();
+//         cbvDesc.SizeInBytes = sizeof(RayTraceInfoConstantData);
+
+//         app.device->CreateConstantBufferView(
+//             &cbvDesc,
+//             app.ShadowPass.rtInfoDescriptor.CPUHandle()
+//         );
+//     }
+// }
+
 void SetupPostProcessPass(App& app)
 {
     // No input layout
@@ -429,7 +463,7 @@ void RenderWorker(App& app)
 {
     auto& renderThread = app.renderThreads[threadType];
     ID3D12CommandAllocator* commandAllocator = renderThread.commandAllocator.Get();
-    ID3D12GraphicsCommandList* commandList = renderThread.commandList.Get();
+    GraphicsCommandList* commandList = renderThread.commandList.Get();
 
     while (app.running) {
         std::unique_lock lock(renderThread.mutex);
@@ -457,32 +491,47 @@ void RenderWorker(App& app)
     }
 }
 
-void GBufferPass(App&, ID3D12GraphicsCommandList*);
-void ShadowPass(App&, ID3D12GraphicsCommandList*);
-void LightPass(App&, ID3D12GraphicsCommandList*);
-void AlphaBlendPass(App&, ID3D12GraphicsCommandList*);
-void PostProcessPass(App&, ID3D12GraphicsCommandList*);
+void GBufferPass(App&, GraphicsCommandList*);
+void ShadowPass(App&, GraphicsCommandList*);
+void LightPass(App&, GraphicsCommandList*);
+void AlphaBlendPass(App&, GraphicsCommandList*);
+void PostProcessPass(App&, GraphicsCommandList*);
 
 template<auto WorkerFunc, unsigned threadType>
 void StartRenderThread(App& app)
 {
     auto& renderThread = app.renderThreads[threadType];
 
+    auto commandListType = D3D12_COMMAND_LIST_TYPE_DIRECT;
+
     ASSERT_HRESULT(app.device->CreateCommandAllocator(
-        D3D12_COMMAND_LIST_TYPE_DIRECT,
+        commandListType,
         IID_PPV_ARGS(&renderThread.commandAllocator)
     ));
 
     ASSERT_HRESULT(app.device->CreateCommandList(
         0,
-        D3D12_COMMAND_LIST_TYPE_DIRECT,
+        commandListType,
         renderThread.commandAllocator.Get(),
         nullptr,
         IID_PPV_ARGS(&renderThread.commandList)
     ));
     renderThread.commandList->Close();
 
-    renderThread.commandList->SetName(convert_to_wstring(typeid(WorkerFunc).name()).c_str());
+    std::wstring commandListName;
+    switch (threadType) {
+    case RenderThread_GBufferPass:
+        commandListName = L"GBufferPass";
+        break;
+    case RenderThread_LightPass:
+        commandListName = L"LightPass";
+        break;
+    case RenderThread_AlphaBlendPass:
+        commandListName = L"AlphaBlendPass";
+        break;
+    };
+
+    renderThread.commandList->SetName(commandListName.c_str());
 
     renderThread.thread = std::thread(
         &RenderWorker<WorkerFunc, threadType>,
@@ -494,20 +543,21 @@ void StartRenderThreads(App& app)
 {
     StartAssetThread(app);
     StartRenderThread<GBufferPass, RenderThread_GBufferPass>(app);
-    StartRenderThread<ShadowPass, RenderThread_ShadowPass>(app);
     StartRenderThread<LightPass, RenderThread_LightPass>(app);
     StartRenderThread<AlphaBlendPass, RenderThread_AlphaBlendPass>(app);
 }
 
-void NotifyAndWaitRenderThreads(App& app)
+
+void NotifyRenderThreads(App& app)
 {
-    // Notify
     for (auto& renderThread : app.renderThreads) {
         renderThread.workIsAvailable = true;
         renderThread.beginWork.notify_one();
     }
+}
 
-    // Wait
+void WaitRenderThreads(App& app)
+{
     for (auto& renderThread : app.renderThreads) {
         std::unique_lock lock(renderThread.mutex);
         renderThread.workFinished.wait(lock, [&] { return !renderThread.workIsAvailable; });
@@ -524,6 +574,74 @@ void LoadInternalModels(App& app)
     //         app.LightBuffer.pointLightSphere = model.meshes[0].get();
     //     }
     // );
+}
+
+void D3DMessageCallback(
+    D3D12_MESSAGE_CATEGORY category,
+    D3D12_MESSAGE_SEVERITY severity,
+    D3D12_MESSAGE_ID ID,
+    LPCSTR pDescription,
+    void* pContext)
+{
+
+    std::string catString;
+    std::string sevString;
+
+    switch (category) {
+    case D3D12_MESSAGE_CATEGORY_APPLICATION_DEFINED:
+        catString = "[APPLICATION_DEFINED]";
+        break;
+    case D3D12_MESSAGE_CATEGORY_MISCELLANEOUS:
+        catString = "[MISCELLANEOUS]";
+        break;
+    case D3D12_MESSAGE_CATEGORY_INITIALIZATION:
+        catString = "[INITIALIZATION]";
+        break;
+    case D3D12_MESSAGE_CATEGORY_CLEANUP:
+        catString = "[CLEANUP]";
+        break;
+    case D3D12_MESSAGE_CATEGORY_COMPILATION:
+        catString = "[COMPILATION]";
+        break;
+    case D3D12_MESSAGE_CATEGORY_STATE_CREATION:
+        catString = "[STATE_CREATION]";
+        break;
+    case D3D12_MESSAGE_CATEGORY_STATE_SETTING:
+        catString = "[STATE_SETTING]";
+        break;
+    case D3D12_MESSAGE_CATEGORY_STATE_GETTING:
+        catString = "[STATE_GETTING]";
+        break;
+    case D3D12_MESSAGE_CATEGORY_RESOURCE_MANIPULATION:
+        catString = "[RESOURCE_MANIPULATION]";
+        break;
+    case D3D12_MESSAGE_CATEGORY_EXECUTION:
+        catString = "[EXECUTION]";
+        break;
+    case D3D12_MESSAGE_CATEGORY_SHADER:
+        catString = "[SHADER]";
+        break;
+    };
+
+    switch (severity) {
+    case D3D12_MESSAGE_SEVERITY_CORRUPTION:
+        sevString = "[CORRUPTION]";
+        break;
+    case D3D12_MESSAGE_SEVERITY_ERROR:
+        sevString = "[ERROR]";
+        break;
+    case D3D12_MESSAGE_SEVERITY_WARNING:
+        sevString = "[WARNING]";
+        break;
+    case D3D12_MESSAGE_SEVERITY_INFO:
+        sevString = "[INFO]";
+        break;
+    case D3D12_MESSAGE_SEVERITY_MESSAGE:
+        sevString = "[MESSAGE]";
+        break;
+    };
+
+    DebugLog() << catString << sevString << ": " << pDescription;
 }
 
 void InitRenderer(App& app)
@@ -569,12 +687,18 @@ void InitRenderer(App& app)
 
     if (app.gpuDebug) {
         // Break on debug layer errors or corruption
-        ComPtr<ID3D12InfoQueue> infoQueue;
+        ComPtr<ID3D12InfoQueue1> infoQueue;
         app.device->QueryInterface(IID_PPV_ARGS(&infoQueue));
         if (infoQueue) {
             infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, true);
             infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, true);
             infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, false);
+            infoQueue->RegisterMessageCallback(
+                D3DMessageCallback,
+                D3D12_MESSAGE_CALLBACK_FLAG_NONE,
+                nullptr,
+                nullptr
+            );
         } else {
             DebugLog() << "Failed to set info queue breakpoints\n";
         }
@@ -653,6 +777,7 @@ void InitRenderer(App& app)
     SetupMipMapGenerator(app);
 
     SetupLightPass(app);
+    // SetupShadowPass(app);
     SetupPostProcessPass(app);
 
     ASSERT_HRESULT(
@@ -780,12 +905,13 @@ void UpdatePerPrimitiveData(App& app, const glm::mat4& projection, const glm::ma
     }
 }
 
-void SetupDirectionalLightShadowMap(App& app, Light& light)
+void SetupLightShadowMap(App& app, Light& light, int lightIdx)
 {
     // We can use the same resource description as the GBuffer depth render target
     // for directional shadow map lights.
-    auto resourceDesc = GBufferResourceDesc(GBufferTarget::GBuffer_Depth, light.directionalShadowMapSize, light.directionalShadowMapSize);
-    resourceDesc.Format = DXGI_FORMAT_D32_FLOAT;
+    auto resourceDesc = GBufferResourceDesc(GBufferTarget::GBuffer_Depth, app.windowWidth, app.windowHeight);
+    resourceDesc.Format = DXGI_FORMAT_R32_FLOAT;
+    resourceDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 
     // Create the resource
     {
@@ -801,16 +927,21 @@ void SetupDirectionalLightShadowMap(App& app, Light& light)
                 &allocDesc,
                 &resourceDesc,
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                &clearValue,
-                &light.directionalShadowMap,
+                nullptr,
+                &light.RayTracedShadow.texture,
                 IID_NULL, nullptr
             )
         );
+
+        auto lightName = convert_to_wstring(
+            "LightRTShadow#" + std::to_string(lightIdx)
+        );
+        light.RayTracedShadow.texture->GetResource()->SetName(lightName.c_str());
     }
 
     // Create SRV
     {
-        light.directionalShadowMapSRV = AllocateDescriptorsUnique(app.descriptorPool, 1, "Directional light shadow SRV");
+        light.RayTracedShadow.SRV = AllocateDescriptorsUnique(app.descriptorPool, 1, "RTShadowMap SRV");
 
         D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
         srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -818,33 +949,27 @@ void SetupDirectionalLightShadowMap(App& app, Light& light)
         srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         srvDesc.Texture2D.MipLevels = 1;
         app.device->CreateShaderResourceView(
-            light.directionalShadowMap->GetResource(),
+            light.RayTracedShadow.texture->GetResource(),
             &srvDesc,
-            light.directionalShadowMapSRV.CPUHandle()
+            light.RayTracedShadow.SRV.CPUHandle()
         );
     }
 
-    // Create DSV
+    // Create UAV
     {
-        light.directionalShadowMapDSV = AllocateDescriptorsUnique(app.dsvDescriptorPool, 1, "Directional light shadow DSV");
+        light.RayTracedShadow.UAV = AllocateDescriptorsUnique(app.descriptorPool, 1, "RTShadowMap UAV");
 
-        D3D12_DEPTH_STENCIL_VIEW_DESC dsDesc = {};
-        dsDesc.Format = DXGI_FORMAT_D32_FLOAT;
-        dsDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
-        dsDesc.Flags = D3D12_DSV_FLAG_NONE;
-        app.device->CreateDepthStencilView(
-            light.directionalShadowMap->GetResource(),
-            &dsDesc,
-            light.directionalShadowMapDSV.CPUHandle()
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+        uavDesc.Format = DXGI_FORMAT_R32_FLOAT;
+        uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        app.device->CreateUnorderedAccessView(
+            light.RayTracedShadow.texture->GetResource(),
+            nullptr,
+            &uavDesc,
+            light.RayTracedShadow.UAV.CPUHandle()
         );
     }
 }
-
-// void SetupPointLightSphere(App& app, Light& light)
-// {
-//     light.sphereInstanceData = app.LightBuffer.pointSphereConstantData.AllocateUnique();
-//     app.LightBuffer.pointLightSphere->primitives[0]->instanceCount++;
-// }
 
 void UpdateLightConstantBuffers(App& app, const glm::mat4& projection, const glm::mat4& view)
 {
@@ -853,13 +978,9 @@ void UpdateLightConstantBuffers(App& app, const glm::mat4& projection, const glm
 
     for (UINT i = 0; i < app.LightBuffer.count; i++) {
         Light& light = app.lights[i];
-        if (light.lightType == LightType_Directional && light.directionalShadowMap == nullptr) {
-            SetupDirectionalLightShadowMap(app, light);
+        if (light.castsShadow && !light.RayTracedShadow.texture) {
+            SetupLightShadowMap(app, light, i);
         }
-
-        // if (app.lights[i].lightType == LightType_Point) {
-        //     SetupPointLightSphere(app, light);
-        // }
 
         app.lights[i].UpdateConstantData(view);
     }
@@ -961,11 +1082,21 @@ void DoFrustumCulling(PrimitivePool& primitivePool, const glm::mat4& viewProject
     }
 }
 
-void UpdateRenderData(App& app, const glm::mat4& projection, const glm::mat4& view)
+// void UpdateRayTraceInfo(App& app, const glm::mat4& viewProjection, const glm::vec3& camPos)
+// {
+//     app.ShadowPass.rtInfoPtr->camPosWorld = camPos;
+//     app.ShadowPass.rtInfoPtr->tMin = 0.001f;
+//     app.ShadowPass.rtInfoPtr->tMax = 1000.0f;
+
+//     app.ShadowPass.rtInfoPtr->projectionToWorld = glm::inverse(viewProjection);
+// }
+
+void UpdateRenderData(App& app, const glm::mat4& projection, const glm::mat4& view, const glm::vec3& camPos)
 {
     UpdateLightConstantBuffers(app, projection, view);
     UpdatePerPrimitiveData(app, projection, view);
     DoFrustumCulling(app.primitivePool, projection * view);
+    //UpdateRayTraceInfo(app, projection * view, camPos);
 }
 
 std::vector<Mesh*> PickSceneMeshes(Scene& scene)
@@ -981,7 +1112,107 @@ std::vector<Mesh*> PickSceneMeshes(Scene& scene)
     return meshes;
 }
 
-void DrawMeshesGBuffer(App& app, ID3D12GraphicsCommandList* commandList)
+void BuildTLAS(App& app, GraphicsCommandList* commandList)
+{
+    auto meshes = PickSceneMeshes(app.scene);
+
+    std::vector<D3D12_RAYTRACING_INSTANCE_DESC> instanceDescs;
+    int instanceId = 0;
+    for (auto& mesh : meshes)
+    {
+        for (auto& primitive : mesh->primitives)
+        {
+            if (!primitive->blasResult) {
+                continue;
+            }
+
+            glm::mat3x4 truncatedModelMat = glm::transpose(primitive->constantData->M);
+
+            D3D12_RAYTRACING_INSTANCE_DESC instances = {};
+            instances.InstanceID = instanceId++;
+            instances.InstanceContributionToHitGroupIndex = 0;
+            instances.InstanceMask = 0xFF;
+            memcpy(instances.Transform, reinterpret_cast<void*>(&truncatedModelMat[0]), sizeof(instances.Transform));
+            instances.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_NONE;
+            instances.AccelerationStructure = primitive->blasResult->GetResource()->GetGPUVirtualAddress();
+
+            instanceDescs.push_back(instances);
+        }
+    }
+
+    // DXR is quite strange...
+    auto instanceBufferSizeBytes = instanceDescs.size() * sizeof(D3D12_RAYTRACING_INSTANCE_DESC);
+    // If we don't have an instance buffer OR it's not big enough create one
+    // if (!app.TLAS.instancesUploadBuffer ||
+    //     app.TLAS.instancesUploadBuffer->GetResource()->GetDesc().Width < instanceBufferSizeBytes) {
+
+    if (instanceBufferSizeBytes == 0) {
+        return;
+    }
+
+    // Per frame pain?
+    CreateOrReallocateUploadBufferWithData(
+        app.mainAllocator.Get(),
+        app.TLAS.instancesUploadBuffer,
+        instanceDescs.data(),
+        instanceBufferSizeBytes
+    );
+
+    // }
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS buildFlags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS asInputs = {};
+    asInputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+    asInputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    asInputs.NumDescs = instanceDescs.size();
+    asInputs.InstanceDescs = app.TLAS.instancesUploadBuffer->GetResource()->GetGPUVirtualAddress();
+    asInputs.Flags = buildFlags;
+
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO prebuildInfo = {};
+    app.device->GetRaytracingAccelerationStructurePrebuildInfo(
+        &asInputs,
+        &prebuildInfo
+    );
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC desc = {};
+    desc.Inputs = asInputs;
+
+    CreateAccelerationStructureBuffers(
+        app.mainAllocator.Get(),
+        prebuildInfo,
+        app.TLAS.scratch,
+        app.TLAS.result
+    );
+    app.TLAS.result->GetResource()->SetName(L"tlasResult");
+    app.TLAS.scratch->GetResource()->SetName(L"tlasScratch");
+
+    desc.ScratchAccelerationStructureData = app.TLAS.scratch->GetResource()->GetGPUVirtualAddress();
+    desc.DestAccelerationStructureData = app.TLAS.result->GetResource()->GetGPUVirtualAddress();
+
+    // Create SRV to the TLAS
+    {
+        if (!app.TLAS.descriptor.IsValid()) {
+            app.TLAS.descriptor = AllocateDescriptorsUnique(app.descriptorPool, 1, "TLAS SRV");
+        }
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.RaytracingAccelerationStructure.Location = app.TLAS.result->GetResource()->GetGPUVirtualAddress();
+        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        app.device->CreateShaderResourceView(
+            nullptr,
+            &srvDesc,
+            app.TLAS.descriptor.CPUHandle()
+        );
+    }
+
+    commandList->BuildRaytracingAccelerationStructure(
+        &desc,
+        0,
+        nullptr
+    );
+}
+
+void DrawMeshesGBuffer(App& app, GraphicsCommandList* commandList)
 {
     commandList->OMSetStencilRef(0xFFFFFFFF);
 
@@ -1030,7 +1261,7 @@ void DrawMeshesGBuffer(App& app, ID3D12GraphicsCommandList* commandList)
     }
 }
 
-void DrawAlphaBlendedMeshes(App& app, ID3D12GraphicsCommandList* commandList)
+void DrawAlphaBlendedMeshes(App& app, GraphicsCommandList* commandList)
 {
     const UINT MaxLightsPerDraw = 8;
 
@@ -1082,7 +1313,7 @@ void DrawAlphaBlendedMeshes(App& app, ID3D12GraphicsCommandList* commandList)
     }
 }
 
-void DrawFullscreenQuad(App& app, ID3D12GraphicsCommandList* commandList)
+void DrawFullscreenQuad(App& app, GraphicsCommandList* commandList)
 {
     // NOTE: if this only draws one triangle, its because the primitive topology is not triangle strip
     commandList->IASetVertexBuffers(0, 0, nullptr);
@@ -1091,7 +1322,7 @@ void DrawFullscreenQuad(App& app, ID3D12GraphicsCommandList* commandList)
     app.Stats.drawCalls++;
 }
 
-void DrawFullscreenQuadInstanced(App& app, ID3D12GraphicsCommandList* commandList, int count)
+void DrawFullscreenQuadInstanced(App& app, GraphicsCommandList* commandList, int count)
 {
     commandList->IASetVertexBuffers(0, 0, nullptr);
     commandList->DrawInstanced(4, count, 0, 0);
@@ -1099,7 +1330,7 @@ void DrawFullscreenQuadInstanced(App& app, ID3D12GraphicsCommandList* commandLis
     app.Stats.drawCalls++;
 }
 
-void BindAndClearGBufferRTVs(const App& app, ID3D12GraphicsCommandList* commandList)
+void BindAndClearGBufferRTVs(const App& app, GraphicsCommandList* commandList)
 {
     CD3DX12_CPU_DESCRIPTOR_HANDLE renderTargetHandles[GBuffer_RTVCount] = {};
     for (int i = 0; i < GBuffer_RTVCount; i++) {
@@ -1117,7 +1348,7 @@ void BindAndClearGBufferRTVs(const App& app, ID3D12GraphicsCommandList* commandL
     commandList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
 }
 
-void TransitionResourcesForGBufferPass(const App& app, ID3D12GraphicsCommandList* commandList)
+void TransitionResourcesForGBufferPass(const App& app, GraphicsCommandList* commandList)
 {
     // Transition our GBuffers into being render targets.
     std::vector<D3D12_RESOURCE_BARRIER> barriers;
@@ -1129,23 +1360,21 @@ void TransitionResourcesForGBufferPass(const App& app, ID3D12GraphicsCommandList
         barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(app.GBuffer.renderTargets[i].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET));
     }
 
-    // Transition any directional light shadow maps to being depth write state
+    // Transition any light shadow maps to being unordered access
     for (UINT i = 0; i < app.LightBuffer.count; i++) {
-        if (app.lights[i].lightType == LightType_Directional) {
-            if (app.lights[i].directionalShadowMap != nullptr) {
-                barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(
-                    app.lights[i].directionalShadowMap->GetResource(),
-                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                    D3D12_RESOURCE_STATE_DEPTH_WRITE
-                ));
-            }
+        if (app.lights[i].castsShadow && app.lights[i].RayTracedShadow.texture != nullptr) {
+            barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(
+                app.lights[i].RayTracedShadow.texture->GetResource(),
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+            ));
         }
     }
 
     commandList->ResourceBarrier((UINT)barriers.size(), barriers.data());
 }
 
-void GBufferPass(App& app, ID3D12GraphicsCommandList* commandList)
+void GBufferPass(App& app, GraphicsCommandList* commandList)
 {
     PIXScopedEvent(commandList, 0xC082FF, L"GBufferPass");
 
@@ -1153,6 +1382,8 @@ void GBufferPass(App& app, ID3D12GraphicsCommandList* commandList)
     commandList->RSSetScissorRects(1, &app.scissorRect);
 
     TransitionResourcesForGBufferPass(app, commandList);
+
+    BuildTLAS(app, commandList);
 
     BindAndClearGBufferRTVs(app, commandList);
 
@@ -1164,83 +1395,91 @@ void GBufferPass(App& app, ID3D12GraphicsCommandList* commandList)
     DrawMeshesGBuffer(app, commandList);
 }
 
-// Renders all shadow maps for all lights.
-void ShadowPass(App& app, ID3D12GraphicsCommandList* commandList)
-{
-    PIXScopedEvent(commandList, 0xC1C1C1, L"ShadowPass");
+// void TransitionResourcesForShadowPass(const App& app, GraphicsCommandList* commandList)
+// {
+//     std::vector<D3D12_RESOURCE_BARRIER> barriers;
 
-    commandList->SetGraphicsRootSignature(app.rootSignature.Get());
+//     // Transition any light shadow maps to being unordered access
+//     for (UINT i = 0; i < app.LightBuffer.count; i++) {
+//         if (app.lights[i].castsShadow && app.lights[i].RayTracedShadow.texture != nullptr) {
+//             barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(
+//                 app.lights[i].RayTracedShadow.texture->GetResource(),
+//                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+//                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+//             ));
+//         }
+//     }
 
-    auto descriptorHeap = app.descriptorPool.Heap();
-    ID3D12DescriptorHeap* ppHeaps[] = { descriptorHeap };
-    commandList->SetDescriptorHeaps(_countof(ppHeaps), ppHeaps);
+//     commandList->ResourceBarrier((UINT)barriers.size(), barriers.data());
+// }
 
-    ManagedPSORef lastUsedPSO = nullptr;
+// void ShadowPass(App& app, GraphicsCommandList* commandList)
+// {
+//     PIXScopedEvent(commandList, 0xC1C1C1, L"ShadowPass");
 
-    auto meshes = PickSceneMeshes(app.scene);
+//     auto descriptorHeap = app.descriptorPool.Heap();
+//     ID3D12DescriptorHeap* ppHeaps[] = { descriptorHeap };
+//     commandList->SetDescriptorHeaps(_countof(ppHeaps), ppHeaps);
 
-    for (UINT i = 0; i < app.LightBuffer.count; i++) {
-        auto& light = app.lights[i];
-        if (light.lightType == LightType_Directional && light.directionalShadowMap != nullptr) {
-            auto dsvHandle = light.directionalShadowMapDSV.CPUHandle();
-            commandList->OMSetRenderTargets(0, nullptr, FALSE, &dsvHandle);
-            commandList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+//     commandList->SetComputeRootSignature(app.rootSignature.Get());
 
-            D3D12_VIEWPORT viewport;
-            viewport.MinDepth = 0.0f;
-            viewport.MaxDepth = 1.0f;
-            viewport.TopLeftX = 0.0f;
-            viewport.TopLeftY = 0.0f;
-            viewport.Width = static_cast<float>(light.directionalShadowMapSize);
-            viewport.Height = static_cast<float>(light.directionalShadowMapSize);
-            commandList->RSSetViewports(1, &viewport);
+//     BuildTLAS(app, commandList);
 
-            CD3DX12_RECT scissorRect(0, 0, static_cast<LONG>(light.directionalShadowMapSize), static_cast<LONG>(light.directionalShadowMapSize));
-            commandList->RSSetScissorRects(1, &scissorRect);
+//     // if (app.TLAS.result) {
+//     //     barriers.push_back(CD3DX12_RESOURCE_BARRIER::UAV(
+//     //         app.TLAS.result->GetResource()
+//     //     ));
+//     // }
+
+//     if (app.TLAS.result) {
+//         auto barrier = CD3DX12_RESOURCE_BARRIER::UAV(
+//             app.TLAS.result->GetResource()
+//         );
+//         commandList->ResourceBarrier(1, &barrier);
+//     }
+
+//     commandList->SetPipelineState1(app.ShadowPass.rtShadowSO->SO.Get());
+
+//     for (UINT i = 0; i < app.LightBuffer.count; i++) {
+//         auto& light = app.lights[i];
+
+//         if (!light.castsShadow) {
+//             continue;
+//         }
+
+//         D3D12_DISPATCH_RAYS_DESC raysDesc = {};
+//         raysDesc.Width = app.windowWidth;
+//         raysDesc.Height = app.windowHeight;
+//         raysDesc.Depth = 1;
+//         raysDesc.RayGenerationShaderRecord = app.ShadowPass.rtShadowShaderTable.RayGenerationShaderRecord;
+//         raysDesc.HitGroupTable = app.ShadowPass.rtShadowShaderTable.HitGroupTable;
+//         raysDesc.CallableShaderTable = app.ShadowPass.rtShadowShaderTable.CallableShaderTable;
+//         raysDesc.MissShaderTable = app.ShadowPass.rtShadowShaderTable.MissShaderTable;
 
 
-            for (auto& mesh : meshes) {
-                if (!mesh->isReadyForRender) {
-                    continue;
-                }
+//         UINT constantValues[4] = {
+//             app.ShadowPass.rtInfoDescriptor.Index(),
+//             light.RayTracedShadow.UAV.Index(),
+//             app.LightBuffer.cbvHandle.Index() + i + 1,
+//             app.TLAS.descriptor.Index()
+//         };
 
-                for (const auto& primitive : mesh->primitives) {
-                    const auto& material = primitive->material.get();
-                    if (!material || !material->castsShadow) {
-                        continue;
-                    }
+//         commandList->SetComputeRoot32BitConstants(
+//             0,
+//             _countof(constantValues),
+//             constantValues,
+//             0
+//         );
 
-                    // Set the per-primitive constant buffer
-                    UINT constantValues[5] = {
-                        primitive->perPrimitiveDescriptor.index,
-                         UINT_MAX,
-                         app.LightBuffer.cbvHandle.Index() + i + 1,
-                         UINT_MAX,
-                         primitive->miscDescriptorParameter.index
-                    };
-
-                    commandList->SetGraphicsRoot32BitConstants(0, _countof(constantValues), constantValues, 0);
-                    commandList->IASetPrimitiveTopology(primitive->primitiveTopology);
-
-                    if (primitive->directionalShadowPSO != lastUsedPSO) {
-                        commandList->SetPipelineState(primitive->directionalShadowPSO->Get());
-                        lastUsedPSO = primitive->directionalShadowPSO;
-                    }
-
-                    commandList->IASetVertexBuffers(0, (UINT)primitive->vertexBufferViews.size(), primitive->vertexBufferViews.data());
-                    commandList->IASetIndexBuffer(&primitive->indexBufferView);
-                    commandList->DrawIndexedInstanced(primitive->indexCount, primitive->instanceCount, 0, 0, 0);
-
-                    app.Stats.drawCalls++;
-                }
-            }
-        }
-    }
-}
+//         commandList->DispatchRays(
+//             &raysDesc
+//         );
+//     }
+// }
 
 const D3D12_RESOURCE_STATES LightPassDepthResourceState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_DEPTH_READ;
 
-void TransitionResourcesForLightPass(const App& app, ID3D12GraphicsCommandList* commandList)
+void TransitionResourcesForLightPass(const App& app, GraphicsCommandList* commandList)
 {
     // Transition GBuffer to being shader resource views so that they can be used in the lighting shaders.
     // Radiance stays as RTV for this pass.
@@ -1253,12 +1492,12 @@ void TransitionResourcesForLightPass(const App& app, ID3D12GraphicsCommandList* 
     // Depth buffer is special
     barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(app.depthStencilBuffer.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, LightPassDepthResourceState));
 
-    // Transition any directional light shadow maps to being pixel resources
+    // Transition any RT shadow maps to being pixel resources
     for (UINT i = 0; i < app.LightBuffer.count; i++) {
-        if (app.lights[i].lightType == LightType_Directional && app.lights[i].directionalShadowMap != nullptr) {
+        if (app.lights[i].castsShadow && app.lights[i].RayTracedShadow.texture != nullptr) {
             barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(
-                app.lights[i].directionalShadowMap->GetResource(),
-                D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                app.lights[i].RayTracedShadow.texture->GetResource(),
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
             ));
         }
@@ -1267,7 +1506,7 @@ void TransitionResourcesForLightPass(const App& app, ID3D12GraphicsCommandList* 
     commandList->ResourceBarrier((UINT)barriers.size(), barriers.data());
 }
 
-void LightPass(App& app, ID3D12GraphicsCommandList* commandList)
+void LightPass(App& app, GraphicsCommandList* commandList)
 {
     PIXScopedEvent(commandList, 0xFF9F82, L"LightPass");
 
@@ -1300,19 +1539,20 @@ void LightPass(App& app, ID3D12GraphicsCommandList* commandList)
         for (UINT i = 0; i < app.LightBuffer.count; i++) {
             // Group together as many point lights as possible into one draw
             int lightCount = 0;
-            int lightStartIdx = 0;
+            int lightStartIdx = i;
             while (i < app.LightBuffer.count && app.lights[i].lightType == LightType_Point) {
                 lightCount++;
                 i++;
             }
 
             if (lightCount > 0) {
-                UINT constantValues[3] = {
+                UINT constantValues[4] = {
+                    app.TLAS.descriptor.Index(),
                     app.LightBuffer.cbvHandle.Index() + lightStartIdx + 1,
                     app.LightBuffer.cbvHandle.Index(),
                     lightCount,
                 };
-                commandList->SetGraphicsRoot32BitConstants(0, _countof(constantValues), constantValues, 2);
+                commandList->SetGraphicsRoot32BitConstants(0, _countof(constantValues), constantValues, 1);
                 DrawFullscreenQuad(app, commandList);
             }
         }
@@ -1330,11 +1570,12 @@ void LightPass(App& app, ID3D12GraphicsCommandList* commandList)
                     hasSetPSO = true;
                 }
 
-                UINT constantValues[2] = {
+                UINT constantValues[3] = {
+                    app.TLAS.descriptor.Index(),
                     app.LightBuffer.cbvHandle.Index() + i + 1,
                     app.LightBuffer.cbvHandle.Index()
                 };
-                commandList->SetGraphicsRoot32BitConstants(0, 2, constantValues, 2);
+                commandList->SetGraphicsRoot32BitConstants(0, _countof(constantValues), constantValues, 1);
                 DrawFullscreenQuad(app, commandList);
             }
         }
@@ -1359,7 +1600,7 @@ void LightPass(App& app, ID3D12GraphicsCommandList* commandList)
 }
 
 // Forward pass for meshes with transparency
-void AlphaBlendPass(App& app, ID3D12GraphicsCommandList* commandList)
+void AlphaBlendPass(App& app, GraphicsCommandList* commandList)
 {
     PIXScopedEvent(commandList, 0x93E9BE, L"AlphaBlendPass");
 
@@ -1382,14 +1623,14 @@ void AlphaBlendPass(App& app, ID3D12GraphicsCommandList* commandList)
     DrawAlphaBlendedMeshes(app, commandList);
 }
 
-void TransitionResourcesForPostProcessPass(App& app, ID3D12GraphicsCommandList* commandList)
+void TransitionResourcesForPostProcessPass(App& app, GraphicsCommandList* commandList)
 {
     // Transition radiance buffer to being an SRV
     auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(app.GBuffer.renderTargets[GBuffer_Radiance].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     commandList->ResourceBarrier(1, &barrier);
 }
 
-void PostProcessPass(App& app, ID3D12GraphicsCommandList* commandList)
+void PostProcessPass(App& app, GraphicsCommandList* commandList)
 {
     PIXScopedEvent(commandList, 0x89E4F8, L"PostProcessPass");
 
@@ -1424,7 +1665,7 @@ void PostProcessPass(App& app, ID3D12GraphicsCommandList* commandList)
 
 void BuildCommandLists(App& app)
 {
-    ID3D12GraphicsCommandList* commandList = app.commandList.Get();
+    GraphicsCommandList* commandList = app.commandList.Get();
 
     ASSERT_HRESULT(
         app.commandAllocator->Reset()
@@ -1434,7 +1675,7 @@ void BuildCommandLists(App& app)
         commandList->Reset(app.commandAllocator.Get(), app.pipelineState.Get())
     );
 
-    NotifyAndWaitRenderThreads(app);
+    NotifyRenderThreads(app);
 
     PostProcessPass(app, commandList);
 
@@ -1454,9 +1695,13 @@ void BuildCommandLists(App& app)
     );
     commandList->ResourceBarrier(1, &barrier);
 
+    //TransitionResourcesForShadowPass(app, commandList);
+
     ASSERT_HRESULT(
         commandList->Close()
     );
+
+    WaitRenderThreads(app);
 }
 
 void RenderFrame(App& app)
@@ -1474,9 +1719,14 @@ void RenderFrame(App& app)
         commandLists[i] = app.renderThreads[i].commandList.Get();
     }
 
+    FenceEvent shadowPassFenceEvent;
+    FenceEvent gbufferFenceEvent;
+
+    //app.computeQueue.ExecuteCommandLists({ shadowCommandList }, shadowPassFenceEvent);
+
 #define EXECUTE_MULTI_COMMANDLISTS
 #ifdef EXECUTE_MULTI_COMMANDLISTS
-    app.graphicsQueue.ExecuteCommandListsBlocking(commandLists, app.previousFrameEvent);
+    app.graphicsQueue.ExecuteCommandListsBlocking(commandLists);
 #else
     for (auto& commandList : commandLists) {
         app.graphicsQueue.ExecuteCommandListsBlocking({ commandList }, app.previousFrameEvent);

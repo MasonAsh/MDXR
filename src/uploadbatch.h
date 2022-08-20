@@ -179,7 +179,7 @@ private:
     void Flush()
     {
         commandList->Close();
-        commandQueue->ExecuteCommandLists({ commandList.Get() }, uploadFenceEvent, uploadFenceEvent);
+        commandQueue->ExecuteCommandLists({ commandList.Get() }, uploadFenceEvent, { uploadFenceEvent });
         virtualBlock->Clear();
 
         ASSERT_HRESULT(commandList->Reset(commandAllocator.Get(), nullptr));

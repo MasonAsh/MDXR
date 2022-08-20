@@ -163,11 +163,11 @@ void DrawMaterialEditor(App& app)
                 materialDirty = true;
             }
 
-            if (ImGui::SliderFloat("Roughness", &selectedMaterial->metalRoughnessFactor.g, 0.0f, 1.0f)) {
+            if (ImGui::SliderFloat("Roughness", &selectedMaterial->metalRoughnessFactor.y, 0.0f, 1.0f)) {
                 materialDirty = true;
             }
 
-            if (ImGui::SliderFloat("Metallic", &selectedMaterial->metalRoughnessFactor.b, 0.0f, 1.0f)) {
+            if (ImGui::SliderFloat("Metallic", &selectedMaterial->metalRoughnessFactor.z, 0.0f, 1.0f)) {
                 materialDirty = true;
             }
 
@@ -208,7 +208,9 @@ void DrawLightEditor(App& app)
         }
         ImGui::SameLine();
         if (ImGui::Button("Remove light")) {
-            app.LightBuffer.count = std::max<UINT>(app.LightBuffer.count - 1, 0u);
+            if (app.LightBuffer.count > 0) {
+                app.LightBuffer.count--;
+            }
             if (selectedLightIdx == app.LightBuffer.count) {
                 selectedLightIdx--;
             }

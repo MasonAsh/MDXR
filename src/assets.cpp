@@ -182,11 +182,6 @@ void CreateModelMaterials(
         return;
     }
 
-    auto descriptorReference = AllocateDescriptorsUnique(app.descriptorPool, materialCount, "model materials");
-    auto constantBufferSlice = app.materialConstantBuffer.Allocate(materialCount);
-    //app.materialConstantBuffer.CreateViews(app.device.Get(), constantBufferSlice, descriptorReference.CPUHandle());
-    outputModel.baseMaterialDescriptor = descriptorReference.Ref();
-
     auto baseTextureDescriptor = outputModel.baseTextureDescriptor.Ref();
 
     for (int i = 0; i < materialCount; i++) {
@@ -234,12 +229,12 @@ void CreateModelMaterials(
         material->textureDescriptors.baseColor = baseColorTextureDescriptor;
         material->textureDescriptors.normal = normalTextureDescriptor;
         material->textureDescriptors.metalRoughness = metalRoughnessTextureDescriptor;
-        material->baseColorFactor.r = static_cast<float>(inputMaterial.pbrMetallicRoughness.baseColorFactor[0]);
-        material->baseColorFactor.g = static_cast<float>(inputMaterial.pbrMetallicRoughness.baseColorFactor[1]);
-        material->baseColorFactor.b = static_cast<float>(inputMaterial.pbrMetallicRoughness.baseColorFactor[2]);
-        material->baseColorFactor.a = static_cast<float>(inputMaterial.pbrMetallicRoughness.baseColorFactor[3]);
-        material->metalRoughnessFactor.g = static_cast<float>(inputMaterial.pbrMetallicRoughness.roughnessFactor);
-        material->metalRoughnessFactor.b = static_cast<float>(inputMaterial.pbrMetallicRoughness.metallicFactor);
+        material->baseColorFactor.x = static_cast<float>(inputMaterial.pbrMetallicRoughness.baseColorFactor[0]);
+        material->baseColorFactor.y = static_cast<float>(inputMaterial.pbrMetallicRoughness.baseColorFactor[1]);
+        material->baseColorFactor.z = static_cast<float>(inputMaterial.pbrMetallicRoughness.baseColorFactor[2]);
+        material->baseColorFactor.w = static_cast<float>(inputMaterial.pbrMetallicRoughness.baseColorFactor[3]);
+        material->metalRoughnessFactor.y = static_cast<float>(inputMaterial.pbrMetallicRoughness.roughnessFactor);
+        material->metalRoughnessFactor.z = static_cast<float>(inputMaterial.pbrMetallicRoughness.metallicFactor);
         material->cbvDescriptor = std::move(descriptor);
         material->name = inputMaterial.name;
         material->castsShadow = material->receivesShadow = true;
@@ -250,11 +245,11 @@ void CreateModelMaterials(
 }
 
 
-std::pair<ComPtr<ID3D12GraphicsCommandList>, ComPtr<ID3D12CommandAllocator>>
+std::pair<ComPtr<GraphicsCommandList>, ComPtr<ID3D12CommandAllocator>>
 EasyCreateGraphicsCommandList(App& app, D3D12_COMMAND_LIST_TYPE commandListType)
 {
     ComPtr<ID3D12CommandAllocator> allocator;
-    ComPtr<ID3D12GraphicsCommandList> commandList;
+    ComPtr<GraphicsCommandList> commandList;
 
     ASSERT_HRESULT(app.device->CreateCommandAllocator(
         commandListType,
@@ -429,7 +424,7 @@ void GenerateMipMaps(App& app, const std::span<ComPtr<ID3D12Resource>>& textures
     if (needsCopy) {
         copyToCommandList->Close();
         copyFromCommandList->Close();
-        app.copyQueue.ExecuteCommandListsBlocking({ copyToCommandList.Get() }, initialUploadEvent);
+        app.copyQueue.ExecuteCommandListsBlocking({ copyToCommandList.Get() }, { initialUploadEvent });
     }
 
     ConstantBufferArena<GenerateMipsConstantData> constantBufferArena;
@@ -517,7 +512,7 @@ void GenerateMipMaps(App& app, const std::span<ComPtr<ID3D12Resource>>& textures
 
     ASSERT_HRESULT(commandList->Close());
 
-    app.computeQueue.ExecuteCommandListsBlocking({ commandList.Get() }, initialUploadEvent);
+    app.computeQueue.ExecuteCommandListsBlocking({ commandList.Get() }, { initialUploadEvent });
 
     if (needsCopy) {
         app.copyQueue.ExecuteCommandListsBlocking({ copyFromCommandList.Get() });
@@ -939,14 +934,68 @@ void AssignPSOToPrimitive(
             inputLayout
         );
     }
+}
 
-    primitive->directionalShadowPSO = CreateDirectionalLightShadowMapPSO(
-        app.psoManager,
-        app.device.Get(),
-        app.dataDir,
-        app.rootSignature.Get(),
-        inputLayout
+
+void CreatePrimitiveBLAS(
+    App& app,
+    GraphicsCommandList* commandList,
+    Primitive* primitive,
+    DXGI_FORMAT posVertexFormat,
+    int positionVertexBufferViewIndex
+)
+{
+    D3D12_RAYTRACING_GEOMETRY_DESC geometry = {};
+    geometry.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+
+    D3D12_VERTEX_BUFFER_VIEW pvv = primitive->vertexBufferViews[positionVertexBufferViewIndex];
+
+    geometry.Triangles.IndexBuffer = primitive->indexBufferView.BufferLocation;
+    geometry.Triangles.IndexFormat = primitive->indexBufferView.Format;
+    geometry.Triangles.IndexCount = primitive->indexCount;
+
+    geometry.Triangles.VertexBuffer.StartAddress = pvv.BufferLocation;
+    geometry.Triangles.VertexBuffer.StrideInBytes = pvv.StrideInBytes;
+    geometry.Triangles.VertexCount = pvv.SizeInBytes / pvv.StrideInBytes;
+    geometry.Triangles.VertexFormat = posVertexFormat;
+
+    geometry.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS asInputs = {};
+    asInputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+    asInputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    asInputs.NumDescs = 1;
+    asInputs.pGeometryDescs = &geometry;
+
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO prebuildInfo = {};
+
+    app.device->GetRaytracingAccelerationStructurePrebuildInfo(
+        &asInputs,
+        &prebuildInfo
     );
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC desc = {};
+    desc.Inputs = asInputs;
+
+    ComPtr<D3D12MA::Allocation> blasScratch;
+    ComPtr<D3D12MA::Allocation> blasResult;
+
+    CreateAccelerationStructureBuffers(
+        app.mainAllocator.Get(),
+        prebuildInfo,
+        blasScratch,
+        blasResult
+    );
+    blasScratch->SetName(L"BlasScratch");
+    blasResult->SetName(L"BlasResult");
+
+    primitive->blasScratch = blasScratch;
+    primitive->blasResult = blasResult;
+
+    desc.ScratchAccelerationStructureData = blasScratch->GetResource()->GetGPUVirtualAddress();
+    desc.DestAccelerationStructureData = blasResult->GetResource()->GetGPUVirtualAddress();
+
+    commandList->BuildRaytracingAccelerationStructure(&desc, 0, nullptr);
 }
 
 
@@ -957,7 +1006,8 @@ PoolItem<Primitive> CreateModelPrimitive(
     const tinygltf::Mesh& inputMesh,
     const tinygltf::Primitive& inputPrimitive,
     const std::vector<SharedPoolItem<Material>>& modelMaterials,
-    int perPrimitiveDescriptorIdx
+    int perPrimitiveDescriptorIdx,
+    GraphicsCommandList* commandList
 )
 {
     // Just storing these strings so that we don't have to keep the Model object around.
@@ -992,6 +1042,12 @@ PoolItem<Primitive> CreateModelPrimitive(
     perPrimitiveDescriptorIdx++;
 
     std::vector<D3D12_VERTEX_BUFFER_VIEW>& vertexBufferViews = primitive->vertexBufferViews;
+
+    // Save a reference to this one for when we build the raytracing geometry desc.
+    // We only care about the vertex buffer view with the position for now.
+    // (RT shadows only needs position)
+    int positionVertexBufferViewIndex;
+    DXGI_FORMAT posVertexFormat;
 
     // Track what addresses are mapped to a vertex buffer view.
     // 
@@ -1047,19 +1103,6 @@ PoolItem<Primitive> CreateModelPrimitive(
             break;
         };
 
-        // Extract bounding box
-        if (*semanticName == "POSITION") {
-            CHECK(accessor.maxValues.size() >= 3);
-            double maxX = accessor.maxValues[0];
-            double maxY = accessor.maxValues[1];
-            double maxZ = accessor.maxValues[2];
-            double minX = accessor.minValues[0];
-            double minY = accessor.minValues[1];
-            double minZ = accessor.minValues[2];
-            primitive->localBoundingBox.max = glm::vec3(maxX, maxY, maxZ);
-            primitive->localBoundingBox.min = glm::vec3(minX, minY, minZ);
-        }
-
         // Accessors can be linked to the same bufferview, so here we keep
         // track of what input slot is linked to a bufferview.
         int bufferViewIdx = accessor.bufferView;
@@ -1104,6 +1147,22 @@ PoolItem<Primitive> CreateModelPrimitive(
         desc.InputSlot = vertexStartOffsetToBufferView[vertexStartAddress];
 
         inputLayout.push_back(desc);
+
+        if (*semanticName == "POSITION") {
+            // Extract bounding box
+            CHECK(accessor.maxValues.size() >= 3);
+            double maxX = accessor.maxValues[0];
+            double maxY = accessor.maxValues[1];
+            double maxZ = accessor.maxValues[2];
+            double minX = accessor.minValues[0];
+            double minY = accessor.minValues[1];
+            double minZ = accessor.minValues[2];
+            primitive->localBoundingBox.max = glm::vec3(maxX, maxY, maxZ);
+            primitive->localBoundingBox.min = glm::vec3(minX, minY, minZ);
+
+            positionVertexBufferViewIndex = desc.InputSlot;
+            posVertexFormat = desc.Format;
+        }
 
         D3D12_PRIMITIVE_TOPOLOGY& topology = primitive->primitiveTopology;
         switch (inputPrimitive.mode)
@@ -1172,6 +1231,15 @@ PoolItem<Primitive> CreateModelPrimitive(
     };
 
     primitive->indexCount = (UINT)accessor.count;
+
+    CreatePrimitiveBLAS(
+        app,
+        commandList,
+        primitive.get(),
+        posVertexFormat,
+        positionVertexBufferViewIndex
+    );
+
     app.Stats.triangleCount += primitive->indexCount;
 
     return primitive;
@@ -1196,9 +1264,9 @@ void AddPunctualLights(App& app, const tinygltf::Model& inputModel, std::vector<
 
         glm::vec3 color(1.0f);
         if (inputLight.color.size() >= 3) {
-            color.r = inputLight.color[0];
-            color.g = inputLight.color[1];
-            color.b = inputLight.color[2];
+            color.x = inputLight.color[0];
+            color.y = inputLight.color[1];
+            color.z = inputLight.color[2];
         }
 
         for (const auto& lightTransform : lightTransforms) {
@@ -1223,7 +1291,8 @@ void FinalizeModel(
     Model& outputModel,
     App& app,
     const tinygltf::Model& inputModel,
-    const std::vector<SharedPoolItem<Material>>& modelMaterials
+    const std::vector<SharedPoolItem<Material>>& modelMaterials,
+    GraphicsCommandList* computeCommandList
 )
 {
     const std::vector<ComPtr<ID3D12Resource>>& resourceBuffers = outputModel.resources;
@@ -1247,7 +1316,8 @@ void FinalizeModel(
                 inputMesh,
                 inputPrimitive,
                 modelMaterials,
-                perPrimitiveDescriptorIdx
+                perPrimitiveDescriptorIdx,
+                computeCommandList
             );
 
             if (primitive != nullptr) {
@@ -1264,6 +1334,10 @@ void FinalizeModel(
     for (auto& mesh : outputModel.meshes) {
         mesh->isReadyForRender = true;
     }
+
+    // Build BLAS
+    computeCommandList->Close();
+    app.computeQueue.ExecuteCommandListsBlocking({ computeCommandList });
 }
 
 
@@ -1883,6 +1957,11 @@ void LoadGLTFThread(App& app, const GLTFLoadEntry& loadEntry, AssetLoadContext* 
         D3D12_COMMAND_LIST_TYPE_COPY
     );
 
+    auto [computeCommandList, computeCommandAllocator] = EasyCreateGraphicsCommandList(
+        app,
+        D3D12_COMMAND_LIST_TYPE_COMPUTE
+    );
+
     FenceEvent fenceEvent;
 
     // Can only call this ONCE before command list executed
@@ -1906,7 +1985,9 @@ void LoadGLTFThread(App& app, const GLTFLoadEntry& loadEntry, AssetLoadContext* 
     context->currentTask = "Finalizing";
     CreateModelDescriptors(app, gltfModel, model, textureBuffers);
     CreateModelMaterials(app, gltfModel, model, modelMaterials);
-    FinalizeModel(model, app, gltfModel, modelMaterials);
+    FinalizeModel(model, app, gltfModel, modelMaterials, computeCommandList.Get());
+
+    app.computeQueue.ExecuteCommandListsBlocking({ computeCommandList.Get() });
 
     context->overallPercent = 1.0f;
 
