@@ -32,6 +32,8 @@ inline D3D12_RESOURCE_DESC GBufferResourceDesc(GBufferTarget target, int windowW
         desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         break;
     case GBuffer_BaseColor:
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        break;
     case GBuffer_MetalRoughness:
         desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         break;

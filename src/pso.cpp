@@ -560,7 +560,7 @@ ManagedPSORef CreateToneMapPSO(
 
     // Back buffer is SRGB format
     psoDesc.NumRenderTargets = 1;
-    psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    //psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
 
     return SimpleCreateGraphicsPSO(
         manager,

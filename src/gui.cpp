@@ -364,6 +364,8 @@ void DrawGeekMenu(App& app)
             ImGui::Text("%f%% %s", loadInfo->overallPercent * 100.0f, loadInfo->currentTask.c_str());
             ImGui::Unindent();
         }
+
+        ImGui::Checkbox("Disable Shadows", &app.RenderSettings.disableShadows);
     }
 
     ImGui::End();

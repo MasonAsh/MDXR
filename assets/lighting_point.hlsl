@@ -40,7 +40,7 @@ float ComputeShadow(LightConstantData light, float3 worldPos)
         return 0.0f;
     }
 
-    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_CULL_BACK_FACING_TRIANGLES>
+    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_CULL_FRONT_FACING_TRIANGLES>
         rayQuery;
 
     float3 hitToLight = light.position.xyz -  worldPos.xyz;

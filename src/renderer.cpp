@@ -983,6 +983,10 @@ void UpdateLightConstantBuffers(App& app, const glm::mat4& projection, const glm
         }
 
         app.lights[i].UpdateConstantData(view);
+
+        if (app.RenderSettings.disableShadows) {
+            app.lights[i].constantData->castsShadow = false;
+        }
     }
 }
 
@@ -1644,7 +1648,8 @@ void PostProcessPass(App& app, GraphicsCommandList* commandList)
 
     TransitionResourcesForPostProcessPass(app, commandList);
 
-    auto rtvHandle = app.frameBufferRTVs[app.frameIdx].CPUHandle();
+    //auto rtvHandle = app.frameBufferRTVs[app.frameIdx].CPUHandle();
+    auto rtvHandle = app.nonSRGBFrameBufferRTVs[app.frameIdx].CPUHandle();
 
     const float clearColor[] = { 0.0f, 0.0f, 0.0f, 1.0f };
     commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);

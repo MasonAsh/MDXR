@@ -528,6 +528,10 @@ struct App
     bool borderlessFullscreen = false;
     bool gpuDebug = false;
 
+    struct {
+        bool disableShadows = false;
+    } RenderSettings;
+
     PSOManager psoManager;
 
     PrimitivePool primitivePool;
