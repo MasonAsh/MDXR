@@ -61,14 +61,10 @@ void AddModelToScene(App& app, Model& model)
 
 void StartSceneAssetLoad(App& app)
 {
-    tinygltf::TinyGLTF loader;
-    std::string err;
-    std::string warn;
-
     const std::string& dataDir = app.dataDir;
 
-    EnqueueGLTF(app, dataDir + "/floor/floor.gltf", AddModelToScene);
-    EnqueueGLTF(app, dataDir + "/DamagedHelmet/DamagedHelmet.gltf", AddModelToScene);
+    // EnqueueGLTF(app, dataDir + "/floor/floor.gltf", AddModelToScene);
+    // EnqueueGLTF(app, dataDir + "/DamagedHelmet/DamagedHelmet.gltf", AddModelToScene);
     // EnqueueGLTF(app, dataDir + "/LightTest/LightTest.gltf", AddModelToScene);
     // EnqueueGLTF(app, dataDir + "/VC/VC.gltf", AddModelToScene);
     // EnqueueGLTF(app, dataDir + "/metallicsphere.gltf");
@@ -78,7 +74,7 @@ void StartSceneAssetLoad(App& app)
     // EnqueueGLTF(app, "C:/Users/mason/dev/glTF-Sample-Models/Main/PKG_A_Curtains/NewSponza_Curtains_glTF_with_tangents.gltf", AddModelToScene);
     // EnqueueGLTF(app, "C:/Users/mason/dev/glTF-Sample-Models/Main/PKG_D_Candles/NewSponza_100sOfCandles_glTF_OmniLights_with_tangents.gltf", AddModelToScene);
 
-    // EnqueueGLTF(app, "C:\\Users\\mason\\dev\\glTF-Sample-Models\\castle_dungeon\\scene.gltf", AddModelToScene);
+    EnqueueGLTF(app, "C:\\Users\\mason\\dev\\glTF-Sample-Models\\castle_dungeon\\scene.gltf", AddModelToScene);
 
     SkyboxImagePaths images;
     const std::string skyboxDir = "/Forest/";

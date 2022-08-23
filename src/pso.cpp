@@ -572,6 +572,49 @@ ManagedPSORef CreateToneMapPSO(
     );
 }
 
+ManagedPSORef CreateDebugVisualizerPSO(
+    PSOManager& manager,
+    ID3D12Device5* device,
+    const std::string& dataDir,
+    ID3D12RootSignature* rootSignature,
+    const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
+)
+{
+    // Unlike other PSOs, we go clockwise here.
+    CD3DX12_RASTERIZER_DESC rasterizerState(D3D12_DEFAULT);
+    auto psoDesc = DefaultGraphicsPSODesc();
+    psoDesc.DepthStencilState.DepthEnable = FALSE;
+    psoDesc.DepthStencilState.StencilEnable = FALSE;
+    psoDesc.RasterizerState = rasterizerState;
+
+    // Blend settings for accumulation buffer
+    D3D12_RENDER_TARGET_BLEND_DESC blendDesc = {};
+    blendDesc.BlendEnable = TRUE;
+    blendDesc.LogicOpEnable = FALSE;
+    blendDesc.SrcBlend = D3D12_BLEND_ONE;
+    blendDesc.DestBlend = D3D12_BLEND_ONE;
+    blendDesc.BlendOp = D3D12_BLEND_OP_ADD;
+    blendDesc.SrcBlendAlpha = D3D12_BLEND_ONE;
+    blendDesc.DestBlendAlpha = D3D12_BLEND_ZERO;
+    blendDesc.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    blendDesc.LogicOp = D3D12_LOGIC_OP_NOOP;
+    blendDesc.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+    psoDesc.BlendState.RenderTarget[0] = blendDesc;
+
+    // Back buffer is SRGB format
+    psoDesc.NumRenderTargets = 1;
+
+    return SimpleCreateGraphicsPSO(
+        manager,
+        device,
+        dataDir + "debug_visualizer",
+        rootSignature,
+        inputLayout,
+        psoDesc
+    );
+}
+
 /// Wrote this before learning about DXR 1.1
 /// Leaving it here for reference in case old style ray tracing is needed in the future.
 

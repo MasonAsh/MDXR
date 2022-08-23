@@ -497,6 +497,16 @@ struct Scene
 typedef Pool<Primitive, 100> PrimitivePool;
 typedef Pool<Mesh, 32> MeshPool;
 
+enum DebugVisualizerMode
+{
+    DebugVisualizerMode_Disabled,
+    DebugVisualizerMode_BaseColor,
+    DebugVisualizerMode_Normal,
+    DebugVisualizerMode_Depth,
+    DebugVisualizerMode_MetalRoughness,
+    DebugVisualizerMode_Count,
+};
+
 struct App
 {
     // NOTE: DESTRUCTOR ORDER IS IMPORTANT ON THESE. LEAVE AT TOP.
@@ -692,4 +702,11 @@ struct App
         std::thread thread;
         std::condition_variable workEvent;
     } AssetThread;
+
+
+    struct
+    {
+        DebugVisualizerMode mode = DebugVisualizerMode_Disabled;
+        ManagedPSORef PSO;
+    } DebugVisualizer;
 };

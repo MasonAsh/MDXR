@@ -456,6 +456,15 @@ void SetupPostProcessPass(App& app)
         app.rootSignature.Get(),
         inputLayout
     );
+
+    // Any debug visualizations also happen in post process phase
+    app.DebugVisualizer.PSO = CreateDebugVisualizerPSO(
+        app.psoManager,
+        app.device.Get(),
+        app.dataDir,
+        app.rootSignature.Get(),
+        inputLayout
+    );
 }
 
 template<auto RenderFunc, unsigned threadType>
@@ -1634,6 +1643,20 @@ void TransitionResourcesForPostProcessPass(App& app, GraphicsCommandList* comman
     commandList->ResourceBarrier(1, &barrier);
 }
 
+void DebugVisualizer(App& app, GraphicsCommandList* commandList)
+{
+    auto rtvHandle = app.nonSRGBFrameBufferRTVs[app.frameIdx].CPUHandle();
+    auto dsvHandle = app.depthStencilDescriptor.CPUHandle();
+    commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, &dsvHandle);
+    commandList->SetPipelineState(app.DebugVisualizer.PSO->Get());
+    UINT constantValues[2] = {
+        app.LightBuffer.cbvHandle.Index(),
+        (UINT)app.DebugVisualizer.mode,
+    };
+    commandList->SetGraphicsRoot32BitConstants(0, _countof(constantValues), constantValues, 3);
+    DrawFullscreenQuad(app, commandList);
+}
+
 void PostProcessPass(App& app, GraphicsCommandList* commandList)
 {
     PIXScopedEvent(commandList, 0x89E4F8, L"PostProcessPass");
@@ -1656,16 +1679,20 @@ void PostProcessPass(App& app, GraphicsCommandList* commandList)
 
     commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 
-    // Tone map pass to convert radiance map to sRGB
-    commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
-    commandList->SetPipelineState(app.PostProcessPass.toneMapPSO->Get());
-    UINT constantValues[] = {
-        app.GBuffer.baseSrvReference.Index(),
-        *reinterpret_cast<UINT*>(&app.PostProcessPass.gamma),
-        *reinterpret_cast<UINT*>(&app.PostProcessPass.exposure),
-    };
-    commandList->SetGraphicsRoot32BitConstants(0, _countof(constantValues), constantValues, 0);
-    DrawFullscreenQuad(app, commandList);
+    if (app.DebugVisualizer.mode == DebugVisualizerMode_Disabled) {
+        // Tone map pass to convert radiance map to sRGB
+        commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
+        commandList->SetPipelineState(app.PostProcessPass.toneMapPSO->Get());
+        UINT constantValues[] = {
+            app.GBuffer.baseSrvReference.Index(),
+            *reinterpret_cast<UINT*>(&app.PostProcessPass.gamma),
+            *reinterpret_cast<UINT*>(&app.PostProcessPass.exposure),
+        };
+        commandList->SetGraphicsRoot32BitConstants(0, _countof(constantValues), constantValues, 0);
+        DrawFullscreenQuad(app, commandList);
+    } else {
+        DebugVisualizer(app, commandList);
+    }
 }
 
 void BuildCommandLists(App& app)
@@ -1755,4 +1782,4 @@ void RenderFrame(App& app)
     }
 
     app.frameIdx = app.swapChain->GetCurrentBackBufferIndex();
-}
+    }

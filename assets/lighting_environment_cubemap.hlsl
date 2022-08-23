@@ -110,12 +110,13 @@ float4 PSMain(PSInput input) : SV_TARGET
     float3 kD = 1.0f - kS;
     float4 diffuseBRDF = float4(kD, 1.0f) * float4(diffuse, 1.0f);
     float3 specular = prefilterColor * (kS * envBRDF.x + envBRDF.y);
+    //float3 specular = (float3)0;
 
     float4 Lo = (diffuseBRDF + float4(specular, 1.0f)) * float4(prefilterColor, 1);
 
     float4 color = float4(Lo);
 
-    color = color / (color + 1.0f);
+    //color = float4(envBRDF, 0, 1);
 
     return color;
 }

@@ -382,21 +382,29 @@ ManagedPSORef CreateToneMapPSO(
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
 );
 
-struct RTShaderTable
-{
-    ComPtr<D3D12MA::Allocation> allocation;
-
-    D3D12_GPU_VIRTUAL_ADDRESS_RANGE RayGenerationShaderRecord;
-    D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE MissShaderTable;
-    D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE HitGroupTable;
-    D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE CallableShaderTable;
-};
-
-RayTraceStateObjectRef CreateRTShadowSO(
+ManagedPSORef CreateDebugVisualizerPSO(
     PSOManager& manager,
     ID3D12Device5* device,
-    D3D12MA::Allocator* allocator,
     const std::string& dataDir,
     ID3D12RootSignature* rootSignature,
-    RTShaderTable* shaderTable
+    const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
 );
+
+// struct RTShaderTable
+// {
+//     ComPtr<D3D12MA::Allocation> allocation;
+
+//     D3D12_GPU_VIRTUAL_ADDRESS_RANGE RayGenerationShaderRecord;
+//     D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE MissShaderTable;
+//     D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE HitGroupTable;
+//     D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE CallableShaderTable;
+// };
+
+// RayTraceStateObjectRef CreateRTShadowSO(
+//     PSOManager& manager,
+//     ID3D12Device5* device,
+//     D3D12MA::Allocator* allocator,
+//     const std::string& dataDir,
+//     ID3D12RootSignature* rootSignature,
+//     RTShaderTable* shaderTable
+// );

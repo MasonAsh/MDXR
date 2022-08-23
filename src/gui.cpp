@@ -325,8 +325,7 @@ void DrawMenuBar(App& app)
 
 void DrawGeekMenu(App& app)
 {
-    static bool geekOpen = false;
-    if (ImGui::CollapsingHeader("Nerd Stuff", &geekOpen)) {
+    if (ImGui::CollapsingHeader("Nerd Stuff")) {
         static bool debugSkybox = false;
         if (ImGui::Checkbox("Debug Diffuse IBL", &debugSkybox)) {
             if (app.Skybox.mesh && app.Skybox.mesh->isReadyForRender) {
@@ -357,6 +356,10 @@ void DrawGeekMenu(App& app)
         }
 
         ImGui::Checkbox("Disable Shadows", &app.RenderSettings.disableShadows);
+
+        const char* debugNames[DebugVisualizerMode_Count] = { "Disabled", "BaseColor", "Normal", "Depth", "MetalRoughness" };
+        const char* debugName = debugNames[app.DebugVisualizer.mode];
+        ImGui::SliderInt("Debug Visualizer", (int*)&app.DebugVisualizer.mode, DebugVisualizerMode_Disabled, DebugVisualizerMode_Count - 1, debugName);
     }
 }
 
