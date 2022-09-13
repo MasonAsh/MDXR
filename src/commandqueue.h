@@ -129,8 +129,6 @@ public:
 
         HRESULT hr;
         {
-            // We must synchronize the calls to the queue, but don't want to keep the lock for
-            // the CPU wait.
             std::scoped_lock lock{ mutex };
 
             waitEvent.sourceFence->WaitQueue(commandQueue.Get(), waitEvent);
@@ -189,4 +187,4 @@ private:
     IncrementalFence fence;
     D3D12_COMMAND_LIST_TYPE commandListType;
     std::mutex mutex;
-};
+    };

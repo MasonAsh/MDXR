@@ -95,7 +95,7 @@ float4 PSMain(PSInput input) : SV_TARGET
         float roughness = metalRoughness.g;
         float metallic = metalRoughness.b;
 
-        float3 lightToFragment = (-viewPos.xyz) -  (-light.positionViewSpace.xyz);
+        float3 lightToFragment = (-worldPos.xyz) -  (-light.position.xyz);
         float distance = length(lightToFragment);
         float attenuation = 1.0f / (distance * distance);
 
@@ -104,7 +104,7 @@ float4 PSMain(PSInput input) : SV_TARGET
         // Light direction to fragment
         float3 Wi = lightToFragment / distance;
         // Direction from fragment to eye
-        float3 Wo = normalize(-viewPos.xyz);
+        float3 Wo = normalize(passData.eyePosWorld.xyz - worldPos.xyz);
 
         float4 color = ShadePBR(
             light.colorIntensity.xyz,

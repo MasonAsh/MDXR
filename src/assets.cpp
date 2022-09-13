@@ -233,6 +233,8 @@ void CreateModelMaterials(
         material->baseColorFactor.y = static_cast<float>(inputMaterial.pbrMetallicRoughness.baseColorFactor[1]);
         material->baseColorFactor.z = static_cast<float>(inputMaterial.pbrMetallicRoughness.baseColorFactor[2]);
         material->baseColorFactor.w = static_cast<float>(inputMaterial.pbrMetallicRoughness.baseColorFactor[3]);
+        material->metalRoughnessFactor.x = 1.0f;
+        material->metalRoughnessFactor.w = 1.0f;
         material->metalRoughnessFactor.y = static_cast<float>(inputMaterial.pbrMetallicRoughness.roughnessFactor);
         material->metalRoughnessFactor.z = static_cast<float>(inputMaterial.pbrMetallicRoughness.metallicFactor);
         material->cbvDescriptor = std::move(descriptor);
@@ -1381,7 +1383,7 @@ bool ValidateSkyboxAssets(const SkyboxAssets& assets)
 void RenderSkyboxEnvironmentLightMaps(App& app, const SkyboxAssets& assets, FenceEvent& cubemapUploadEvent, AssetLoadContext* context)
 {
     // IMPORTANT: If this gets changed, PREFILTER_MAP_MIPCOUNT in common.hlsli must also be changed
-    const UINT PrefilterMipCount = 5;
+    const UINT PrefilterMipCount = 6;
 
     ScopedPerformanceTracker perf(__func__, PerformancePrecision::Milliseconds);
 
@@ -1490,11 +1492,12 @@ void RenderSkyboxEnvironmentLightMaps(App& app, const SkyboxAssets& assets, Fenc
         PIXScopedEvent(commandList.Get(), 0, ("CubeImage#" + std::to_string(i)).c_str());
 
         float roughness = 1.0f;
-
-        UINT constantValues[6] = {
+        float isDiffuse = 1.0f;
+        UINT constantValues[7] = {
             app.Skybox.texcubeSRV.Index(),
             diffuseIrradianceUAV.Index(),
             i,
+            *reinterpret_cast<UINT*>(&isDiffuse),
             *reinterpret_cast<UINT*>(&roughness),
             *reinterpret_cast<UINT*>(&texelSize[0]),
             *reinterpret_cast<UINT*>(&texelSize[1])
@@ -1508,10 +1511,12 @@ void RenderSkyboxEnvironmentLightMaps(App& app, const SkyboxAssets& assets, Fenc
         {
             glm::vec2 texelSize = glm::vec2(1.0f / mipWidth, 1.0f / mipHeight);
             float roughness = static_cast<float>(mip) / static_cast<float>(PrefilterMipCount - 1);
-            UINT constantValues[6] = {
+            float isDiffuse = 0.0f;
+            UINT constantValues[7] = {
                 app.Skybox.texcubeSRV.Index(),
                 prefilterMapUAVs.Index() + mip,
                 i,
+                *reinterpret_cast<UINT*>(&isDiffuse),
                 *reinterpret_cast<UINT*>(&roughness),
                 *reinterpret_cast<UINT*>(&texelSize[0]),
                 *reinterpret_cast<UINT*>(&texelSize[1])
@@ -1613,11 +1618,44 @@ void LoadBRDFLUT(App& app, UploadBatch& uploadBatch)
 }
 
 
+void FreeSkybox(App& app)
+{
+    if (!app.Skybox.prefilterMapSRV.IsValid()) {
+        return;
+    }
+
+    auto lock = LockRenderThread(app);
+    app.graphicsQueue.WaitForEventCPU(app.previousFrameEvent);
+
+    app.Skybox.prefilterMapSRV = UniqueDescriptors();
+    app.Skybox.cubemap = nullptr;
+    app.Skybox.irradianceCubeMap = nullptr;
+
+    app.Skybox.cubemap = nullptr;
+    app.Skybox.vertexBuffer = nullptr;
+    app.Skybox.indexBuffer = nullptr;
+    app.Skybox.perPrimitiveConstantBuffer = nullptr;
+    app.Skybox.irradianceCubeMap = nullptr;
+    app.Skybox.prefilterMap = nullptr;
+    app.Skybox.perPrimitiveCBV = UniqueDescriptors();
+    app.Skybox.texcubeSRV = UniqueDescriptors();
+    app.Skybox.irradianceCubeSRV = UniqueDescriptors();
+    app.Skybox.prefilterMapSRV = UniqueDescriptors();
+    app.Skybox.mesh = nullptr;
+
+    // LUT texture for environment BRDF split sum calculation.
+    app.Skybox.brdfLUT = nullptr;
+    app.Skybox.brdfLUTDescriptor = UniqueDescriptors();
+}
+
+
 void CreateSkybox(App& app, const SkyboxAssets& asset, AssetLoadContext* context)
 {
     if (!ValidateSkyboxAssets(asset)) {
         return;
     }
+
+    FreeSkybox(app);
 
     context->currentTask = "Uploading cubemap";
     context->overallPercent = 0.15f;

@@ -30,9 +30,10 @@ struct LightPassConstantData
     glm::mat4 inverseProjectionMatrix;
     glm::mat4 inverseViewMatrix;
     glm::vec4 environmentIntensity;
+    glm::vec4 eyePosWorld;
     UINT baseGBufferIndex;
     UINT debug;
-    float pad[26];
+    float pad[22];
 };
 static_assert((sizeof(LightPassConstantData) % 256) == 0, "Constant buffer must be 256-byte aligned");
 

@@ -357,9 +357,23 @@ void DrawGeekMenu(App& app)
 
         ImGui::Checkbox("Disable Shadows", &app.RenderSettings.disableShadows);
 
-        const char* debugNames[DebugVisualizerMode_Count] = { "Disabled", "BaseColor", "Normal", "Depth", "MetalRoughness" };
+        const char* debugNames[DebugVisualizerMode_Count] = { "Disabled", "Radiance", "BaseColor", "Normal", "Depth", "MetalRoughness" };
         const char* debugName = debugNames[app.DebugVisualizer.mode];
         ImGui::SliderInt("Debug Visualizer", (int*)&app.DebugVisualizer.mode, DebugVisualizerMode_Disabled, DebugVisualizerMode_Count - 1, debugName);
+
+        ImVec4 debugColor = {
+            app.CursorColorDebug.lastRGBA.x,
+            app.CursorColorDebug.lastRGBA.y,
+            app.CursorColorDebug.lastRGBA.z,
+            app.CursorColorDebug.lastRGBA.w
+        };
+        ImGui::Text("DebugColor R:%.2f, G:%.2f, B:%.2f, A:%.2f", debugColor.x, debugColor.y, debugColor.z, debugColor.w);
+        ImGui::SameLine();
+        ImGui::ColorButton("DebugColor", debugColor);
+
+        if (ImGui::Button("Reload Skybox")) {
+            StartSkyboxLoad(app);
+        }
     }
 }
 

@@ -300,7 +300,11 @@ int RunApp(int argc, char** argv)
         ReloadIfShaderChanged(app);
 
         buttonState = SDL_GetMouseState(&mouseX, &mouseY);
+        app.mouseState.cursorPos = glm::ivec2(mouseX, mouseY);
+
         UpdateControllerState(app);
+
+        app.mouseState.leftClick = (buttonState & SDL_BUTTON_LMASK);
 
         app.camera.locked = (buttonState & SDL_BUTTON_RMASK) == 0;
         if (!app.camera.locked) {

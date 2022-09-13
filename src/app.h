@@ -207,6 +207,8 @@ struct MouseState
 {
     int xrel, yrel;
     float scrollDelta;
+    glm::ivec2 cursorPos;
+    bool leftClick;
 };
 
 struct ControllerState {
@@ -500,6 +502,7 @@ typedef Pool<Mesh, 32> MeshPool;
 enum DebugVisualizerMode
 {
     DebugVisualizerMode_Disabled,
+    DebugVisualizerMode_Radiance,
     DebugVisualizerMode_BaseColor,
     DebugVisualizerMode_Normal,
     DebugVisualizerMode_Depth,
@@ -561,6 +564,7 @@ struct App
     CD3DX12_RECT scissorRect;
 
     std::array<RenderThread, RenderThread_Count> renderThreads;
+    std::mutex renderFrameMutex;
 
     CommandQueue computeQueue;
     ComPtr<ID3D12CommandAllocator> computeCommandAllocator;
@@ -609,6 +613,12 @@ struct App
         UniqueDescriptors baseSrvReference;
         DescriptorRef rtvs[GBuffer_RTVCount];
     } GBuffer;
+
+    struct {
+        ComPtr<D3D12MA::Allocation> readbackBuffer;
+        glm::vec4 lastRGBA;
+        bool readbackPending = false;
+    } CursorColorDebug;
 
     struct
     {
@@ -710,3 +720,5 @@ struct App
         ManagedPSORef PSO;
     } DebugVisualizer;
 };
+
+std::scoped_lock<std::mutex> LockRenderThread(App& app);

@@ -33,7 +33,8 @@ PSInput VSMain(VSInput input)
 
     float3 binormal = cross(input.normal, input.tangent.xyz) * input.tangent.w;
 
-    float3x3 MV3 = (float3x3)primitive.MV;
+    // Write out world space normals
+    float3x3 MV3 = (float3x3)primitive.M;
 
     result.normalVS = mul(MV3, input.normal);
     result.tangentVS = mul(MV3, input.tangent.xyz);
@@ -51,7 +52,7 @@ PSOutput PSMain(PSInput input)
     ConstantBuffer<MaterialData> mat = GetMaterial();
 
     // We can write ambient light straight to the backbuffer.
-    float4 ambient = { 0.01, 0.01, 0.01, 1.0 };
+    float4 ambient = { 0.0, 0.0, 0.0, 1.0 };
     result.backBuffer = ambient;
 
 

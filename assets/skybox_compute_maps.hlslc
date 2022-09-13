@@ -4,14 +4,14 @@
 
 #define BLOCK_SIZE 8
 #define THREADS_PER_PIXEL 16
-#define SAMPLES_PER_PIXEL 256
+#define SAMPLES_PER_PIXEL 1024
 #define SAMPLES_PER_THREAD ((float)SAMPLES_PER_PIXEL / (float)THREADS_PER_PIXEL)
-#define SAMPLE_DELTA sqrt((4.0f*PI) / (float)SAMPLES_PER_PIXEL)
 
 cbuffer Constants : register(b0) {
     uint g_SkyboxSrvIdx;
     uint g_OutTextureUavIdx;
     uint g_FaceIndex;
+    float g_IsDiffuse; // 0.0 for prefilter map, 1.0 for diffuse irradiance
     float g_Roughness;
     float2 g_TexelSize;
 };
@@ -21,6 +21,14 @@ struct ComputeShaderInput {
     uint3 groupThreadID : SV_GroupThreadID;
     uint3 dispatchThreadID : SV_DispatchThreadID;
     uint groupIndex : SV_GroupIndex;
+};
+
+struct MicrofacetDistributionSample
+{
+    float pdf;
+    float cosTheta;
+    float sinTheta;
+    float phi;
 };
 
 groupshared float4 g_IrradianceAccumulators[BLOCK_SIZE * BLOCK_SIZE * THREADS_PER_PIXEL];
@@ -64,6 +72,35 @@ float2 Hammersley(uint i, uint N)
     return float2(float(i) / float(N), ri);
 }
 
+MicrofacetDistributionSample SampleGGX(float2 xi, float roughness)
+{
+    MicrofacetDistributionSample mds;
+    
+    float a = roughness * roughness;
+    mds.cosTheta = saturate(sqrt((1.0 - xi.y) / (1.0 + (a * a - 1.0) * xi.y)));
+    mds.sinTheta = sqrt(1.0 - mds.cosTheta * mds.cosTheta);
+    mds.phi = 2.0 * PI * xi.x;
+
+    mds.pdf = DistributionGGX(mds.cosTheta, roughness);
+
+    mds.pdf /= 4.0;
+
+    return mds;
+}
+
+MicrofacetDistributionSample SampleLambertian(float2 xi)
+{
+    MicrofacetDistributionSample mds;
+    
+    mds.cosTheta = sqrt(1.0 - xi.y);
+    mds.sinTheta = sqrt(xi.y);
+    mds.phi = 2.0 * PI * xi.x;
+    
+    mds.pdf = mds.cosTheta / PI;
+
+    return mds;
+}
+
 float3 ImportanceSampleGGX(float2 Xi, float3x3 TBN, float roughness)
 {
     float a = roughness * roughness;
@@ -77,8 +114,52 @@ float3 ImportanceSampleGGX(float2 Xi, float3x3 TBN, float roughness)
     H.y = sinTheta * sin(phi);
     H.z = cosTheta;
 
-    //return tangentSample.x * tangentX + tangentSample.y * tangentY + tangentSample.z * N; 
     return mul(H, TBN);
+}
+
+float3 ImportanceSampleDiffuse(float2 Xi, float3x3 TBN)
+{
+    float phi = 2 * PI * Xi.x;
+    float cosTheta = 1.0f - Xi.y;
+    float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+
+    float3 H;
+    H.x = sinTheta * cos(phi);
+    H.y = sinTheta * sin(phi);
+    H.z = cosTheta;
+
+    return mul(H, TBN);
+}
+
+float3 ImportanceSample(float2 xi, float3x3 TBN, float roughness, out float pdf)
+{
+    MicrofacetDistributionSample mds;
+
+    if (g_IsDiffuse) {
+        mds = SampleLambertian(xi);
+    } else {
+        mds = SampleGGX(xi, roughness);
+    }
+
+    pdf = mds.pdf;
+
+    float3 H;
+    H.x = mds.sinTheta * cos(mds.phi);
+    H.y = mds.sinTheta * sin(mds.phi);
+    H.z = mds.cosTheta;
+    H = normalize(H);
+
+    return mul(H, TBN);
+}
+
+float3 AdjustSkyboxColor(float3 color)
+{
+    //const float environmentScale = 3.14;
+    const float environmentScale = 1.0f;
+    float luma = max(0.000000001, max_float3(color));
+    float3 result = color;
+    //result *= 1.0 - max(0.0, luma) / luma;
+    return result * environmentScale;
 }
 
 [numthreads(BLOCK_SIZE, BLOCK_SIZE, THREADS_PER_PIXEL)]
@@ -92,6 +173,7 @@ void CSMain(ComputeShaderInput input)
     uint3 groupThreadID = input.groupThreadID;
 
     float3 N = normalize(ConvertCubeUVToXYZ(g_FaceIndex, outUV));
+    N.x *= -1;
     float3 R = N;
     float3 V = N;
 
@@ -103,7 +185,6 @@ void CSMain(ComputeShaderInput input)
     uint startSample = groupThreadID.z * SAMPLES_PER_THREAD;
     uint endSample = (groupThreadID.z + 1) * SAMPLES_PER_THREAD;
 
-    //float2 dimensions = 1.0f / texelSize;
     float2 dimensions;
     skybox.GetDimensions(dimensions.x, dimensions.y);
 
@@ -118,22 +199,29 @@ void CSMain(ComputeShaderInput input)
     for (uint i = startSample; i < endSample; i += 1) {
         float2 Xi = Hammersley(i, SAMPLES_PER_PIXEL);
 
-        float3 H = ImportanceSampleGGX(Xi, tangentToWorld, g_Roughness);
-        float3 L  = 2.0 * dot(V, H) * H - V;
-        float NdotL = max(dot(N, L), 0);
-        float NdotH = max(dot(N, H), 0);
-        float VdotH = max(dot(V, H), 0);
-        if (NdotL > 0.0f) {
-            float D = DistributionGGX(NdotH, g_Roughness);
-            float pdf = (D * NdotH / (4.0f * VdotH)) + 0.0001f;
-            float solidAngleTexel = 4.0f * PI / (6 * dimensions.x * dimensions.x);
-            float solidAngleSample = 1.0f / ((float)SAMPLES_PER_PIXEL * pdf + 0.0001f);
+        float pdf;
+        float3 H = ImportanceSample(Xi, tangentToWorld, g_Roughness, pdf);
 
-            float mip = g_Roughness == 0.0f ? 0.0f : 0.5f * log2((float)(solidAngleSample/solidAngleTexel));
+        float mip = 0.5 * log2(6.0 * float(dimensions.x) * float(dimensions.x) / (float(SAMPLES_PER_PIXEL) * pdf));
 
-            float4 skySample = skybox.SampleLevel(g_sampler, H, mip);
-            irradiance.rgb += skySample.rgb * NdotL;
-            irradiance.a += NdotL;
+        if (g_IsDiffuse) {
+            float3 skySample = skybox.SampleLevel(g_sampler, H, mip).rgb;
+            irradiance.rgb += skySample;
+            irradiance.w += 1;
+        } else {
+            float3 L  = normalize(reflect(-V, H));
+            float NdotL = dot(N, L);
+            if (NdotL > 0.0) {
+
+                if (g_Roughness == 0.0) {
+                    mip = 0;
+                }
+
+                float3 skySample = skybox.SampleLevel(g_sampler, L, mip).rgb;
+
+                irradiance.rgb += skySample * NdotL;
+                irradiance.w += NdotL;
+            }
         }
     }
 

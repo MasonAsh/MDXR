@@ -7,6 +7,11 @@
 #include <directx/d3dx12.h>
 #include <pix3.h>
 
+std::scoped_lock<std::mutex> LockRenderThread(App& app)
+{
+    return std::scoped_lock<std::mutex>(app.renderFrameMutex);
+}
+
 void SetupDepthStencil(App& app, bool isResize)
 {
     if (!isResize) {
@@ -148,12 +153,45 @@ void SetupGBuffer(App& app, bool isResize)
     app.device->CreateShaderResourceView(app.depthStencilBuffer.Get(), &depthSrvDesc, srvHandle);
 }
 
+void SetupCursorColorDebug(App& app)
+{
+    D3D12MA::ALLOCATION_DESC readbackProperties = {};
+    readbackProperties.HeapType = D3D12_HEAP_TYPE_READBACK;
+
+    D3D12_RESOURCE_DESC resourceDesc = {};
+    resourceDesc.DepthOrArraySize = 1;
+    resourceDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    resourceDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    resourceDesc.Format = DXGI_FORMAT_UNKNOWN;
+    resourceDesc.Height = 1;
+    resourceDesc.Width = sizeof(float) * 4;
+    resourceDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    resourceDesc.MipLevels = 1;
+    resourceDesc.SampleDesc.Count = 1;
+
+    ASSERT_HRESULT(
+        app.mainAllocator->CreateResource(
+            &readbackProperties,
+            &resourceDesc,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            nullptr,
+            &app.CursorColorDebug.readbackBuffer,
+            IID_NULL, nullptr
+        )
+    );
+
+    app.CursorColorDebug.lastRGBA = glm::vec4(0);
+}
+
 void HandleResize(App& app, int newWidth, int newHeight)
 {
     // Release references to the buffers before resizing.
     for (auto& renderTarget : app.renderTargets) {
         renderTarget = nullptr;
     }
+
+    auto lock = LockRenderThread(app);
+    app.graphicsQueue.WaitForEventCPU(app.previousFrameEvent);
 
     app.swapChain->ResizeBuffers(2, newWidth, newHeight, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
     app.viewport.Width = (float)newWidth;
@@ -265,7 +303,7 @@ void SetupMipMapGenerator(App& app)
 
     CD3DX12_ROOT_PARAMETER1 rootParameters[1];
 
-    rootParameters->InitAsConstants(6, 0);
+    rootParameters->InitAsConstants(7, 0);
 
     D3D12_ROOT_SIGNATURE_FLAGS rootSignatureFlags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
 
@@ -789,6 +827,8 @@ void InitRenderer(App& app)
     // SetupShadowPass(app);
     SetupPostProcessPass(app);
 
+    SetupCursorColorDebug(app);
+
     ASSERT_HRESULT(
         device->CreateCommandAllocator(
             D3D12_COMMAND_LIST_TYPE_COPY,
@@ -980,10 +1020,11 @@ void SetupLightShadowMap(App& app, Light& light, int lightIdx)
     }
 }
 
-void UpdateLightConstantBuffers(App& app, const glm::mat4& projection, const glm::mat4& view)
+void UpdateLightConstantBuffers(App& app, const glm::mat4& projection, const glm::mat4& view, const glm::vec3& eyePosWorld)
 {
     app.LightBuffer.passData->inverseProjectionMatrix = glm::inverse(projection);
     app.LightBuffer.passData->inverseViewMatrix = glm::inverse(view);
+    app.LightBuffer.passData->eyePosWorld = glm::vec4(eyePosWorld, 1.0f);
 
     for (UINT i = 0; i < app.LightBuffer.count; i++) {
         Light& light = app.lights[i];
@@ -1106,7 +1147,7 @@ void DoFrustumCulling(PrimitivePool& primitivePool, const glm::mat4& viewProject
 
 void UpdateRenderData(App& app, const glm::mat4& projection, const glm::mat4& view, const glm::vec3& camPos)
 {
-    UpdateLightConstantBuffers(app, projection, view);
+    UpdateLightConstantBuffers(app, projection, view, camPos);
     UpdatePerPrimitiveData(app, projection, view);
     DoFrustumCulling(app.primitivePool, projection * view);
     //UpdateRayTraceInfo(app, projection * view, camPos);
@@ -1599,7 +1640,7 @@ void LightPass(App& app, GraphicsCommandList* commandList)
             PIXBeginEvent(commandList, 0xFF9F82, L"EnvironmentCubemap");
             commandList->SetPipelineState(app.LightPass.environentCubemapLightPso->Get());
             UINT constantValues[5] = {
-                UINT_MAX,
+                app.TLAS.descriptor.Index(),
                 app.Skybox.brdfLUTDescriptor.Index(),
                 app.Skybox.irradianceCubeSRV.Index(),
                 app.LightBuffer.cbvHandle.Index(),
@@ -1695,7 +1736,102 @@ void PostProcessPass(App& app, GraphicsCommandList* commandList)
     }
 }
 
-void BuildCommandLists(App& app)
+ID3D12Resource* GetColorCusorSourceBuffer(App& app)
+{
+    ID3D12Resource* result = nullptr;
+    switch (app.DebugVisualizer.mode)
+    {
+    case DebugVisualizerMode_Disabled:
+    default: // TODO: support GBuffers for cursor color debug
+        result = app.renderTargets[app.frameIdx].Get();
+        break;
+        // case DebugVisualizerMode_Radiance:
+        //     result = app.GBuffer.renderTargets[GBuffer_Radiance].Get();
+        //     break;
+        // case DebugVisualizerMode_BaseColor:
+        //     result = app.GBuffer.renderTargets[GBuffer_BaseColor].Get();
+        //     break;
+        // case DebugVisualizerMode_Normal:
+        //     result = app.GBuffer.renderTargets[GBuffer_Normal].Get();
+        //     break;
+        // case DebugVisualizerMode_Depth:
+        //     result = app.GBuffer.renderTargets[GBuffer_Depth].Get();
+        //     break;
+        // case DebugVisualizerMode_MetalRoughness:
+        //     result = app.GBuffer.renderTargets[GBuffer_MetalRoughness].Get();
+        //     break;
+    }
+
+    return result;
+}
+
+void ExecuteColorCusorReadback(App& app, GraphicsCommandList* commandList, D3D12_RESOURCE_STATES& renderTargetState)
+{
+    // Bounds check the cursor
+    if (app.mouseState.cursorPos.x < 0 || app.mouseState.cursorPos.x >= app.windowWidth ||
+        app.mouseState.cursorPos.y < 0 || app.mouseState.cursorPos.y >= app.windowHeight) {
+        return;
+    }
+
+    auto pSrc = GetColorCusorSourceBuffer(app);
+
+    D3D12_TEXTURE_COPY_LOCATION dst = {};
+    dst.pResource = app.CursorColorDebug.readbackBuffer->GetResource();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+
+    auto srcDesc = pSrc->GetDesc();
+    app.device->GetCopyableFootprints(
+        &srcDesc,
+        0,
+        1,
+        0,
+        &dst.PlacedFootprint,
+        nullptr,
+        nullptr,
+        nullptr
+    );
+
+    dst.PlacedFootprint.Footprint.Width = 1;
+    dst.PlacedFootprint.Footprint.Height = 1;
+
+    D3D12_TEXTURE_COPY_LOCATION src = {};
+    src.pResource = pSrc;
+    src.SubresourceIndex = 0;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+
+    D3D12_BOX srcBox;
+    srcBox.left = app.mouseState.cursorPos.x;
+    srcBox.right = app.mouseState.cursorPos.x + 1;
+    srcBox.top = app.mouseState.cursorPos.y;
+    srcBox.bottom = app.mouseState.cursorPos.y + 1;
+    srcBox.back = 1;
+    srcBox.front = 0;
+
+    auto afterState = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+        app.renderTargets[app.frameIdx].Get(),
+        renderTargetState,
+        afterState
+    );
+    commandList->ResourceBarrier(
+        1,
+        &barrier
+    );
+    renderTargetState = afterState;
+
+    commandList->CopyTextureRegion(
+        &dst,
+        0,
+        0,
+        0,
+        &src,
+        &srcBox
+    );
+
+    app.CursorColorDebug.readbackPending = true;
+}
+
+void BuildPresentCommandList(App& app)
 {
     GraphicsCommandList* commandList = app.commandList.Get();
 
@@ -1707,8 +1843,6 @@ void BuildCommandLists(App& app)
         commandList->Reset(app.commandAllocator.Get(), app.pipelineState.Get())
     );
 
-    NotifyRenderThreads(app);
-
     PostProcessPass(app, commandList);
 
     auto linearRTV = app.nonSRGBFrameBufferRTVs[app.frameIdx].CPUHandle();
@@ -1719,30 +1853,70 @@ void BuildCommandLists(App& app)
 
     ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), commandList);
 
+
+    D3D12_RESOURCE_STATES backBufferState = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    if (app.mouseState.leftClick) {
+        ExecuteColorCusorReadback(app, commandList, backBufferState);
+    }
+
     // Indicate that the back buffer will now be used to present.
     auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(
         app.renderTargets[app.frameIdx].Get(),
-        D3D12_RESOURCE_STATE_RENDER_TARGET,
+        backBufferState,
         D3D12_RESOURCE_STATE_PRESENT
     );
     commandList->ResourceBarrier(1, &barrier);
 
-    //TransitionResourcesForShadowPass(app, commandList);
-
     ASSERT_HRESULT(
         commandList->Close()
     );
+}
+
+void BuildCommandLists(App& app)
+{
+    NotifyRenderThreads(app);
+
+    // This one can go on main thread
+    BuildPresentCommandList(app);
 
     WaitRenderThreads(app);
 }
 
+void FetchCusorColor(App& app)
+{
+    if (app.CursorColorDebug.readbackPending) {
+        UINT* data;
+        D3D12_RANGE readbackRange{ 0, sizeof(UINT) };
+        app.CursorColorDebug.readbackBuffer->GetResource()->Map(
+            0,
+            &readbackRange,
+            reinterpret_cast<void**>(&data)
+        );
+
+        app.CursorColorDebug.lastRGBA.w = ((*data & 0xFF000000) >> 24);
+        app.CursorColorDebug.lastRGBA.z = ((*data & 0x00FF0000) >> 16);
+        app.CursorColorDebug.lastRGBA.y = ((*data & 0x0000FF00) >> 8);
+        app.CursorColorDebug.lastRGBA.x = ((*data & 0x000000FF) >> 0);
+        app.CursorColorDebug.lastRGBA /= 255.0f;
+
+        D3D12_RANGE emptyRange{ 0, 0 };
+        app.CursorColorDebug.readbackBuffer->GetResource()->Unmap(
+            0,
+            &emptyRange
+        );
+
+        app.CursorColorDebug.readbackPending = false;
+    }
+}
+
 void RenderFrame(App& app)
 {
+    auto lock = LockRenderThread(app);
+    app.graphicsQueue.WaitForEventCPU(app.previousFrameEvent);
+
     app.Stats.drawCalls = 0;
 
-    bool tdrOccurred = false;
-
-    app.graphicsQueue.WaitForEventCPU(app.previousFrameEvent);
+    FetchCusorColor(app);
 
     BuildCommandLists(app);
 
@@ -1754,11 +1928,11 @@ void RenderFrame(App& app)
     FenceEvent shadowPassFenceEvent;
     FenceEvent gbufferFenceEvent;
 
-    //app.computeQueue.ExecuteCommandLists({ shadowCommandList }, shadowPassFenceEvent);
+    FenceEvent renderWorkloadEvent;
 
 #define EXECUTE_MULTI_COMMANDLISTS
 #ifdef EXECUTE_MULTI_COMMANDLISTS
-    app.graphicsQueue.ExecuteCommandListsBlocking(commandLists);
+    app.graphicsQueue.ExecuteCommandLists(commandLists, renderWorkloadEvent);
 #else
     for (auto& commandList : commandLists) {
         app.graphicsQueue.ExecuteCommandListsBlocking({ commandList }, app.previousFrameEvent);
@@ -1772,14 +1946,14 @@ void RenderFrame(App& app)
         app.swapChain.Get(),
         0,
         DXGI_PRESENT_ALLOW_TEARING,
-        app.previousFrameEvent
+        app.previousFrameEvent,
+        renderWorkloadEvent
     );
 
     if (!SUCCEEDED(hr)) {
-        tdrOccurred = true;
         app.running = false;
         DebugLog() << "TDR occurred\n";
     }
 
     app.frameIdx = app.swapChain->GetCurrentBackBufferIndex();
-    }
+}

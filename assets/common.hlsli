@@ -43,6 +43,7 @@ struct LightPassConstantData
     float4x4 inverseProjection;
     float4x4 inverseView;
     float4 environmentIntensity;
+    float4 eyePosWorld;
     uint baseGBufferIdx;
     uint debug;
 };
@@ -60,12 +61,12 @@ float4 make_float4(float value)
     return float4(value, value, value, value);
 }
 
-float3 ExpandNormal(float3 n)
+float max_float3(float3 v)
 {
-    return n * 2.0f - 1.0f;
+    return max(v.x, max(v.y, v.z));
 }
 
-#define PREFILTER_MAP_MIPCOUNT 5
+#define PREFILTER_MAP_MIPCOUNT 6
 
 #define GBUFFER_RADIANCE 0
 #define GBUFFER_BASE_COLOR 1
@@ -89,9 +90,9 @@ SamplerState g_samplerShadowMap : register(s1);
 float4 DoNormalMap(Texture2D normalMap, float3x3 TBN, float2 uv)
 {
     float3 normal = normalMap.Sample(g_sampler, uv).xyz;
-    normal = ExpandNormal(normal);
+    normal = normal * 2.0f - 1.0f;
     normal = mul(normal, TBN);
-    return normalize(float4(normal, 0.0f));
+    return float4(normalize(normal), 0.0);
 }
 
 ConstantBuffer<PrimitiveInstanceData> GetPrimitiveInstanceData(uint instance) 

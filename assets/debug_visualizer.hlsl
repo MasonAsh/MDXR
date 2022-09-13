@@ -20,15 +20,19 @@ float4 PSMain(PSInput input) : SV_TARGET
 {
     ConstantBuffer<LightPassConstantData> passData = GetLightPassData();
 
+    Texture2D radianceTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + GBUFFER_RADIANCE];
     Texture2D baseColorTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + GBUFFER_BASE_COLOR];
     Texture2D normalTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + GBUFFER_NORMAL];
     Texture2D metalRoughnessTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + GBUFFER_METAL_ROUGHNESS];
     Texture2D depthTexture = ResourceDescriptorHeap[passData.baseGBufferIdx + GBUFFER_DEPTH];
 
+    float3 radiance = radianceTexture.Sample(g_sampler, input.uv).rgb;
     float3 baseColor = baseColorTexture.Sample(g_sampler, input.uv).rgb;
     float depth = depthTexture.Sample(g_sampler, input.uv).r;
     float4 normal = normalTexture.Sample(g_sampler, input.uv);
     float4 metalRoughness = metalRoughnessTexture.Sample(g_sampler, input.uv);
+
+    normal = float4((normal.xyz + 1.0) * 0.5, 1.0);
 
     uint debugMode = g_MiscDescriptorIndex;
 
@@ -36,12 +40,14 @@ float4 PSMain(PSInput input) : SV_TARGET
 
     //enum DebugVisualizerMode
     if (debugMode == 1) {
-        color = baseColor;
+        color = radiance;
     } else if (debugMode == 2) {
-        color = normal.xyz;
+        color = baseColor;
     } else if (debugMode == 3) {
-        color = (float3)depth;
+        color = normal.xyz;
     } else if (debugMode == 4) {
+        color = (float3)depth;
+    } else if (debugMode == 5) {
         color = metalRoughness.rgb;
     }
 

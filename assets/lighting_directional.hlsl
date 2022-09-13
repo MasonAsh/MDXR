@@ -92,9 +92,9 @@ float4 PSMain(PSInput input) : SV_TARGET
     float3 N = normal.xyz;
 
     // Light direction to fragment
-    float3 Wi = normalize(-light.directionViewSpace.xyz);
+    float3 L = normalize(-light.direction.xyz);
     // Direction from fragment to eye
-    float3 Wo = normalize(-viewPos.xyz);
+    float3 V = normalize(passData.eyePosWorld.xyz - worldPos.xyz);
 
     float4 color = ShadePBR(
         light.colorIntensity.xyz,
@@ -102,8 +102,8 @@ float4 PSMain(PSInput input) : SV_TARGET
         N,
         roughness,
         metallic,
-        Wi,
-        Wo,
+        L,
+        V,
         attenuation
     );
     color.rgb *=  (1.0f - shadow);
