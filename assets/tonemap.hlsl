@@ -12,7 +12,8 @@ struct PSInput {
     float2 uv : TEXCOORD;
 };
 
-float3 filmic(float3 x) {
+float3 filmic(float3 x) 
+{
   float3 X = max((float3)0.0, x - 0.004);
   float3 result = (X * (6.2 * X + 0.5)) / (X * (6.2 * X + 1.7) + 0.06);
   return pow(result, (float3)2.2);
@@ -43,12 +44,6 @@ float4 PSMain(PSInput input) : SV_TARGET
     Texture2D radianceTexture = ResourceDescriptorHeap[baseGBufferIdx + GBUFFER_RADIANCE];
     float3 radiance = radianceTexture.Sample(g_sampler, input.uv).rgb;
 
-    //float3 color = (float3)1.0f - exp(-radiance * exposure);
-
-    // float3 color = radiance * exposure;
-    // color = pow(color, 1/gamma);
-
-    //float3 color = filmic(radiance);
     float3 color = radiance;
 
     color = color * exposure;

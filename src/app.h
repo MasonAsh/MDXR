@@ -648,6 +648,22 @@ struct App
 
     struct
     {
+        float threshold = 1.0f;
+        float intensity = 1.0f;
+
+        ManagedPSORef filterPSO;
+        ManagedPSORef blurPSO;
+        ManagedPSORef applyPSO;
+
+        struct {
+            ComPtr<D3D12MA::Allocation> texture;
+            UniqueDescriptors srv;
+            UniqueDescriptors rtv;
+        } PingPong[2];
+    } Bloom;
+
+    struct
+    {
         ManagedPSORef toneMapPSO;
         float gamma = 2.2f;
         float exposure = 1.0f;

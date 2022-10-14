@@ -390,6 +390,31 @@ ManagedPSORef CreateDebugVisualizerPSO(
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
 );
 
+ManagedPSORef CreateBloomFilterPSO(
+    PSOManager& manager,
+    ID3D12Device5* device,
+    const std::string& dataDir,
+    ID3D12RootSignature* rootSignature,
+    const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
+);
+
+ManagedPSORef CreateBloomBlurPSO(
+    PSOManager& manager,
+    ID3D12Device5* device,
+    const std::string& dataDir,
+    ID3D12RootSignature* rootSignature,
+    const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
+);
+
+ManagedPSORef CreateBloomApplyPSO(
+    PSOManager& manager,
+    ID3D12Device5* device,
+    const std::string& dataDir,
+    ID3D12RootSignature* rootSignature,
+    const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout
+);
+
+
 // struct RTShaderTable
 // {
 //     ComPtr<D3D12MA::Allocation> allocation;

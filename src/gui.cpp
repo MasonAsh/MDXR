@@ -250,6 +250,7 @@ void DrawEnvironmentEditor(App& app)
         ImGui::DragFloat3("Environment Intensity", &app.LightBuffer.passData->environmentIntensity[0]);
         ImGui::DragFloat("Gamma", &app.PostProcessPass.gamma, 0.1f, 0.0f, 3.0f, nullptr, 1.0f);
         ImGui::DragFloat("Exposure", &app.PostProcessPass.exposure, 0.1f, 0.0f, 2.0f, nullptr, 1.0f);
+        ImGui::DragFloat("Bloom threshold", &app.Bloom.threshold, 0.1f, 0.2f, 2.0f, nullptr, 1.0f);
     }
 }
 

@@ -35,5 +35,6 @@ float4 PSMain(PSInput input) : SV_TARGET0
     input.texcoord.x *= -1;
     float4 skySample = skybox.Sample(g_sampler, input.texcoord);
     skySample.rgb *= skySample.a;
+    skySample.rgb = pow(skySample.rgb, 1.0/2.2);
     return float4(skySample.rgb, 1.0f);
 }

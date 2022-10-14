@@ -48,6 +48,84 @@ void SetupDepthStencil(App& app, bool isResize)
     );
 }
 
+void SetupBloomPass(App& app)
+{
+    D3D12MA::ALLOCATION_DESC allocDesc = {};
+    allocDesc.HeapType = D3D12_HEAP_TYPE_DEFAULT;
+
+    app.Bloom.threshold = 1.0f;
+
+    app.Bloom.PingPong[0].texture = nullptr;
+    app.Bloom.PingPong[1].texture = nullptr;
+
+    auto resourceDesc = GBufferResourceDesc(GBuffer_Radiance, 1024, 1024);
+
+    ASSERT_HRESULT(app.mainAllocator->CreateResource(
+        &allocDesc,
+        &resourceDesc,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        nullptr,
+        &app.Bloom.PingPong[0].texture,
+        IID_NULL, nullptr
+    ));
+    app.Bloom.PingPong[0].srv = AllocateDescriptorsUnique(app.descriptorPool, 1, "Bloom.PingPong[0].srv");
+    app.Bloom.PingPong[0].rtv = AllocateDescriptorsUnique(app.rtvDescriptorPool, 1, "Bloom.PingPong[0].rtv");
+    app.device->CreateShaderResourceView(
+        app.Bloom.PingPong[0].texture->GetResource(),
+        nullptr,
+        app.Bloom.PingPong[0].srv.CPUHandle()
+    );
+    app.device->CreateRenderTargetView(
+        app.Bloom.PingPong[0].texture->GetResource(),
+        nullptr,
+        app.Bloom.PingPong[0].rtv.CPUHandle()
+    );
+
+    ASSERT_HRESULT(app.mainAllocator->CreateResource(
+        &allocDesc,
+        &resourceDesc,
+        D3D12_RESOURCE_STATE_RENDER_TARGET,
+        nullptr,
+        &app.Bloom.PingPong[1].texture,
+        IID_NULL, nullptr
+    ));
+    app.Bloom.PingPong[1].srv = AllocateDescriptorsUnique(app.descriptorPool, 1, "Bloom.PingPong[1].srv");
+    app.Bloom.PingPong[1].rtv = AllocateDescriptorsUnique(app.rtvDescriptorPool, 1, "Bloom.PingPong[1].rtv");
+    app.device->CreateShaderResourceView(
+        app.Bloom.PingPong[1].texture->GetResource(),
+        nullptr,
+        app.Bloom.PingPong[1].srv.CPUHandle()
+    );
+    app.device->CreateRenderTargetView(
+        app.Bloom.PingPong[1].texture->GetResource(),
+        nullptr,
+        app.Bloom.PingPong[1].rtv.CPUHandle()
+    );
+
+    std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout;
+    app.Bloom.filterPSO = CreateBloomFilterPSO(
+        app.psoManager,
+        app.device.Get(),
+        app.dataDir,
+        app.rootSignature.Get(),
+        inputLayout
+    );
+    app.Bloom.blurPSO = CreateBloomBlurPSO(
+        app.psoManager,
+        app.device.Get(),
+        app.dataDir,
+        app.rootSignature.Get(),
+        inputLayout
+    );
+    app.Bloom.applyPSO = CreateBloomApplyPSO(
+        app.psoManager,
+        app.device.Get(),
+        app.dataDir,
+        app.rootSignature.Get(),
+        inputLayout
+    );
+}
+
 void SetupRenderTargets(App& app, bool isResize)
 {
     // Allocate descriptors. These remain for the lifetime of the app so no need to manage lifetimes.
@@ -203,6 +281,7 @@ void HandleResize(App& app, int newWidth, int newHeight)
     SetupRenderTargets(app, true);
     SetupDepthStencil(app, true);
     SetupGBuffer(app, true);
+    SetupBloomPass(app);
 
     app.frameIdx = app.swapChain->GetCurrentBackBufferIndex();
 }
@@ -821,6 +900,8 @@ void InitRenderer(App& app)
 
     CreateMainRootSignature(app);
 
+    SetupBloomPass(app);
+
     SetupMipMapGenerator(app);
 
     SetupLightPass(app);
@@ -1290,7 +1371,7 @@ void DrawMeshesGBuffer(App& app, GraphicsCommandList* commandList)
             DescriptorRef materialDescriptor;
 
             if (material) {
-                if (material->materialType == MaterialType_AlphaBlendPBR) {
+                if (material->materialType == MaterialType_AlphaBlendPBR || material->materialType == MaterialType_Unlit) {
                     continue;
                 }
                 materialDescriptor = material->cbvDescriptor.Ref();
@@ -1363,6 +1444,59 @@ void DrawAlphaBlendedMeshes(App& app, GraphicsCommandList* commandList)
 
                 app.Stats.drawCalls++;
             }
+        }
+    }
+}
+
+void DrawUnlitMeshes(App& app, GraphicsCommandList* commandList)
+{
+    commandList->RSSetViewports(1, &app.viewport);
+    commandList->RSSetScissorRects(1, &app.scissorRect);
+
+    auto rtvHandle = app.nonSRGBFrameBufferRTVs[app.frameIdx].CPUHandle();
+    auto dsvHandle = app.depthStencilDescriptor.CPUHandle();
+    commandList->OMSetRenderTargets(1, &rtvHandle, false, &dsvHandle);
+
+    ManagedPSORef lastUsedPSO = nullptr;
+
+    auto meshes = PickSceneMeshes(app.scene);
+
+    for (auto& mesh : meshes) {
+        if (!mesh->isReadyForRender) {
+            continue;
+        }
+
+        for (const auto& primitive : mesh->primitives) {
+            if (primitive->cull) {
+                continue;
+            }
+
+            const auto& material = primitive->material.get();
+            // FIXME: if I am not lazy I will SORT by material type
+            // Transparent materials drawn in different pass
+            DescriptorRef materialDescriptor;
+
+            if (!material || material->materialType != MaterialType_Unlit) {
+                continue;
+            }
+
+            materialDescriptor = material->cbvDescriptor.Ref();
+
+            // Set the per-primitive constant buffer
+            UINT constantValues[5] = { primitive->perPrimitiveDescriptor.index, materialDescriptor.index, 0, 0, primitive->miscDescriptorParameter.index };
+            commandList->SetGraphicsRoot32BitConstants(0, _countof(constantValues), constantValues, 0);
+            commandList->IASetPrimitiveTopology(primitive->primitiveTopology);
+
+            if (primitive->PSO != lastUsedPSO) {
+                commandList->SetPipelineState(primitive->PSO->Get());
+                lastUsedPSO = primitive->PSO;
+            }
+
+            commandList->IASetVertexBuffers(0, (UINT)primitive->vertexBufferViews.size(), primitive->vertexBufferViews.data());
+            commandList->IASetIndexBuffer(&primitive->indexBufferView);
+            commandList->DrawIndexedInstanced(primitive->indexCount, primitive->instanceCount, 0, 0, 0);
+
+            app.Stats.drawCalls++;
         }
     }
 }
@@ -1698,6 +1832,142 @@ void DebugVisualizer(App& app, GraphicsCommandList* commandList)
     DrawFullscreenQuad(app, commandList);
 }
 
+void BloomPingPongStep(
+    App& app,
+    GraphicsCommandList* commandList,
+    ManagedPSORef pso,
+    int rtvPingPongIndex,
+    int srvPingPongIndex,
+    std::span<UINT> constantValues)
+{
+    D3D12_RESOURCE_BARRIER barriers[] = {
+        CD3DX12_RESOURCE_BARRIER::Transition(
+            app.Bloom.PingPong[rtvPingPongIndex].texture->GetResource(),
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_RENDER_TARGET),
+        CD3DX12_RESOURCE_BARRIER::Transition(
+            app.Bloom.PingPong[srvPingPongIndex].texture->GetResource(),
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+    };
+
+    commandList->ResourceBarrier(_countof(barriers), barriers);
+
+    auto rtvHandle = app.Bloom.PingPong[rtvPingPongIndex].rtv.CPUHandle();
+    commandList->OMSetRenderTargets(
+        1,
+        &rtvHandle,
+        false,
+        nullptr
+    );
+    commandList->SetPipelineState(pso->Get());
+    commandList->SetGraphicsRoot32BitConstants(
+        0,
+        constantValues.size(),
+        constantValues.data(),
+        0
+    );
+    DrawFullscreenQuad(app, commandList);
+}
+
+void ApplyBloom(App& app, GraphicsCommandList* commandList)
+{
+    commandList->IASetPrimitiveTopology(
+        D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP
+    );
+
+    {
+        auto bloomResourceDesc = app.Bloom.PingPong[0].texture->GetResource()->GetDesc();
+        CD3DX12_VIEWPORT viewport(app.Bloom.PingPong[0].texture->GetResource());
+        commandList->RSSetViewports(1, &viewport);
+
+        auto scissorRect = CD3DX12_RECT(0, 0, static_cast<LONG>(viewport.Width), static_cast<LONG>(viewport.Height));
+        commandList->RSSetScissorRects(1, &scissorRect);
+    }
+
+    // Filter
+    {
+        UINT constantValues[] = {
+            *reinterpret_cast<UINT*>(&app.Bloom.threshold),
+            app.GBuffer.baseSrvReference.Index(),
+        };
+
+        BloomPingPongStep(
+            app,
+            commandList,
+            app.Bloom.filterPSO,
+            0,
+            1,
+            std::span(constantValues)
+        );
+    }
+
+    const int NUM_BLUR_PASSES = 10;
+    static_assert(NUM_BLUR_PASSES % 2 == 0);
+
+    int ping = 1;
+    int pong = 0;
+
+    bool horizontal = false;
+
+    // Blur passes
+    for (int i = 0; i < NUM_BLUR_PASSES; i++)
+    {
+        UINT constantValues[] = {
+            app.Bloom.PingPong[pong].srv.Index(),
+            (UINT)horizontal
+        };
+
+        BloomPingPongStep(
+            app,
+            commandList,
+            app.Bloom.blurPSO,
+            ping,
+            pong,
+            std::span(constantValues)
+        );
+
+        std::swap(ping, pong);
+
+        horizontal = !horizontal;
+    }
+
+    // Final result goes into PingPong[ping]
+    D3D12_RESOURCE_BARRIER barriers[] = {
+        CD3DX12_RESOURCE_BARRIER::Transition(
+            app.Bloom.PingPong[pong].texture->GetResource(),
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+        CD3DX12_RESOURCE_BARRIER::Transition(
+            app.Bloom.PingPong[ping].texture->GetResource(),
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_RENDER_TARGET),
+    };
+    commandList->ResourceBarrier(_countof(barriers), barriers);
+
+    // Apply bloom, writing bloom texture into radiance buffer
+    commandList->SetPipelineState(app.Bloom.applyPSO->Get());
+    commandList->RSSetViewports(1, &app.viewport);
+    commandList->RSSetScissorRects(1, &app.scissorRect);
+    auto rtvHandle = app.GBuffer.rtvs[GBuffer_Radiance].CPUHandle();
+    commandList->OMSetRenderTargets(
+        1,
+        &rtvHandle,
+        false,
+        nullptr
+    );
+    UINT constantValues[] = {
+        app.Bloom.PingPong[ping].srv.Index()
+    };
+    commandList->SetGraphicsRoot32BitConstants(
+        0,
+        _countof(constantValues),
+        constantValues,
+        0
+    );
+    DrawFullscreenQuad(app, commandList);
+}
+
 void PostProcessPass(App& app, GraphicsCommandList* commandList)
 {
     PIXScopedEvent(commandList, 0x89E4F8, L"PostProcessPass");
@@ -1710,9 +1980,11 @@ void PostProcessPass(App& app, GraphicsCommandList* commandList)
     commandList->SetDescriptorHeaps(1, ppHeaps);
     commandList->SetGraphicsRootSignature(app.rootSignature.Get());
 
+    // Apply bloom while radiance buffer is still in render target state
+    ApplyBloom(app, commandList);
+
     TransitionResourcesForPostProcessPass(app, commandList);
 
-    //auto rtvHandle = app.frameBufferRTVs[app.frameIdx].CPUHandle();
     auto rtvHandle = app.nonSRGBFrameBufferRTVs[app.frameIdx].CPUHandle();
 
     const float clearColor[] = { 0.0f, 0.0f, 0.0f, 1.0f };
@@ -1734,6 +2006,12 @@ void PostProcessPass(App& app, GraphicsCommandList* commandList)
     } else {
         DebugVisualizer(app, commandList);
     }
+
+    rtvHandle = app.frameBufferRTVs[app.frameIdx].CPUHandle();
+    commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
+    // Unlit meshes draw straight into the backbuffer without tonemapping, making this a good
+    // spot to do this
+    DrawUnlitMeshes(app, commandList);
 }
 
 ID3D12Resource* GetColorCusorSourceBuffer(App& app)
